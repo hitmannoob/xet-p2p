@@ -21,7 +21,7 @@ Xet (chunks + xorbs + shards + local CAS)  ↔  QUIC (pinned mutual TLS)  ↔  X
 - Every received object is verified before it is stored; every file is verified (size + SHA-256)
   before it is installed, and installation is atomic per file. A failed transfer installs nothing.
 
-Status: **M0–M3 complete** (offline round trip; authenticated QUIC push; incremental install,
+Status: **M0–M4 complete** (offline round trip; authenticated QUIC push; incremental install,
 durable resume, concurrent pushes, scopes, `--delete`; chunk-level transfer with native repacking). See [PROGRESS.md](PROGRESS.md) for details and what is next, and
 [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md) for the full design brief.
 
@@ -116,6 +116,7 @@ Not yet covered: certificate rotation/revocation (replace the pinned file and re
 | `xet-p2p keygen --out DIR --name NAME` | Create a self-signed identity |
 | `xet-p2p serve ...` | Receive pushes into `--root` |
 | `xet-p2p push SRC --to HOST:PORT --dest REL ...` | Push a file or directory |
+| `xet-p2p gc --cas-dir DIR [--max-size-mib N] [--dry-run]` | Reclaim CAS space (orphans; LRU eviction to a cap) |
 | `xet-p2p local ingest SRC --cas-dir DIR [-o manifest.json]` | Offline: store into a CAS, write manifest |
 | `xet-p2p local restore MANIFEST DEST --cas-dir DIR` | Offline: reconstruct from a CAS |
 
@@ -140,6 +141,23 @@ stored is still reused, and so is the reconstruction metadata of every file that
 
 Pushes into disjoint destinations run concurrently; pushes into overlapping destinations (one inside
 the other) wait for each other.
+
+## Operations
+
+- **Bandwidth**: `push --bwlimit-mib 20` caps payload throughput across all streams.
+- **Stalled senders**: `serve --stall-timeout-secs 120` (default) aborts a transfer whose sender
+  stops sending data, freeing its destination for others.
+- **Disk space**: the CAS is a cache. `xet-p2p gc --cas-dir DIR` deletes content no file references
+  (after a 7-day grace that protects resumable transfers); add `--max-size-mib N` to evict least
+  recently used content down to a cap (it is re-fetched from a peer when next needed). `gc` needs
+  the CAS to itself and refuses to run while a `serve` or `push` is using it.
+
+## Compared with rsync
+
+See [docs/BENCHMARK_M4.md](docs/BENCHMARK_M4.md). In short: large-file edits sync 3–5× faster than
+rsync with comparable bytes, and content the receiver holds anywhere is never resent; rsync sends
+less for compressible data (zlib vs Xet's lz4), for tiny edits (literal bytes vs ~64 KiB chunks),
+and for big trees of tiny files (mtimes vs content hashes in the file list).
 
 ## Transfer modes
 

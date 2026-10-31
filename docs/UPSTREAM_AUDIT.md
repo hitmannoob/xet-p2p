@@ -65,4 +65,15 @@ natively via a `local://` endpoint. No upstream code needs to be forked or reimp
 8. **No full chunk index upstream.** `LocalClient` indexes only global-dedup-eligible chunks. M3 adds
    its own redb index (chunk → xorb, index) alongside upstream's state; same redb version (=3.1.3).
 
+9. **Local reconstruction bypasses `FileDownloadSession` (M4).** Through `LocalClient`, each file's
+   reconstruction re-parses the xorb footer from disk with unbuffered per-field reads (~800
+   syscalls per file); 2000 small files took 13.7 s. `xet-local` now reconstructs from the file's
+   native segments itself: footers parsed once (buffered) and cached, one range read per segment,
+   chunks decoded with upstream `parse_chunk_header` / `decompress_from_slice`, every chunk hash
+   checked against the footer, SHA-256 computed in the same pass. Same formats, our driver loop.
+10. **`get_xorb_raw_bytes` reads the whole xorb** before slicing a range; chunk runs are read with
+    our own range read of the (layout-coupled) xorb path instead.
+11. **`DeletionControlableClient`** (list/delete file entries, shards, xorbs; dedup-table cleanup)
+    is used by `xet-p2p gc`.
+
 None of these require a custom chunk, xorb, or shard format.

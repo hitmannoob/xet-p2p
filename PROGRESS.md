@@ -10,7 +10,7 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
 | M1 — Direct QUIC push, full-xorb transport | **Done** (exit gate met) |
 | M2 — Incremental transfer + durable resume | **Done** (exit gate met) |
 | M3 — Chunk-level transfer optimization | **Done** (exit gate met; [benchmark](docs/BENCHMARK_M3.md)) |
-| M4 — Performance and reliability | Not started |
+| M4 — Performance and reliability | **Done** ([benchmark vs rsync](docs/BENCHMARK_M4.md)) |
 | M5 — Provider-agnostic sandbox integration | Not started |
 
 ## Pins
@@ -132,32 +132,69 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
   same-sender edits whole-xorb is already near-optimal and chunk mode costs +0.03 MiB of chunk
   lists. Conditions: Apple M4, localhost UDP (no latency/loss), incompressible data, release.
 
-## Next: M4 — performance and reliability
+### 2026-10-31 — M4
 
-1. Benchmark vs `rsync` over SSH and a plain copy, with latency/loss shaping and compressible data.
-2. Hybrid mode: request whole sender xorbs when every chunk in them is needed (saves chunk-list
-   bytes for same-sender edits), chunk ranges otherwise.
-3. Streaming xorb I/O (own file reads/writes) to drop whole-object buffering; bandwidth limits.
-4. CAS garbage collection (xorbs, index entries, stale pending state); `xet-p2p gc`.
+- **Stall timeout** (receiver, `--stall-timeout-secs`, default 120): a transfer whose sender delivers
+  no QUIC STREAM frames while the receiver waits on it is aborted and its destination lock freed.
+  Keep-alive pings do not count; local work never trips it. Sender-side has none by design (the
+  receiver may legitimately work for minutes; the sender's user can interrupt).
+- **Bandwidth limit** (`push --bwlimit-mib`): shared token bucket over all streams.
+- **Garbage collection** (`xet-p2p gc`): orphan xorbs past a 7-day grace, optional LRU eviction to
+  `--max-size-mib` (dependent file entries dropped first, so a crash mid-GC never leaves a dangling
+  reconstruction), empty shards and chunk-index entries removed, `--dry-run`. Recency = xorb mtime,
+  refreshed on commit, reconstruct, and each push. Store locking: shared `<cas>/.lock` for normal
+  opens, exclusive for GC.
+- **Performance**, found by profiling during the rsync benchmark:
+  - Local reconstruction now decodes files directly from native segments with cached footers,
+    concurrently, checking every chunk hash (upstream `LocalClient` re-read footers per file with
+    unbuffered reads). Restore of 2000 small files 13.7 s → 1.4 s.
+  - Durability on macOS: fsync per object + one `F_FULLFSYNC` barrier per batch (`durable` module),
+    instead of a full drive-cache flush per file.
+  - Chunk runs read by range (upstream `get_xorb_raw_bytes` reads the whole xorb), batched ~4 MiB
+    per stream; resume state written with one barrier per batch. Push of 2000 small files
+    9.7 s → 1.0 s.
+  - Wire manifest: binary + lz4 (≈200 → 80 B/file before compression).
+- **Benchmark vs rsync and plain copy** ([docs/BENCHMARK_M4.md](docs/BENCHMARK_M4.md)): large-file
+  edits 3–5× faster than rsync at comparable bytes; rsync wins on compressible data (zlib vs lz4,
+  ~2×), on tiny edits (literal bytes vs whole 64 KiB chunks, plus ~10 KiB handshake), and on
+  small-file manifests (hashes vs mtimes). No network shaping available (needs root).
+- **Considered and not done**:
+  - *Hybrid chunk/xorb mode*: a chunk-mode receiver never holds the sender's xorbs, and deciding
+    that a whole xorb is needed requires the chunk list anyway; the saving would be the chunk list
+    itself (≈0.055% of file size). Not worth a second fetch path.
+  - *Streaming xorb I/O*: memory is already bounded by the byte budget; true streaming means
+    writing xorbs ourselves instead of through upstream `upload_xorb`. Deferred.
+- Tests: 97 (stall + slow-but-steady sender, bandwidth limiter unit, 4 GC/locking, manifest
+  encoding round trip). Note: the suite needs ~2–3 GiB of temp space; on a full disk use
+  `-- --test-threads=4`.
+
+## Next: M5 — provider-agnostic sandbox integration
+
+Per the brief: `SandboxProvider` adapters (attach, capabilities, bootstrap agent, session) with a
+fake provider and generic host first, then E2B and Modal; provider URIs; `doctor`; optional
+authenticated TLS/WebSocket fallback behind a transport trait; opt-in billable tests only.
 
 ## Known gaps / risks
 
 - Directory install is per-file atomic after all files verify, not one atomic swap of the tree. A
   crash mid-install leaves a mix of old and new verified files; re-running the push completes it
   (unchanged files skipped). An atomic tree swap was considered and not taken.
-- Xorbs are still buffered whole (bounded by the memory budget): upstream's `upload_xorb` and
-  `get_xorb_raw_bytes` take/return whole buffers. True streaming needs our own xorb file I/O; M4.
+- Xorbs are still buffered whole (bounded by the memory budget): upstream's `upload_xorb` takes a
+  whole buffer. True streaming needs our own xorb file writes.
 - Sender-side CAS writes during ingest are not fsynced (upstream sessions). A sender power loss can
   corrupt its own CAS; the receiver rejects any bad xorb, so the result is a failed push, never
   corrupt data on the receiver. Recovery: delete the sender's `--cas-dir`.
 - Ingest change detection relies on mtime/size; an edit that restores both exactly is not seen.
 - Chunk mode sends a chunk list (36 B/chunk) for every new file before knowing what is missing;
   for same-sender edits this is slightly more than whole-xorb (+0.03 MiB per 64 MiB file).
+- Compression is upstream's lz4; on compressible data rsync -az (zlib) sends ~2× less. A
+  transport-level compressor over chunk runs would close this without changing object bytes.
+- Smallest unit resent is one content-defined chunk (~64 KiB); a tiny edit costs 1–2 chunks.
+- Local reconstruction no longer uses upstream `FileDownloadSession` (see audit): formats and
+  decoding are upstream's, the driver loop is ours.
 - The receiver's repacked xorbs differ from the sender's; content identity is per chunk and per
   file hash, so this is invisible to reconstruction, but receiver-side dedup ratios depend on
   arrival order of chunks within a pack.
-- A sender that stops sending while keeping the connection alive stalls its transfer (and holds
-  its destination lock) until it disconnects; no per-transfer inactivity timeout yet.
 - No `transport` trait yet: `transfer` uses Quinn types directly. Abstract when M5 adds a fallback.
 - `LocalClient` lives in upstream's `simulation` module — no stability promise; pinned `=1.8.0` and
   wrapped behind `xet-local`, with durability paths coupled to its on-disk layout.
