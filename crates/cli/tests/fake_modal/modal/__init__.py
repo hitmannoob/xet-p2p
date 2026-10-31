@@ -18,13 +18,16 @@ class _Stream:
 
 class _Stdin:
     def __init__(self, proc):
-        self._proc, self._buf = proc, []
+        self._proc = proc
 
     def write(self, data):
-        self._buf.append(data if isinstance(data, str) else data.decode())
+        # Like Modal: writing to a finished exec is a ConflictError.
+        if self._proc._popen.poll() is not None:
+            raise RuntimeError("ConflictError: Exec has already completed; stdin is no longer accepting writes")
+        self._proc._popen.stdin.write(data if isinstance(data, str) else data.decode())
 
     def write_eof(self):
-        pass
+        self._proc._popen.stdin.close()
 
     def drain(self):
         pass
@@ -40,8 +43,12 @@ class _LazyStream:
 
 
 class _Process:
+    """Starts immediately, like a Modal exec."""
+
     def __init__(self, cmd, timeout):
-        self._cmd, self._timeout, self._done = list(cmd), timeout, False
+        self._timeout, self._done = timeout, False
+        self._popen = subprocess.Popen(list(cmd), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
         self.stdin = _Stdin(self)
         self.stdout, self.stderr = _LazyStream(self, "out"), _LazyStream(self, "err")
         self.returncode = None
@@ -49,9 +56,10 @@ class _Process:
     def _finish(self):
         if self._done:
             return
-        r = subprocess.run(self._cmd, input="".join(self.stdin._buf), capture_output=True,
-                           text=True, timeout=self._timeout)
-        self._out, self._err, self.returncode, self._done = r.stdout, r.stderr, r.returncode, True
+        if not self._popen.stdin.closed:
+            self._popen.stdin.close()
+        self._out, self._err = self._popen.communicate(timeout=self._timeout)
+        self.returncode, self._done = self._popen.returncode, True
 
     def wait(self):
         self._finish()

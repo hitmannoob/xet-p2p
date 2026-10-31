@@ -26,6 +26,9 @@ import modal  # noqa: E402
 
 BOOTSTRAP = r"""
 set -u
+# Read the credentials first: Modal rejects stdin writes once the process has exited, and the
+# checks below may exit early.
+IFS= read -r K; IFS= read -r C; IFS= read -r CL
 BIN=$1 SHA=$2 ARCH=$3 ROOT=$4 CAS=$5 SESSION=$6 PORT=$7 IDLE=$8
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 M=$(uname -m)
@@ -34,7 +37,6 @@ if [ ! -f "$BIN" ] || [ "$(sha "$BIN" 2>/dev/null)" != "$SHA" ]; then echo '{"ne
 chmod 755 "$BIN"
 umask 077
 mkdir -p "$SESSION" && mkdir -p "$ROOT" || exit 14
-IFS= read -r K; IFS= read -r C; IFS= read -r CL
 printf %s "$K" | base64 -d > "$SESSION/server.key" && printf %s "$C" | base64 -d > "$SESSION/server.crt" \
   && printf %s "$CL" | base64 -d > "$SESSION/client.crt" || { rm -rf "$SESSION"; exit 15; }
 set -- "$BIN" serve --no-quic --listen-tcp "0.0.0.0:$PORT" --root "$ROOT" --cas-dir "$CAS" \
