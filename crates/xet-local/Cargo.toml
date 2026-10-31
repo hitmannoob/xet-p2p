@@ -12,6 +12,7 @@ xet-core-structures.workspace = true
 xet-client.workspace = true
 xet-data.workspace = true
 hex.workspace = true
+redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

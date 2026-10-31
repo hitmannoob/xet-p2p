@@ -15,6 +15,7 @@ use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy,
 use xet_runtime::core::XetContext;
 
 use crate::error::{Error, Result};
+use crate::index::ChunkIndex;
 use crate::manifest::{
     Entry, EntryKind, MANIFEST_FORMAT_VERSION, Manifest, STAGING_PREFIX, validate_rel_path,
 };
@@ -30,6 +31,7 @@ pub struct LocalCas {
     config: Arc<TranslatorConfig>,
     /// The same store upstream sessions open for `config` (redb handles are shared per path).
     pub(crate) client: Arc<LocalClient>,
+    pub(crate) index: ChunkIndex,
 }
 
 /// SHA-256 of zero bytes. Upstream 1.8.0 reports all zeros for empty files.
@@ -44,6 +46,8 @@ pub struct MissingContent {
     pub xorbs: BTreeSet<MerkleHash>,
     /// Xorbs referenced by known reconstructions and already present locally.
     pub present_xorbs: BTreeSet<MerkleHash>,
+    /// Files with a known reconstruction that references an absent xorb (in `xorbs`).
+    pub files_missing_xorbs: BTreeSet<MerkleHash>,
 }
 
 impl MissingContent {
@@ -96,12 +100,16 @@ impl LocalCas {
         let client = LocalClient::new(ctx.clone(), root.join("xet").join("xorbs"))
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
-        Ok(Self {
+        let index = ChunkIndex::open(&root.join("chunk_index.redb"))?;
+        let cas = Self {
             root,
             ctx,
             config,
             client,
-        })
+            index,
+        };
+        cas.sync_index().await?;
+        Ok(cas)
     }
 
     pub fn root(&self) -> &Path {
@@ -145,6 +153,8 @@ impl LocalCas {
                 .upload_files(file_paths.iter().map(|p| (*p, Sha256Policy::Compute)))
                 .await?;
             let dedup = session.finalize().await?;
+            // Make newly stored chunks visible to chunk-level planning.
+            self.sync_index().await?;
             (infos, dedup)
         };
 
@@ -217,6 +227,30 @@ impl LocalCas {
         Ok((manifest, report))
     }
 
+    /// Indexes the chunks of any stored xorb not yet in the chunk index (e.g. created by ingest,
+    /// or by a version before the index existed).
+    pub async fn sync_index(&self) -> Result<usize> {
+        let mut added = 0;
+        for xorb in self
+            .client
+            .list_xorbs()
+            .await
+            .map_err(|e| Error::Xet(e.to_string()))?
+        {
+            if self.index.is_indexed(&xorb)? {
+                continue;
+            }
+            let footer = self
+                .client
+                .xorb_footer(&xorb)
+                .await
+                .map_err(|e| Error::Xet(e.to_string()))?;
+            self.index.insert_xorb(&xorb, &footer.info.chunk_hashes)?;
+            added += 1;
+        }
+        Ok(added)
+    }
+
     /// Reports which reconstruction metadata and xorbs `manifest` needs that this CAS lacks.
     /// Purely local: a lookup here is never a network transfer.
     pub async fn missing_content(&self, manifest: &Manifest) -> Result<MissingContent> {
@@ -237,7 +271,11 @@ impl LocalCas {
             };
             for segment in &info.segments {
                 let h = segment.xorb_hash;
-                if missing.xorbs.contains(&h) || missing.present_xorbs.contains(&h) {
+                if missing.xorbs.contains(&h) {
+                    missing.files_missing_xorbs.insert(hash);
+                    continue;
+                }
+                if missing.present_xorbs.contains(&h) {
                     continue;
                 }
                 if self
@@ -249,6 +287,7 @@ impl LocalCas {
                     missing.present_xorbs.insert(h);
                 } else {
                     missing.xorbs.insert(h);
+                    missing.files_missing_xorbs.insert(hash);
                 }
             }
         }

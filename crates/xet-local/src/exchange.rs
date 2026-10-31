@@ -78,6 +78,10 @@ impl PendingShard {
         Ok(Self { files })
     }
 
+    pub(crate) fn from_infos(files: Vec<MDBFileInfo>) -> Self {
+        Self { files }
+    }
+
     pub fn num_files(&self) -> usize {
         self.files.len()
     }
@@ -183,6 +187,17 @@ impl LocalCas {
             reason: "content does not match its hash or is malformed".into(),
         })?;
 
+        self.store_verified_xorb(hash, bytes, &xorb).await
+    }
+
+    /// Stores a xorb whose bytes are known to match `xorb` and `hash`, durably, and indexes its
+    /// chunks.
+    pub(crate) async fn store_verified_xorb(
+        &self,
+        hash: MerkleHash,
+        bytes: Vec<u8>,
+        xorb: &XorbObject,
+    ) -> Result<()> {
         let footer_start = (bytes.len() as u64)
             .checked_sub(size_of::<u32>() as u64 + xorb.info_length as u64)
             .ok_or_else(|| Error::Verification {
@@ -205,6 +220,7 @@ impl LocalCas {
             .map_err(xet_err)?;
         // Upstream renames into place without fsync; make the commit survive power loss.
         sync_file_and_parent(&self.xorb_path(&hash))?;
+        self.index.insert_xorb(&hash, &xorb.info.chunk_hashes)?;
         Ok(())
     }
 

@@ -6,8 +6,10 @@
 //! manifest, and verified atomic installation.
 
 mod cas;
+pub mod chunks;
 mod error;
 mod exchange;
+mod index;
 pub mod manifest;
 mod walk;
 
