@@ -10,13 +10,14 @@ use tokio::task::JoinSet;
 use tracing::debug;
 use transport_quic::quinn::{Connection, RecvStream, SendStream};
 use transport_quic::{read_frame, write_frame};
+use xet_local::chunks::encode_chunk_lists;
 use xet_local::{IngestReport, LocalCas, Manifest, MerkleHash};
 
 use crate::budget::MemoryBudget;
 use crate::error::{Error, Result};
 use crate::protocol::{
-    MAX_CONTROL_FRAME, Message, ObjectHeader, ObjectKind, PROTOCOL_VERSION, ReceiverReport,
-    parse_hash,
+    ChunkRequest, MAX_CONTROL_FRAME, Message, ObjectHeader, ObjectKind, PROTOCOL_VERSION,
+    ReceiverReport, TransferMode, parse_hash,
 };
 
 #[derive(Debug, Clone)]
@@ -29,6 +30,8 @@ pub struct PushOptions {
     pub max_memory_bytes: u64,
     /// Ask the receiver to remove anything under `dest` that the source does not contain.
     pub delete: bool,
+    /// How missing content is moved (chunk-level by default).
+    pub mode: TransferMode,
 }
 
 /// Default for [`PushOptions::max_memory_bytes`] and the receiver's equivalent.
@@ -42,6 +45,10 @@ pub struct PushReport {
     pub xorbs_sent: usize,
     pub xorb_bytes_sent: u64,
     pub shard_bytes_sent: u64,
+    /// Chunk mode: native chunk-run bytes, runs, and chunk-list bytes sent.
+    pub chunk_bytes_sent: u64,
+    pub chunk_runs_sent: usize,
+    pub chunk_list_bytes_sent: u64,
     pub receiver: ReceiverReport,
     pub udp_bytes_sent: u64,
     pub elapsed: Duration,
@@ -52,8 +59,12 @@ impl PushReport {
         self.xorbs_referenced - self.xorbs_sent
     }
 
+    /// Every object byte sent: native xorbs, shards, chunk runs, and chunk lists.
     pub fn payload_bytes_sent(&self) -> u64 {
-        self.xorb_bytes_sent + self.shard_bytes_sent
+        self.xorb_bytes_sent
+            + self.shard_bytes_sent
+            + self.chunk_bytes_sent
+            + self.chunk_list_bytes_sent
     }
 }
 
@@ -76,6 +87,9 @@ pub async fn push(
         xorbs_sent: 0,
         xorb_bytes_sent: 0,
         shard_bytes_sent: 0,
+        chunk_bytes_sent: 0,
+        chunk_runs_sent: 0,
+        chunk_list_bytes_sent: 0,
         receiver: ReceiverReport::default(),
         udp_bytes_sent: 0,
         elapsed: Duration::ZERO,
@@ -89,6 +103,7 @@ pub async fn push(
             session_id: session_id(),
             dest: opts.dest.clone(),
             delete: opts.delete,
+            mode: opts.mode,
         },
     )
     .await?;
@@ -124,6 +139,19 @@ pub async fn push(
                 }
                 report.xorb_bytes_sent += send_xorbs(&cas, conn, &xorbs, opts).await?;
                 report.xorbs_sent += xorbs.len();
+            }
+            Message::NeedChunkLists { files: wanted } => {
+                let wanted = parse_subset(&wanted, &files, "file")?;
+                debug!(files = wanted.len(), "NEED_CHUNK_LISTS");
+                let lists = encode_chunk_lists(&cas.chunk_lists(&wanted).await?);
+                report.chunk_list_bytes_sent +=
+                    send_object(conn, ObjectKind::ChunkLists, None, lists).await?;
+            }
+            Message::NeedChunks { requests } => {
+                debug!(files = requests.len(), "NEED_CHUNKS");
+                let (bytes, runs) = send_chunk_runs(&cas, conn, &requests, &files, opts).await?;
+                report.chunk_bytes_sent += bytes;
+                report.chunk_runs_sent += runs;
             }
             Message::Ack { .. } => {}
             Message::Result { report: r } => {
@@ -187,6 +215,56 @@ async fn send_xorbs(
         total += res.map_err(|e| Error::Protocol(format!("send task failed: {e}")))??;
     }
     Ok(total)
+}
+
+/// Sends the native bytes of every requested chunk range, one stream per run, bounded by the
+/// stream and memory limits. Returns (bytes, runs).
+async fn send_chunk_runs(
+    cas: &Arc<LocalCas>,
+    conn: &Connection,
+    requests: &[ChunkRequest],
+    files: &BTreeSet<MerkleHash>,
+    opts: &PushOptions,
+) -> Result<(u64, usize)> {
+    let permits = Arc::new(Semaphore::new(opts.parallel_streams.max(1)));
+    let budget = MemoryBudget::new(opts.max_memory_bytes);
+    let mut tasks = JoinSet::new();
+    let mut runs_sent = 0;
+    let mut total = 0;
+    for req in requests {
+        let file = parse_hash(&req.file)?;
+        if !files.contains(&file) {
+            return Err(Error::Protocol(format!(
+                "receiver requested chunks of unrelated file {}",
+                req.file
+            )));
+        }
+        for mut run in cas.plan_chunk_runs(&file, &req.ranges).await? {
+            let permit = permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("semaphore never closed");
+            let memory = budget
+                .reserve(run.byte_range.end - run.byte_range.start)
+                .await;
+            let (cas, conn) = (cas.clone(), conn.clone());
+            runs_sent += 1;
+            tasks.spawn(async move {
+                let _permits = (permit, memory);
+                cas.read_chunk_run(&mut run).await?;
+                send_object(&conn, ObjectKind::ChunkRun, Some(run.xorb), run.bytes).await
+            });
+            // Surface failures early rather than after planning everything.
+            while let Some(res) = tasks.try_join_next() {
+                total += res.map_err(|e| Error::Protocol(format!("send task failed: {e}")))??;
+            }
+        }
+    }
+    while let Some(res) = tasks.join_next().await {
+        total += res.map_err(|e| Error::Protocol(format!("send task failed: {e}")))??;
+    }
+    Ok((total, runs_sent))
 }
 
 async fn send_object(

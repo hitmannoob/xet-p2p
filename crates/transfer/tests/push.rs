@@ -8,7 +8,7 @@ use std::sync::Arc;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 use transfer::protocol::{MAX_CONTROL_FRAME, Message, ObjectHeader, ObjectKind, PROTOCOL_VERSION};
-use transfer::{Error, PushOptions, Receiver, ReceiverOptions, push};
+use transfer::{Error, PushOptions, Receiver, ReceiverOptions, TransferMode, push};
 use transport_quic::quinn::{Connection, Endpoint};
 use transport_quic::{
     EndpointOptions, GeneratedIdentity, Identity, client_endpoint, connect, generate, read_frame,
@@ -136,8 +136,21 @@ impl Harness {
         self.push_with(dest, |_| {}).await
     }
 
+    async fn push_xorb(&self, dest: &str) -> transfer::Result<transfer::PushReport> {
+        self.push_with(dest, |o| o.mode = TransferMode::Xorb).await
+    }
+
     async fn push_with(
         &self,
+        dest: &str,
+        configure: impl FnOnce(&mut PushOptions),
+    ) -> transfer::Result<transfer::PushReport> {
+        self.push_from(&self.sender_cas, dest, configure).await
+    }
+
+    async fn push_from(
+        &self,
+        cas: &Arc<LocalCas>,
         dest: &str,
         configure: impl FnOnce(&mut PushOptions),
     ) -> transfer::Result<transfer::PushReport> {
@@ -147,9 +160,10 @@ impl Harness {
             parallel_streams: 4,
             max_memory_bytes: transfer::DEFAULT_MAX_MEMORY_BYTES,
             delete: false,
+            mode: TransferMode::Chunk,
         };
         configure(&mut opts);
-        let result = push(self.sender_cas.clone(), &self.src(), &conn, &opts).await;
+        let result = push(cas.clone(), &self.src(), &conn, &opts).await;
         conn.close(0u32.into(), b"done");
         result
     }
@@ -164,7 +178,7 @@ async fn push_tree_to_empty_receiver() {
     write(&h.src(), "empty", b"");
     fs::create_dir_all(h.src().join("empty-dir")).unwrap();
 
-    let r = h.push("project").await.unwrap();
+    let r = h.push_xorb("project").await.unwrap();
     assert_trees_equal(&h.src(), &h.root().join("project"));
     assert_eq!(r.receiver.files_installed, 4);
     assert_eq!(r.xorbs_sent, r.xorbs_referenced);
@@ -178,7 +192,7 @@ async fn push_tree_to_empty_receiver() {
 async fn push_multi_xorb_file() {
     let h = Harness::new().await;
     write(&h.src(), "big.bin", &random_bytes(3, 90 * MIB));
-    let r = h.push("big").await.unwrap();
+    let r = h.push_xorb("big").await.unwrap();
     assert!(r.xorbs_sent >= 2, "{r:?}");
     assert_trees_equal(&h.src(), &h.root().join("big"));
 }
@@ -188,9 +202,9 @@ async fn second_push_of_unchanged_tree_sends_zero_payload() {
     let h = Harness::new().await;
     write(&h.src(), "a.bin", &random_bytes(4, 2 * MIB));
     write(&h.src(), "b/c.bin", &random_bytes(5, MIB));
-    h.push("p").await.unwrap();
+    h.push_xorb("p").await.unwrap();
 
-    let r = h.push("p").await.unwrap();
+    let r = h.push_xorb("p").await.unwrap();
     assert_eq!(r.payload_bytes_sent(), 0, "{r:?}");
     assert_eq!(r.xorbs_sent, 0);
     assert_eq!(r.xorbs_reused(), r.xorbs_referenced);
@@ -207,8 +221,8 @@ async fn second_push_of_unchanged_tree_sends_zero_payload() {
 async fn push_to_second_destination_reuses_receiver_cas() {
     let h = Harness::new().await;
     write(&h.src(), "a.bin", &random_bytes(6, 2 * MIB));
-    h.push("one").await.unwrap();
-    let r = h.push("two").await.unwrap();
+    h.push_xorb("one").await.unwrap();
+    let r = h.push_xorb("two").await.unwrap();
     assert_eq!(r.payload_bytes_sent(), 0);
     assert_trees_equal(&h.src(), &h.root().join("two"));
 }
@@ -218,12 +232,12 @@ async fn edited_file_resends_only_new_xorbs() {
     let h = Harness::new().await;
     let base = random_bytes(7, 4 * MIB);
     write(&h.src(), "a.bin", &base);
-    let first = h.push("p").await.unwrap();
+    let first = h.push_xorb("p").await.unwrap();
 
     let mut grown = base.clone();
     grown.extend(random_bytes(8, MIB));
     write(&h.src(), "a.bin", &grown);
-    let second = h.push("p").await.unwrap();
+    let second = h.push_xorb("p").await.unwrap();
     assert!(second.xorbs_reused() >= 1, "{second:?}");
     assert!(second.xorb_bytes_sent < first.xorb_bytes_sent + MIB as u64);
     assert_eq!(fs::read(h.root().join("p/a.bin")).unwrap(), grown);
@@ -277,6 +291,7 @@ async fn unauthorized_client_cannot_push() {
             parallel_streams: 1,
             max_memory_bytes: transfer::DEFAULT_MAX_MEMORY_BYTES,
             delete: false,
+            mode: TransferMode::Chunk,
         };
         push(h.sender_cas.clone(), &h.src(), &conn, &opts).await
     }
@@ -310,6 +325,7 @@ where
             session_id: "test".into(),
             dest: "p".into(),
             delete: false,
+            mode: TransferMode::Xorb,
         },
     )
     .await
@@ -454,6 +470,7 @@ async fn interrupted_push(h: &Harness, dest: &str, commit: usize) -> usize {
             session_id: "interrupted".into(),
             dest: dest.into(),
             delete: false,
+            mode: TransferMode::Xorb,
         },
     )
     .await
@@ -529,7 +546,7 @@ async fn interrupted_push_resumes_without_resending_committed_content() {
         "nothing installed by the interrupted attempt"
     );
 
-    let r = h.push("p").await.unwrap();
+    let r = h.push_xorb("p").await.unwrap();
     let rr = &r.receiver;
     assert!(rr.resumed, "{rr:?}");
     assert_eq!(rr.attempts, 2);
@@ -553,7 +570,7 @@ async fn interrupted_before_any_xorb_still_reuses_shard() {
     let h = Harness::new().await;
     write(&h.src(), "a.bin", &random_bytes(31, 3 * MIB));
     let needed = interrupted_push(&h, "p", 0).await;
-    let r = h.push("p").await.unwrap();
+    let r = h.push_xorb("p").await.unwrap();
     assert!(r.receiver.resumed && r.receiver.reconstructions_reused == 1);
     assert_eq!(r.shard_bytes_sent, 0);
     assert_eq!(r.xorbs_sent, needed);
@@ -588,7 +605,7 @@ async fn changed_source_after_interruption_starts_fresh_but_reuses_xorbs() {
     write(&h.src(), "big.bin", &random_bytes(33, 150 * MIB));
     interrupted_push(&h, "p", 2).await;
     write(&h.src(), "new.txt", b"added after the interruption");
-    let r = h.push("p").await.unwrap();
+    let r = h.push_xorb("p").await.unwrap();
     // Different manifest, so a different session; the committed xorbs are still found in the CAS,
     // and the unchanged file's entry is reused, so only new.txt's metadata is requested.
     assert!(!r.receiver.resumed);
@@ -636,6 +653,7 @@ async fn tiny_memory_budgets_still_complete_one_xorb_at_a_time() {
         .push_with("p", |o| {
             o.max_memory_bytes = 1;
             o.parallel_streams = 8;
+            o.mode = TransferMode::Xorb;
         })
         .await
         .unwrap();
@@ -737,4 +755,154 @@ async fn delete_never_reaches_outside_destination() {
     h.push_with("p", |o| o.delete = true).await.unwrap();
     assert!(h.root().join("sibling/precious.txt").exists());
     assert!(h.root().join(".xet-p2p/cas").exists());
+}
+
+// ---- M3: chunk mode ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chunk_push_tree_to_empty_receiver() {
+    let h = Harness::new().await;
+    write(&h.src(), "a.bin", &random_bytes(40, 3 * MIB));
+    write(&h.src(), "nested/b.txt", b"chunks over quic\n");
+    write(&h.src(), "empty", b"");
+    let r = h.push("p").await.unwrap();
+    let rr = &r.receiver;
+    assert_eq!(rr.mode, TransferMode::Chunk);
+    assert_trees_equal(&h.src(), &h.root().join("p"));
+    assert!(rr.chunks_received > 0 && rr.xorbs_packed >= 1, "{rr:?}");
+    assert_eq!(rr.chunks_received, rr.chunks_total - rr.chunks_present);
+    assert_eq!((r.xorbs_sent, r.shard_bytes_sent), (0, 0));
+    assert_eq!(rr.payload_bytes_received, r.payload_bytes_sent());
+    assert_eq!(rr.chunk_bytes_received, r.chunk_bytes_sent);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chunk_second_push_sends_zero_payload() {
+    let h = Harness::new().await;
+    write(&h.src(), "a.bin", &random_bytes(41, 2 * MIB));
+    h.push("p").await.unwrap();
+    let r = h.push("p").await.unwrap();
+    assert_eq!(r.payload_bytes_sent(), 0, "{r:?}");
+    assert_eq!(r.receiver.files_unchanged, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chunk_mode_multi_xorb_file_and_repack() {
+    let h = Harness::new().await;
+    write(&h.src(), "big.bin", &random_bytes(42, 90 * MIB));
+    let r = h.push("p").await.unwrap();
+    assert!(r.receiver.xorbs_packed >= 5, "{:?}", r.receiver);
+    assert_trees_equal(&h.src(), &h.root().join("p"));
+}
+
+/// Pushing one file whose sender xorb is shared with many other files: only its chunks move.
+#[tokio::test(flavor = "multi_thread")]
+async fn chunk_mode_shared_xorb_cold_receiver() {
+    let h = Harness::new().await;
+    let all = h.tmp.path().join("all");
+    for i in 0..40 {
+        write(
+            &all,
+            &format!("f{i:02}.bin"),
+            &random_bytes(300 + i, 512 * 1024),
+        );
+    }
+    h.sender_cas.ingest(&all).await.unwrap();
+    write(&h.src(), "f07.bin", &random_bytes(307, 512 * 1024));
+    let r = h.push("c").await.unwrap();
+    assert_eq!(r.receiver.chunks_present, 0);
+    assert!(r.payload_bytes_sent() < 600 * 1024, "{r:?}");
+    assert!(r.xorbs_referenced >= 1);
+    assert_trees_equal(&h.src(), &h.root().join("c"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chunk_mode_reuses_chunks_from_another_senders_xorbs() {
+    let h = Harness::new().await;
+    let base = random_bytes(43, 16 * MIB);
+    write(&h.src(), "model.bin", &base);
+    h.push("p").await.unwrap();
+
+    // Edit, then push from a different sender CAS that shares no xorbs with the receiver.
+    let mut v2 = base.clone();
+    v2.splice(8 * MIB..8 * MIB, random_bytes(44, 5000));
+    write(&h.src(), "model.bin", &v2);
+    let other = Arc::new(
+        LocalCas::open(h.tmp.path().join("other-sender"))
+            .await
+            .unwrap(),
+    );
+    let chunk = h.push_from(&other, "p", |_| {}).await.unwrap();
+    assert!(chunk.receiver.chunks_present > 200, "{:?}", chunk.receiver);
+    assert!(chunk.chunk_bytes_sent < 400 * 1024, "{chunk:?}");
+    assert_eq!(fs::read(h.root().join("p/model.bin")).unwrap(), v2);
+
+    // The same push in xorb mode from yet another fresh sender sends everything.
+    let third = Arc::new(
+        LocalCas::open(h.tmp.path().join("third-sender"))
+            .await
+            .unwrap(),
+    );
+    write(&h.src(), "model.bin", &{
+        let mut v3 = v2.clone();
+        v3.splice(0..0, random_bytes(45, 100));
+        v3
+    });
+    let xorb = h
+        .push_from(&third, "q", |o| o.mode = TransferMode::Xorb)
+        .await
+        .unwrap();
+    assert!(xorb.xorb_bytes_sent > 15 * MIB as u64, "{xorb:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chunk_mode_interrupted_push_resumes() {
+    let h =
+        Harness::with_receiver(|o| o.commit_delay = Some(std::time::Duration::from_millis(400)))
+            .await;
+    write(&h.src(), "big.bin", &random_bytes(46, 70 * MIB));
+
+    // Start a push and abandon it (dropping its connection) after the first packed xorb commits.
+    let sessions = h.root().join(".xet-p2p/cas/sessions");
+    let push = {
+        let h = &h;
+        async move { h.push("p").await }
+    };
+    let committed = async {
+        loop {
+            let n = fs::read_dir(&sessions)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .filter_map(|e| fs::read(e.path()).ok())
+                .filter_map(|b| String::from_utf8(b).ok())
+                .any(|t| !t.contains("\"xorbs_committed\": 0"));
+            if n {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::select! {
+        r = push => panic!("push finished before interruption: {r:?}"),
+        _ = committed => {}
+    }
+    // Let the receiver notice the dropped connection and release the destination.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let r = h.push("p").await.unwrap();
+    let rr = &r.receiver;
+    assert!(rr.resumed, "{rr:?}");
+    assert!(rr.prior_xorbs_committed >= 1);
+    assert_eq!(rr.chunk_lists_reused, 1);
+    assert_eq!(
+        r.chunk_list_bytes_sent, 0,
+        "chunk list must come from saved state"
+    );
+    assert!(
+        rr.chunks_present > 0 && rr.chunks_received < rr.chunks_total,
+        "{rr:?}"
+    );
+    assert_trees_equal(&h.src(), &h.root().join("p"));
 }

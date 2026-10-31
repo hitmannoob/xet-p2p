@@ -191,16 +191,20 @@ fn receiver_killed_mid_transfer_resumes_after_restart() {
 
     assert_eq!(rr["resumed"], true, "{report:#}");
     assert_eq!(rr["prior_xorbs_committed"].as_u64().unwrap(), committed);
+    // Chunk mode (the default): chunk lists come from saved state, and every chunk packed into
+    // a committed xorb before the crash is found locally instead of being re-sent.
+    assert_eq!(rr["mode"], "chunk");
     assert!(
-        rr["reconstructions_reused"].as_u64().unwrap() >= 1,
+        rr["chunk_lists_reused"].as_u64().unwrap() >= 1,
         "{report:#}"
     );
-    assert_eq!(report["shard_bytes_sent"], 0);
-    let referenced = report["xorbs_referenced"].as_u64().unwrap();
-    let sent = report["xorbs_sent"].as_u64().unwrap();
+    assert_eq!(report["chunk_list_bytes_sent"], 0);
+    let total = rr["chunks_total"].as_u64().unwrap();
+    let present = rr["chunks_present"].as_u64().unwrap();
+    let received = rr["chunks_received"].as_u64().unwrap();
     assert!(
-        committed >= 1 && sent <= referenced - committed,
-        "re-sent committed xorbs: {report:#}"
+        committed >= 1 && present > 0 && received == total - present,
+        "re-sent committed chunks: {report:#}"
     );
     assert_eq!(std::fs::read(p.root.join("project/big.bin")).unwrap(), data);
     assert_eq!(

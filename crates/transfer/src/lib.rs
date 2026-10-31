@@ -11,7 +11,7 @@ mod sender;
 mod session;
 
 pub use error::{Error, Result};
-pub use protocol::ReceiverReport;
+pub use protocol::{ReceiverReport, TransferMode};
 pub use receiver::{Receiver, ReceiverOptions};
 pub use sender::{DEFAULT_MAX_MEMORY_BYTES, PushOptions, PushReport, push};
 pub use session::SessionRecord;

@@ -1,20 +1,24 @@
-//! The xet-p2p control protocol (version 1).
+//! The xet-p2p control protocol (version 2).
 //!
 //! One bidirectional control stream, opened by the sender, carries CBOR [`Message`] frames.
 //! Objects travel on unidirectional streams opened by the sender: an [`ObjectHeader`] frame
-//! followed by the object's native Xet bytes, unchanged.
+//! followed by the object's bytes. Xorbs, shards, and chunk runs are native Xet bytes, unchanged.
 //!
+//! Chunk mode (default):
 //! ```text
-//! sender                                receiver
-//!   HELLO {version, session, dest}  ->
-//!                                   <-  HELLO_OK
-//!   MANIFEST                        ->
-//!                                   <-  NEED {reconstructions, xorbs}   (0..n rounds)
-//!   [uni] OBJECT shard / xorb ...   ->
-//!                                   <-  ACK per verified, committed object
-//!                                       (receiver: verify, reconstruct, atomically install)
-//!                                   <-  RESULT  |  ERROR
+//! sender                                  receiver
+//!   HELLO {version, session, dest, mode} ->
+//!                                       <-  HELLO_OK
+//!   MANIFEST                             ->
+//!                                       <-  NEED_CHUNK_LISTS {files}        (new files only)
+//!   [uni] CHUNK_LISTS                    ->  verified against each file hash
+//!                                       <-  NEED_CHUNKS {file, ranges}*     (chunks not held)
+//!   [uni] CHUNK_RUN ...                  ->  each chunk hashed, repacked into native xorbs
+//!                                       <-  ACK per verified run
+//!                                       <-  RESULT  |  ERROR
 //! ```
+//! Xorb mode (v1 behaviour): `NEED {reconstructions, xorbs}` rounds answered with native shard and
+//! whole xorb objects.
 //!
 //! `FINALIZE` from the brief is implicit: once the receiver holds everything the manifest needs it
 //! reconstructs, verifies, and installs without further instruction.
@@ -24,7 +28,7 @@ use xet_local::{Manifest, MerkleHash};
 
 use crate::error::{Error, Result};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -37,6 +41,28 @@ pub const MAX_OBJECT_HEADER: u32 = 4096;
 pub const MAX_XORB_BYTES: u64 = 80 * MIB;
 /// Largest shard accepted (reconstruction metadata for one transfer).
 pub const MAX_SHARD_BYTES: u64 = 256 * MIB;
+/// Largest chunk-list object accepted (36 bytes per chunk: ~460 GiB of data at 64 KiB chunks).
+pub const MAX_CHUNK_LISTS_BYTES: u64 = 256 * MIB;
+/// Largest chunk run accepted (a run never spans more than one xorb).
+pub const MAX_CHUNK_RUN_BYTES: u64 = MAX_XORB_BYTES;
+
+/// How missing content is moved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferMode {
+    /// Only chunks the receiver lacks, repacked into native xorbs on the receiver.
+    #[default]
+    Chunk,
+    /// Whole native xorbs, as stored by the sender.
+    Xorb,
+}
+
+/// Chunk index ranges `[start, end)` into one file's chunk list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkRequest {
+    pub file: String,
+    pub ranges: Vec<(u32, u32)>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -49,6 +75,8 @@ pub enum Message {
         /// Mirror: remove anything under `dest` the manifest does not describe (opt-in).
         #[serde(default)]
         delete: bool,
+        #[serde(default)]
+        mode: TransferMode,
     },
     HelloOk {
         protocol_version: u32,
@@ -61,6 +89,12 @@ pub enum Message {
         reconstructions: Vec<String>,
         /// Xorb hashes wanted as whole native xorbs.
         xorbs: Vec<String>,
+    },
+    NeedChunkLists {
+        files: Vec<String>,
+    },
+    NeedChunks {
+        requests: Vec<ChunkRequest>,
     },
     Ack {
         kind: ObjectKind,
@@ -81,6 +115,8 @@ impl Message {
             Message::HelloOk { .. } => "HELLO_OK",
             Message::Manifest { .. } => "MANIFEST",
             Message::Need { .. } => "NEED",
+            Message::NeedChunkLists { .. } => "NEED_CHUNK_LISTS",
+            Message::NeedChunks { .. } => "NEED_CHUNKS",
             Message::Ack { .. } => "ACK",
             Message::Result { .. } => "RESULT",
             Message::Error { .. } => "ERROR",
@@ -93,6 +129,8 @@ impl Message {
 pub enum ObjectKind {
     Shard,
     Xorb,
+    ChunkLists,
+    ChunkRun,
 }
 
 /// First frame of every object stream.
@@ -130,6 +168,20 @@ pub struct ReceiverReport {
     /// With `delete`: entries removed from the destination.
     pub files_deleted: usize,
     pub dirs_deleted: usize,
+    pub mode: TransferMode,
+    /// Chunk mode: chunks across the new files (with repeats), distinct chunks already held
+    /// locally (and their bytes), and distinct chunks received.
+    pub chunks_total: usize,
+    pub chunks_present: usize,
+    pub chunk_bytes_present: u64,
+    pub chunks_received: usize,
+    /// Native chunk-run bytes and chunk-list bytes received.
+    pub chunk_bytes_received: u64,
+    pub chunk_list_bytes_received: u64,
+    /// Native xorbs built on the receiver from received chunks.
+    pub xorbs_packed: usize,
+    /// Chunk lists saved by an earlier, interrupted attempt and reused.
+    pub chunk_lists_reused: usize,
     /// Reconstruction entries received by an earlier, interrupted attempt and reused instead of
     /// being requested again.
     pub reconstructions_reused: usize,

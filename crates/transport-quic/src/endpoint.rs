@@ -14,7 +14,7 @@ use crate::identity::{Identity, SERVER_NAME};
 use crate::verify::{PinnedClientVerifier, PinnedServerVerifier};
 
 /// ALPN protocol identifier; bumped with incompatible wire changes.
-pub const ALPN: &[u8] = b"xet-p2p/1";
+pub const ALPN: &[u8] = b"xet-p2p/2";
 
 /// Tunables shared by both endpoints.
 #[derive(Debug, Clone)]

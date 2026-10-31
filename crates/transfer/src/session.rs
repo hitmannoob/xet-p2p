@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use xet_local::chunks::{ChunkList, decode_chunk_lists, encode_chunk_lists};
 use xet_local::{Manifest, MerkleHash, PendingShard};
 
 use crate::error::{Error, Result};
@@ -138,8 +139,49 @@ impl SessionStore {
         }
     }
 
+    /// Loads saved chunk lists for any of `wanted`, re-verifying each against its file hash.
+    pub fn take_chunk_lists(
+        &self,
+        wanted: &BTreeSet<MerkleHash>,
+    ) -> (Vec<(MerkleHash, ChunkList)>, BTreeSet<MerkleHash>) {
+        let mut lists = Vec::new();
+        let mut found = BTreeSet::new();
+        for hash in wanted {
+            let one = BTreeSet::from([*hash]);
+            if let Some(mut l) = fs::read(self.chunks_path(hash))
+                .ok()
+                .and_then(|b| decode_chunk_lists(&b, &one).ok())
+            {
+                lists.append(&mut l);
+                found.insert(*hash);
+            }
+        }
+        (lists, found)
+    }
+
+    /// Saves verified chunk lists, one file each, for later attempts.
+    pub fn put_chunk_lists(&self, lists: &[(MerkleHash, ChunkList)]) -> Result<()> {
+        for entry in lists {
+            write_atomic(
+                &self.chunks_path(&entry.0),
+                &encode_chunk_lists(std::slice::from_ref(entry)),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_chunk_lists(&self, hashes: &BTreeSet<MerkleHash>) {
+        for hash in hashes {
+            let _ = fs::remove_file(self.chunks_path(hash));
+        }
+    }
+
     fn pending_path(&self, hash: &MerkleHash) -> PathBuf {
         self.pending.join(format!("{}.shard", hash.hex()))
+    }
+
+    fn chunks_path(&self, hash: &MerkleHash) -> PathBuf {
+        self.pending.join(format!("{}.chunks", hash.hex()))
     }
 
     fn path(&self, key: &str) -> PathBuf {

@@ -107,12 +107,14 @@ pub fn decode_chunk_lists(
     Ok(out)
 }
 
-/// Native serialized chunks `[start, end)` of one sender xorb.
+/// Native serialized chunks `[start, end)` of one sender xorb, at bytes `byte_range` of it.
 #[derive(Debug, Clone)]
 pub struct ChunkRun {
     pub xorb: MerkleHash,
     pub start: u32,
     pub end: u32,
+    pub byte_range: Range<u64>,
+    /// Filled by [`LocalCas::read_chunk_run`].
     pub bytes: Vec<u8>,
 }
 
@@ -247,10 +249,34 @@ impl LocalCas {
         file: &MerkleHash,
         ranges: &[(u32, u32)],
     ) -> Result<Vec<ChunkRun>> {
+        let mut runs = self.plan_chunk_runs(file, ranges).await?;
+        for run in &mut runs {
+            self.read_chunk_run(run).await?;
+        }
+        Ok(runs)
+    }
+
+    /// Maps `ranges` of `file`'s chunk list to runs in this CAS's xorbs, without reading data.
+    pub async fn plan_chunk_runs(
+        &self,
+        file: &MerkleHash,
+        ranges: &[(u32, u32)],
+    ) -> Result<Vec<ChunkRun>> {
         let info = self.file_info(file).await?;
         let mut footers = HashMap::new();
         let mut runs: Vec<ChunkRun> = Vec::new();
+        let total: u32 = info
+            .segments
+            .iter()
+            .map(|s| s.chunk_index_end - s.chunk_index_start)
+            .sum();
         for &(a, b) in ranges {
+            if a >= b || b > total {
+                return Err(Error::InvalidManifest(format!(
+                    "chunk range {a}..{b} outside file {} ({total} chunks)",
+                    file.hex()
+                )));
+            }
             let mut pos = 0u32; // file chunk index at the start of `seg`
             for seg in &info.segments {
                 let len = seg.chunk_index_end - seg.chunk_index_start;
@@ -269,17 +295,12 @@ impl LocalCas {
                             xorb: seg.xorb_hash,
                             start,
                             end,
+                            byte_range: 0..0,
                             bytes: Vec::new(),
                         });
                     }
                 }
                 pos += len;
-            }
-            if b > pos || a >= b {
-                return Err(Error::InvalidManifest(format!(
-                    "chunk range {a}..{b} outside file {} ({pos} chunks)",
-                    file.hex()
-                )));
             }
         }
         for run in &mut runs {
@@ -287,14 +308,23 @@ impl LocalCas {
             let (lo, hi) = footer
                 .get_byte_offset(run.start, run.end)
                 .map_err(xet_err)?;
-            run.bytes = self
-                .client
-                .get_xorb_raw_bytes(&run.xorb, Some(FileRange::new(lo as u64, hi as u64)))
-                .await
-                .map_err(xet_err)?
-                .into();
+            run.byte_range = lo as u64..hi as u64;
         }
         Ok(runs)
+    }
+
+    /// Reads a planned run's native bytes.
+    pub async fn read_chunk_run(&self, run: &mut ChunkRun) -> Result<()> {
+        run.bytes = self
+            .client
+            .get_xorb_raw_bytes(
+                &run.xorb,
+                Some(FileRange::new(run.byte_range.start, run.byte_range.end)),
+            )
+            .await
+            .map_err(xet_err)?
+            .into();
+        Ok(())
     }
 
     // ---- receiver ----

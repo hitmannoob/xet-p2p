@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use transfer::{PushOptions, PushReport, Receiver, ReceiverOptions, push};
+use transfer::{PushOptions, PushReport, Receiver, ReceiverOptions, TransferMode, push};
 use transport_quic::{
     EndpointOptions, Identity, bind_addr_for, client_endpoint, connect, fingerprint, generate,
     load_cert, server_endpoint,
@@ -95,6 +95,9 @@ enum Command {
         /// every new file has been verified; never touches anything outside --dest.
         #[arg(long)]
         delete: bool,
+        /// Transfer mode: "chunk" (only missing chunks, default) or "xorb" (whole xorbs).
+        #[arg(long, default_value = "chunk", value_parser = ["chunk", "xorb"])]
+        mode: String,
         /// Print the transfer report as JSON on stdout.
         #[arg(long)]
         json: bool,
@@ -201,6 +204,7 @@ async fn main() -> Result<()> {
             parallel,
             max_memory_mib,
             delete,
+            mode,
             json,
         } => {
             let addr = tokio::net::lookup_host(&to)
@@ -225,6 +229,11 @@ async fn main() -> Result<()> {
                 parallel_streams: parallel as usize,
                 max_memory_bytes: max_memory_mib.saturating_mul(1024 * 1024),
                 delete,
+                mode: if mode == "xorb" {
+                    TransferMode::Xorb
+                } else {
+                    TransferMode::Chunk
+                },
             };
             if delete {
                 eprintln!(
@@ -346,17 +355,31 @@ fn print_push_report(r: &PushReport) {
         "  local ingest: {} chunks ({} new), {} new bytes, {} deduped",
         d.total_chunks, d.new_chunks, d.new_bytes, d.deduped_bytes
     );
+    let rr = &r.receiver;
+    match rr.mode {
+        TransferMode::Xorb => eprintln!(
+            "  whole-xorb mode: {} xorbs referenced, {} sent, {} reused on receiver",
+            r.xorbs_referenced,
+            r.xorbs_sent,
+            r.xorbs_reused()
+        ),
+        TransferMode::Chunk => eprintln!(
+            "  chunk mode: {} chunks in new files, {} already on receiver ({} bytes), {} sent in {} runs; {} xorbs packed",
+            rr.chunks_total,
+            rr.chunks_present,
+            rr.chunk_bytes_present,
+            rr.chunks_received,
+            r.chunk_runs_sent,
+            rr.xorbs_packed
+        ),
+    }
     eprintln!(
-        "  xorbs: {} referenced, {} sent, {} reused on receiver",
-        r.xorbs_referenced,
-        r.xorbs_sent,
-        r.xorbs_reused()
-    );
-    eprintln!(
-        "  payload sent: {} bytes ({} xorb, {} shard); UDP sent: {} bytes",
+        "  payload sent: {} bytes ({} xorb, {} shard, {} chunk, {} chunk-list); UDP sent: {} bytes",
         r.payload_bytes_sent(),
         r.xorb_bytes_sent,
         r.shard_bytes_sent,
+        r.chunk_bytes_sent,
+        r.chunk_list_bytes_sent,
         r.udp_bytes_sent
     );
     if secs > 0.0 {
@@ -366,7 +389,6 @@ fn print_push_report(r: &PushReport) {
             r.payload_bytes_sent() as f64 / secs / 1048576.0
         );
     }
-    let rr = &r.receiver;
     eprintln!(
         "  receiver: {} files installed, {} unchanged; {} bytes reconstructed and verified",
         rr.files_installed, rr.files_unchanged, rr.bytes_reconstructed
@@ -408,6 +430,9 @@ fn report_json(r: &PushReport) -> serde_json::Value {
         "xorbs_reused": r.xorbs_reused(),
         "xorb_bytes_sent": r.xorb_bytes_sent,
         "shard_bytes_sent": r.shard_bytes_sent,
+        "chunk_bytes_sent": r.chunk_bytes_sent,
+        "chunk_runs_sent": r.chunk_runs_sent,
+        "chunk_list_bytes_sent": r.chunk_list_bytes_sent,
         "payload_bytes_sent": r.payload_bytes_sent(),
         "udp_bytes_sent": r.udp_bytes_sent,
         "elapsed_secs": r.elapsed.as_secs_f64(),

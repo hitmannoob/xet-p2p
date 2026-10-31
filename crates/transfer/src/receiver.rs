@@ -10,15 +10,20 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 use transport_quic::quinn::{Connection, Endpoint, RecvStream, SendStream};
 use transport_quic::{fingerprint, peer_certificate, read_frame, read_payload, write_frame};
+use xet_local::chunks::{VerifiedChunk, XorbPacker, decode_chunk_lists, parse_chunk_run};
 use xet_local::manifest::validate_rel_path;
-use xet_local::{LocalCas, MerkleHash, PendingShard, ReconstructOptions, create_confined_dir};
+use xet_local::{
+    LocalCas, Manifest, MerkleHash, MissingContent, PendingShard, ReconstructOptions,
+    create_confined_dir,
+};
 
 use crate::budget::MemoryBudget;
 use crate::error::{Error, Result};
 use crate::locks::DestLocks;
 use crate::protocol::{
-    MAX_CONTROL_FRAME, MAX_OBJECT_HEADER, MAX_SHARD_BYTES, MAX_XORB_BYTES, Message, ObjectHeader,
-    ObjectKind, PROTOCOL_VERSION, ReceiverReport, parse_hash, to_hex,
+    ChunkRequest, MAX_CHUNK_LISTS_BYTES, MAX_CHUNK_RUN_BYTES, MAX_CONTROL_FRAME, MAX_OBJECT_HEADER,
+    MAX_SHARD_BYTES, MAX_XORB_BYTES, Message, ObjectHeader, ObjectKind, PROTOCOL_VERSION,
+    ReceiverReport, TransferMode, parse_hash, to_hex,
 };
 use crate::session::{Session, SessionStore};
 
@@ -139,22 +144,23 @@ impl Receiver {
         send: &mut SendStream,
         recv: &mut RecvStream,
     ) -> Result<ReceiverReport> {
-        let (dest, delete) = match next(recv).await? {
+        let (dest, delete, mode) = match next(recv).await? {
             Message::Hello {
                 protocol_version,
                 session_id,
                 dest,
                 delete,
+                mode,
             } => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(Error::Protocol(format!(
                         "unsupported protocol version {protocol_version} (receiver speaks {PROTOCOL_VERSION})"
                     )));
                 }
-                info!(connection = %session_id, %dest, delete, "HELLO");
+                info!(connection = %session_id, %dest, delete, ?mode, "HELLO");
                 self.check_dest(&dest)?;
                 self.check_scope(conn, &dest)?;
-                (dest, delete)
+                (dest, delete, mode)
             }
             other => return Err(unexpected(other)),
         };
@@ -190,6 +196,48 @@ impl Receiver {
         }
 
         let missing = self.cas.missing_content(&manifest).await?;
+        report.mode = mode;
+        match mode {
+            TransferMode::Xorb => {
+                self.fetch_whole_xorbs(conn, send, &missing, &mut session, &mut report)
+                    .await?
+            }
+            TransferMode::Chunk => {
+                self.fetch_chunks(conn, send, &manifest, &missing, &mut session, &mut report)
+                    .await?
+            }
+        }
+
+        let dest_dir = create_confined_dir(&self.root, &dest)?;
+        let r = self
+            .cas
+            .reconstruct_with(
+                &manifest,
+                &dest_dir,
+                ReconstructOptions {
+                    delete_extraneous: delete,
+                },
+            )
+            .await?;
+        report.files_deleted = r.files_deleted;
+        report.dirs_deleted = r.dirs_deleted;
+        report.files_installed = r.files;
+        report.files_unchanged = r.files_unchanged;
+        report.dirs_created = r.dirs;
+        report.bytes_reconstructed = r.bytes;
+        session.finish()?;
+        Ok(report)
+    }
+
+    /// Whole-xorb mode: the sender's native shard entries and xorbs, as stored.
+    async fn fetch_whole_xorbs(
+        &self,
+        conn: &Connection,
+        send: &mut SendStream,
+        missing: &MissingContent,
+        session: &mut Session<'_>,
+        report: &mut ReceiverReport,
+    ) -> Result<()> {
         let mut xorbs = missing.xorbs.clone();
         let mut present = missing.present_xorbs.clone();
 
@@ -211,7 +259,9 @@ impl Receiver {
                     },
                 )
                 .await?;
-                let shard = self.receive_shard(conn).await?;
+                let shard = self
+                    .receive_single(conn, ObjectKind::Shard, MAX_SHARD_BYTES)
+                    .await?;
                 report.shards_received += 1;
                 report.payload_bytes_received += shard.len() as u64;
                 let p = PendingShard::parse(&shard, &need)?;
@@ -246,7 +296,7 @@ impl Receiver {
             )
             .await?;
             report.payload_bytes_received += self
-                .receive_xorbs(conn, send, xorbs.clone(), &mut session)
+                .receive_xorbs(conn, send, xorbs.clone(), session)
                 .await?;
             report.xorbs_received += xorbs.len();
         }
@@ -258,25 +308,183 @@ impl Receiver {
             self.sessions.remove_pending(&files);
         }
 
-        let dest_dir = create_confined_dir(&self.root, &dest)?;
-        let r = self
-            .cas
-            .reconstruct_with(
-                &manifest,
-                &dest_dir,
-                ReconstructOptions {
-                    delete_extraneous: delete,
+        Ok(())
+    }
+
+    /// Chunk mode: fetch only chunks this CAS does not hold (in any xorb), repack them into native
+    /// xorbs, and register fresh reconstructions for the new files.
+    async fn fetch_chunks(
+        &self,
+        conn: &Connection,
+        send: &mut SendStream,
+        manifest: &Manifest,
+        missing: &MissingContent,
+        session: &mut Session<'_>,
+        report: &mut ReceiverReport,
+    ) -> Result<()> {
+        report.xorbs_already_present = missing.present_xorbs.len();
+        // Files to describe: never seen, or whose stored reconstruction lost a xorb.
+        let wanted: BTreeSet<MerkleHash> = missing
+            .reconstructions
+            .union(&missing.files_missing_xorbs)
+            .copied()
+            .collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+
+        let (mut lists, have) = self.sessions.take_chunk_lists(&wanted);
+        report.chunk_lists_reused = have.len();
+        let need: BTreeSet<MerkleHash> = wanted.difference(&have).copied().collect();
+        if !need.is_empty() {
+            write_frame(
+                send,
+                &Message::NeedChunkLists {
+                    files: to_hex(need.iter().copied()),
                 },
             )
             .await?;
-        report.files_deleted = r.files_deleted;
-        report.dirs_deleted = r.dirs_deleted;
-        report.files_installed = r.files;
-        report.files_unchanged = r.files_unchanged;
-        report.dirs_created = r.dirs;
-        report.bytes_reconstructed = r.bytes;
-        session.finish()?;
-        Ok(report)
+            let bytes = self
+                .receive_single(conn, ObjectKind::ChunkLists, MAX_CHUNK_LISTS_BYTES)
+                .await?;
+            report.chunk_list_bytes_received += bytes.len() as u64;
+            report.payload_bytes_received += bytes.len() as u64;
+            let got = tokio::task::spawn_blocking(move || decode_chunk_lists(&bytes, &need))
+                .await
+                .map_err(|e| Error::Protocol(format!("decode task failed: {e}")))??;
+            self.sessions.put_chunk_lists(&got)?;
+            write_frame(
+                send,
+                &Message::Ack {
+                    kind: ObjectKind::ChunkLists,
+                    hash: None,
+                },
+            )
+            .await?;
+            lists.extend(got);
+        }
+
+        let plan = self.cas.plan_chunks(&lists)?;
+        report.chunks_total = plan.total_chunks;
+        report.chunks_present = plan.present_chunks;
+        report.chunk_bytes_present = plan.present_bytes;
+        if !plan.missing.is_empty() {
+            let requests = plan
+                .requests
+                .iter()
+                .map(|(file, ranges)| ChunkRequest {
+                    file: file.hex(),
+                    ranges: ranges.clone(),
+                })
+                .collect();
+            write_frame(send, &Message::NeedChunks { requests }).await?;
+            self.receive_chunk_runs(conn, send, plan.missing.clone(), session, report)
+                .await?;
+        }
+
+        let sha: HashMap<MerkleHash, String> = manifest
+            .files()
+            .filter_map(|(_, _, h, sha, _)| Some((MerkleHash::from_hex(h).ok()?, sha.to_owned())))
+            .collect();
+        let files: Vec<_> = lists
+            .into_iter()
+            .map(|(f, l)| {
+                let sha = sha.get(&f).cloned().ok_or_else(|| {
+                    Error::Protocol(format!("chunk list for file {} not in manifest", f.hex()))
+                })?;
+                Ok((f, l, sha))
+            })
+            .collect::<Result<_>>()?;
+        self.cas.register_files(&files).await?;
+        self.sessions.remove_chunk_lists(&wanted);
+        Ok(())
+    }
+
+    /// Receives chunk runs until every chunk in `outstanding` has arrived and verified. Each
+    /// chunk is hashed; unrequested or repeated chunks abort the transfer. Verified native chunk
+    /// bytes are packed into new xorbs, committed as each fills.
+    async fn receive_chunk_runs(
+        &self,
+        conn: &Connection,
+        send: &mut SendStream,
+        mut outstanding: HashMap<MerkleHash, u64>,
+        session: &mut Session<'_>,
+        report: &mut ReceiverReport,
+    ) -> Result<()> {
+        type Received = (
+            Vec<u8>,
+            Vec<VerifiedChunk>,
+            tokio::sync::OwnedSemaphorePermit,
+        );
+        let permits = Arc::new(Semaphore::new(self.opts.parallel_objects));
+        let mut tasks: JoinSet<Result<Received>> = JoinSet::new();
+        let mut packer = XorbPacker::default();
+
+        while !outstanding.is_empty() || !tasks.is_empty() {
+            tokio::select! {
+                stream = conn.accept_uni(), if !outstanding.is_empty() => {
+                    let mut stream = stream?;
+                    let (permits, budget) = (permits.clone(), self.budget.clone());
+                    tasks.spawn(async move {
+                        let _permit = permits.acquire_owned().await.expect("semaphore never closed");
+                        let header = read_header(&mut stream).await?;
+                        if header.kind != ObjectKind::ChunkRun {
+                            return Err(Error::Protocol("expected a chunk run".into()));
+                        }
+                        if header.len > MAX_CHUNK_RUN_BYTES {
+                            return Err(transport_quic::Error::FrameTooLarge { len: header.len, max: MAX_CHUNK_RUN_BYTES }.into());
+                        }
+                        let memory = budget.reserve(header.len).await;
+                        let bytes = read_payload(&mut stream, header.len, MAX_CHUNK_RUN_BYTES).await?;
+                        let (bytes, chunks) = tokio::task::spawn_blocking(move || {
+                            let chunks = parse_chunk_run(&bytes);
+                            (bytes, chunks)
+                        })
+                        .await
+                        .map_err(|e| Error::Protocol(format!("verify task failed: {e}")))?;
+                        Ok((bytes, chunks?, memory))
+                    });
+                }
+                Some(done) = tasks.join_next(), if !tasks.is_empty() => {
+                    let (bytes, chunks, _memory) =
+                        done.map_err(|e| Error::Protocol(format!("receive task failed: {e}")))??;
+                    for c in chunks {
+                        if outstanding.remove(&c.hash).is_none() {
+                            return Err(Error::Protocol(format!("unrequested or duplicate chunk {}", c.hash.hex())));
+                        }
+                        packer.push(&bytes[c.span.clone()], c.size);
+                        report.chunks_received += 1;
+                        if packer.is_full() {
+                            self.flush_pack(&mut packer, session, report).await?;
+                        }
+                    }
+                    report.chunk_bytes_received += bytes.len() as u64;
+                    report.payload_bytes_received += bytes.len() as u64;
+                    write_frame(send, &Message::Ack { kind: ObjectKind::ChunkRun, hash: None }).await?;
+                }
+            }
+        }
+        if !packer.is_empty() {
+            self.flush_pack(&mut packer, session, report).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_pack(
+        &self,
+        packer: &mut XorbPacker,
+        session: &mut Session<'_>,
+        report: &mut ReceiverReport,
+    ) -> Result<()> {
+        let body = packer.take();
+        let len = body.len() as u64;
+        self.cas.commit_packed(body).await?;
+        report.xorbs_packed += 1;
+        session.xorb_committed(len)?;
+        if let Some(d) = self.opts.commit_delay {
+            tokio::time::sleep(d).await;
+        }
+        Ok(())
     }
 
     /// Rejects destinations that escape the root or overlap the CAS or session directories.
@@ -327,13 +535,19 @@ impl Receiver {
         }
     }
 
-    async fn receive_shard(&self, conn: &Connection) -> Result<Vec<u8>> {
+    /// Receives one object of `kind` (without a hash) of at most `max` bytes.
+    async fn receive_single(
+        &self,
+        conn: &Connection,
+        kind: ObjectKind,
+        max: u64,
+    ) -> Result<Vec<u8>> {
         let mut stream = conn.accept_uni().await?;
         let header = read_header(&mut stream).await?;
-        if header.kind != ObjectKind::Shard || header.hash.is_some() {
-            return Err(Error::Protocol("expected a shard object".into()));
+        if header.kind != kind || header.hash.is_some() {
+            return Err(Error::Protocol(format!("expected a {kind:?} object")));
         }
-        Ok(read_payload(&mut stream, header.len, MAX_SHARD_BYTES).await?)
+        Ok(read_payload(&mut stream, header.len, max).await?)
     }
 
     /// Receives exactly the requested xorbs, verifying and committing each, and ACKs each one.
