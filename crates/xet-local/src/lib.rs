@@ -7,11 +7,13 @@
 
 mod cas;
 mod error;
+mod exchange;
 pub mod manifest;
 mod walk;
 
-pub use cas::{IngestReport, LocalCas, MissingContent, ReconstructReport};
+pub use cas::{IngestReport, LocalCas, MissingContent, ReconstructReport, create_confined_dir};
 pub use error::{Error, Result};
+pub use exchange::PendingShard;
 pub use manifest::{Entry, EntryKind, Manifest};
 pub use xet_core_structures::merklehash::MerkleHash;
 pub use xet_data::deduplication::DeduplicationMetrics;

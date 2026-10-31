@@ -29,7 +29,7 @@ pub struct LocalCas {
     ctx: XetContext,
     config: Arc<TranslatorConfig>,
     /// The same store upstream sessions open for `config` (redb handles are shared per path).
-    client: Arc<LocalClient>,
+    pub(crate) client: Arc<LocalClient>,
 }
 
 /// SHA-256 of zero bytes. Upstream 1.8.0 reports all zeros for empty files.
@@ -38,15 +38,15 @@ const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495
 /// Content a manifest references that this CAS cannot yet reconstruct.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MissingContent {
-    /// Files whose reconstruction metadata (shard) is absent.
-    pub files_without_reconstruction: Vec<String>,
+    /// Xet file hashes whose reconstruction metadata (shard entry) is absent.
+    pub reconstructions: BTreeSet<MerkleHash>,
     /// Xorbs referenced by known reconstructions but not present locally.
     pub xorbs: BTreeSet<MerkleHash>,
 }
 
 impl MissingContent {
     pub fn is_empty(&self) -> bool {
-        self.files_without_reconstruction.is_empty() && self.xorbs.is_empty()
+        self.reconstructions.is_empty() && self.xorbs.is_empty()
     }
 }
 
@@ -182,9 +182,7 @@ impl LocalCas {
                 .await
                 .map_err(|e| Error::Xet(e.to_string()))?;
             let Some((info, _shard)) = info else {
-                missing
-                    .files_without_reconstruction
-                    .push(entry.path.clone());
+                missing.reconstructions.insert(hash);
                 continue;
             };
             for segment in &info.segments {
@@ -217,7 +215,7 @@ impl LocalCas {
         let missing = self.missing_content(manifest).await?;
         if !missing.is_empty() {
             return Err(Error::MissingContent {
-                files: missing.files_without_reconstruction.len(),
+                files: missing.reconstructions.len(),
                 xorbs: missing.xorbs.len(),
             });
         }
@@ -301,6 +299,22 @@ fn staging_name() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{STAGING_PREFIX}{}-{nanos}", std::process::id())
+}
+
+/// Creates `rel` (a manifest-style relative path) under `root` without following symlinks, and
+/// returns the resulting directory. Use this to confine a peer-chosen destination to a root.
+pub fn create_confined_dir(root: &Path, rel: &str) -> Result<PathBuf> {
+    let rel = validate_rel_path(rel)?;
+    let root = fs::canonicalize(root)?;
+    ensure_dir(&root, &rel)?;
+    let dir = fs::canonicalize(root.join(&rel))?;
+    if !dir.starts_with(&root) {
+        return Err(Error::UnsafePath {
+            path: rel.to_string_lossy().into_owned(),
+            reason: "resolves outside the root",
+        });
+    }
+    Ok(dir)
 }
 
 /// Creates `rel` under `dest` one component at a time, refusing to traverse symlinks or files.

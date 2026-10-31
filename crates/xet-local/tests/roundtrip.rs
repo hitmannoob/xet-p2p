@@ -323,10 +323,7 @@ async fn missing_content_fails_without_partial_files() {
         .await
         .unwrap();
     let missing = empty.missing_content(&manifest).await.unwrap();
-    assert_eq!(
-        missing.files_without_reconstruction,
-        vec!["a.bin".to_string()]
-    );
+    assert_eq!(missing.reconstructions.len(), 1);
     assert!(matches!(
         empty.reconstruct(&manifest, &f.dest).await,
         Err(Error::MissingContent { files: 1, .. })
