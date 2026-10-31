@@ -2633,6 +2633,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "transfer"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rand 0.9.5",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "transport-quic",
+ "xet-local",
+]
+
+[[package]]
 name = "transport-quic"
 version = "0.1.0"
 dependencies = [

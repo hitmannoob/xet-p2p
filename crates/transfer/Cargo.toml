@@ -1,0 +1,20 @@
+[package]
+name = "transfer"
+description = "xet-p2p transfer coordination: control protocol, push and receive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xet-local.workspace = true
+transport-quic.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
