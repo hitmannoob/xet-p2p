@@ -3318,6 +3318,9 @@ dependencies = [
  "clap",
  "serde_json",
  "tokio",
+ "tracing-subscriber",
+ "transfer",
+ "transport-quic",
  "xet-local",
 ]
 
