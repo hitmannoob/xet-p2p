@@ -9,7 +9,8 @@ pub mod identity;
 mod verify;
 
 pub use endpoint::{
-    ALPN, EndpointOptions, bind_addr_for, client_endpoint, connect, server_endpoint,
+    ALPN, EndpointOptions, bind_addr_for, client_endpoint, connect, peer_certificate,
+    server_endpoint,
 };
 pub use error::{Error, Result};
 pub use frame::{read_frame, read_payload, write_frame};

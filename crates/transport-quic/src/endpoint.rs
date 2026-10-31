@@ -120,3 +120,12 @@ pub fn bind_addr_for(remote: SocketAddr) -> SocketAddr {
         SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
     }
 }
+
+/// The certificate the peer authenticated with on `conn` (pinned mutual TLS guarantees one).
+pub fn peer_certificate(conn: &Connection) -> Option<CertificateDer<'static>> {
+    conn.peer_identity()?
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .ok()?
+        .into_iter()
+        .next()
+}

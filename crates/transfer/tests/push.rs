@@ -72,6 +72,11 @@ impl Harness {
     }
 
     async fn with_receiver(configure: impl FnOnce(&mut ReceiverOptions)) -> Self {
+        Self::with_receiver_for(|o, _| configure(o)).await
+    }
+
+    /// Like [`Self::with_receiver`], also passing the sender certificate's fingerprint.
+    async fn with_receiver_for(configure: impl FnOnce(&mut ReceiverOptions, &str)) -> Self {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("root");
         fs::create_dir_all(root.join(".xet-p2p")).unwrap();
@@ -91,7 +96,10 @@ impl Harness {
         // The receiver's CAS lives inside its root, as in the brief's example layout.
         let receiver_cas = Arc::new(LocalCas::open(root.join(".xet-p2p/cas")).await.unwrap());
         let mut opts = ReceiverOptions::new(&receiver_cas);
-        configure(&mut opts);
+        configure(
+            &mut opts,
+            &transport_quic::fingerprint(&identity(&client_id).cert),
+        );
         let receiver = Arc::new(Receiver::new(&root, receiver_cas, opts).unwrap());
         tokio::spawn(receiver.serve(server.clone()));
 
@@ -655,4 +663,39 @@ async fn destination_overlapping_session_dir_rejected() {
         "{err:?}"
     );
     assert!(h.push("elsewhere").await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sender_confined_to_its_scope() {
+    let h = Harness::with_receiver_for(|o, client_fp| {
+        o.client_scopes
+            .insert(client_fp.to_owned(), vec![PathBuf::from("projects/alice")]);
+    })
+    .await;
+    write(&h.src(), "a.txt", b"x");
+    assert!(h.push("projects/alice").await.is_ok());
+    assert!(h.push("projects/alice/deep/er").await.is_ok());
+    for dest in ["projects/bob", "projects", "projects/alicex", "other"] {
+        let err = h.push(dest).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Remote(ref m) if m.contains("allowed")),
+            "{dest}: {err:?}"
+        );
+    }
+    assert!(!h.root().join("projects/bob").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sender_without_scope_entry_rejected_when_scopes_configured() {
+    let h = Harness::with_receiver_for(|o, _| {
+        o.client_scopes
+            .insert("someone-else".into(), vec![PathBuf::new()]);
+    })
+    .await;
+    write(&h.src(), "a.txt", b"x");
+    let err = h.push("p").await.unwrap_err();
+    assert!(
+        matches!(err, Error::Remote(ref m) if m.contains("no destination scope")),
+        "{err:?}"
+    );
 }

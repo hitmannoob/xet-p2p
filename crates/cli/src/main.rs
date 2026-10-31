@@ -48,9 +48,10 @@ enum Command {
         cert: PathBuf,
         #[arg(long)]
         key: PathBuf,
-        /// Certificate of a sender allowed to push (repeatable).
-        #[arg(long = "allow-client", required = true)]
-        allow_client: Vec<PathBuf>,
+        /// A sender allowed to push: CERT or CERT=SCOPE (repeatable). With SCOPE, that sender may
+        /// only write within <root>/SCOPE; without it, anywhere under the root.
+        #[arg(long = "allow-client", required = true, value_name = "CERT[=SCOPE]")]
+        allow_client: Vec<String>,
         /// Objects received and verified concurrently.
         #[arg(long, default_value_t = 4)]
         parallel: u32,
@@ -143,12 +144,24 @@ async fn main() -> Result<()> {
             session_dir,
             test_commit_delay_ms,
         } => {
-            let allowed = allow_client
-                .iter()
-                .map(|p| load_cert(p).with_context(|| format!("loading {}", p.display())))
-                .collect::<Result<Vec<_>>>()?;
-            for (path, c) in allow_client.iter().zip(&allowed) {
-                eprintln!("authorized sender {} ({})", fingerprint(c), path.display());
+            let mut allowed = Vec::new();
+            let mut scopes: std::collections::HashMap<String, Vec<PathBuf>> = Default::default();
+            for spec in &allow_client {
+                let (path, scope) = parse_allow_client(spec)?;
+                let cert =
+                    load_cert(&path).with_context(|| format!("loading {}", path.display()))?;
+                let fp = fingerprint(&cert);
+                eprintln!(
+                    "authorized sender {fp} ({}) -> {}",
+                    path.display(),
+                    if scope.as_os_str().is_empty() {
+                        "<root>".to_string()
+                    } else {
+                        format!("<root>/{}", scope.display())
+                    }
+                );
+                scopes.entry(fp).or_default().push(scope);
+                allowed.push(cert);
             }
             let opts = EndpointOptions {
                 max_data_streams: parallel,
@@ -163,6 +176,7 @@ async fn main() -> Result<()> {
                 ropts.session_dir = dir;
             }
             ropts.commit_delay = test_commit_delay_ms.map(std::time::Duration::from_millis);
+            ropts.client_scopes = scopes;
             let receiver = Arc::new(Receiver::new(&root, cas, ropts)?);
             eprintln!(
                 "listening on {} (QUIC), root {}",
@@ -262,6 +276,19 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// `CERT` or `CERT=SCOPE`. A spec naming an existing file is always a bare path.
+fn parse_allow_client(spec: &str) -> Result<(PathBuf, PathBuf)> {
+    if Path::new(spec).is_file() {
+        return Ok((spec.into(), PathBuf::new()));
+    }
+    let Some((cert, scope)) = spec.rsplit_once('=') else {
+        return Ok((spec.into(), PathBuf::new()));
+    };
+    let scope = xet_local::manifest::validate_rel_path(scope)
+        .with_context(|| format!("invalid scope in --allow-client {spec}"))?;
+    Ok((cert.into(), scope))
 }
 
 fn keygen(out: &Path, name: &str) -> Result<()> {

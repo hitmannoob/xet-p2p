@@ -1,6 +1,6 @@
 //! Receiver side: decide what is missing locally, request it, verify it, reconstruct, install.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,7 +9,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use transport_quic::quinn::{Connection, Endpoint, RecvStream, SendStream};
-use transport_quic::{read_frame, read_payload, write_frame};
+use transport_quic::{fingerprint, peer_certificate, read_frame, read_payload, write_frame};
 use xet_local::manifest::validate_rel_path;
 use xet_local::{LocalCas, MerkleHash, PendingShard, create_confined_dir};
 
@@ -36,6 +36,10 @@ pub struct ReceiverOptions {
     /// Upper bound on xorb bytes held in memory at once, across all concurrent transfers
     /// (at least one xorb always fits).
     pub max_memory_bytes: u64,
+    /// Per-sender destination scopes, keyed by certificate SHA-256 fingerprint. A sender may write
+    /// only within one of its scopes (root-relative paths; an empty path means the whole root).
+    /// When empty, every authenticated sender may write anywhere under the root.
+    pub client_scopes: HashMap<String, Vec<PathBuf>>,
     /// Test hook: pause after committing each xorb, to make interruption timing deterministic.
     pub commit_delay: Option<Duration>,
 }
@@ -48,6 +52,7 @@ impl ReceiverOptions {
             session_dir: cas.root().join("sessions"),
             dest_lock_wait: Duration::from_secs(60),
             max_memory_bytes: crate::sender::DEFAULT_MAX_MEMORY_BYTES,
+            client_scopes: HashMap::new(),
             commit_delay: None,
         }
     }
@@ -147,6 +152,7 @@ impl Receiver {
                 }
                 info!(connection = %session_id, %dest, "HELLO");
                 self.check_dest(&dest)?;
+                self.check_scope(conn, &dest)?;
                 dest
             }
             other => return Err(unexpected(other)),
@@ -283,6 +289,30 @@ impl Receiver {
             }
         }
         Ok(())
+    }
+
+    /// Enforces the sender's configured destination scopes, if any.
+    fn check_scope(&self, conn: &Connection, dest: &str) -> Result<()> {
+        if self.opts.client_scopes.is_empty() {
+            return Ok(());
+        }
+        let cert = peer_certificate(conn)
+            .ok_or_else(|| Error::Protocol("peer presented no certificate".into()))?;
+        let fp = fingerprint(&cert);
+        let scopes = self
+            .opts
+            .client_scopes
+            .get(&fp)
+            .ok_or_else(|| Error::Protocol(format!("sender {fp} has no destination scope")))?;
+        let rel = validate_rel_path(dest)?;
+        if scopes.iter().any(|s| rel.starts_with(s)) {
+            Ok(())
+        } else {
+            Err(Error::Local(xet_local::Error::UnsafePath {
+                path: dest.to_owned(),
+                reason: "outside the destinations this sender is allowed to write",
+            }))
+        }
     }
 
     async fn receive_shard(&self, conn: &Connection) -> Result<Vec<u8>> {
