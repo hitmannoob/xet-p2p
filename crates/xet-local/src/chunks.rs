@@ -11,8 +11,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 
-use xet_client::cas_client::{Client, DirectAccessClient};
-use xet_client::cas_types::FileRange;
+use xet_client::cas_client::Client;
 use xet_core_structures::merklehash::{MerkleHash, compute_data_hash, file_hash};
 use xet_core_structures::metadata_shard::Sha256;
 use xet_core_structures::metadata_shard::chunk_verification::range_hash_from_chunks;
@@ -330,16 +329,13 @@ impl LocalCas {
     }
 
     /// Reads a planned run's native bytes.
+    /// (Upstream's `get_xorb_raw_bytes` reads the whole xorb before slicing; read only the range.)
     pub async fn read_chunk_run(&self, run: &mut ChunkRun) -> Result<()> {
-        run.bytes = self
-            .client
-            .get_xorb_raw_bytes(
-                &run.xorb,
-                Some(FileRange::new(run.byte_range.start, run.byte_range.end)),
-            )
+        let path = self.xorb_path(&run.xorb);
+        let (lo, hi) = (run.byte_range.start, run.byte_range.end);
+        run.bytes = tokio::task::spawn_blocking(move || read_range(&path, lo, hi))
             .await
-            .map_err(xet_err)?
-            .into();
+            .map_err(xet_err)??;
         Ok(())
     }
 

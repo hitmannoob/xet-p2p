@@ -81,8 +81,9 @@ pub enum Message {
     HelloOk {
         protocol_version: u32,
     },
+    /// The file tree, in the compact encoding of [`encode_manifest`].
     Manifest {
-        manifest: Manifest,
+        encoded: serde_bytes::ByteBuf,
     },
     Need {
         /// Xet file hashes whose reconstruction entries (as one native shard) are wanted.
@@ -187,10 +188,162 @@ pub struct ReceiverReport {
     pub reconstructions_reused: usize,
 }
 
+/// Largest decoded manifest accepted.
+pub const MAX_MANIFEST_BYTES: usize = 256 * MIB as usize;
+
+const MANIFEST_MAGIC: &[u8; 4] = b"XM1\0";
+
+impl Message {
+    pub fn manifest(manifest: &Manifest) -> Result<Self> {
+        Ok(Message::Manifest {
+            encoded: serde_bytes::ByteBuf::from(encode_manifest(manifest)?),
+        })
+    }
+}
+
+/// Compact wire form of a manifest: binary hashes, length-prefixed paths, then lz4.
+/// About 80 bytes per file before compression, versus ~200 for hex strings in CBOR.
+///
+/// `"XM1\0" | n: u32 | n × (kind: u8 | path_len: u16 | path | [size: u64 | xet: 32 | sha256: 32 |
+/// exec: u8])`, all little-endian, compressed with lz4 (size-prepended).
+pub fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>> {
+    use xet_local::EntryKind;
+    if manifest.format_version != xet_local::manifest::MANIFEST_FORMAT_VERSION {
+        return Err(Error::Protocol("unsupported manifest version".into()));
+    }
+    let mut out = Vec::with_capacity(8 + manifest.entries.len() * 80);
+    out.extend_from_slice(MANIFEST_MAGIC);
+    out.extend_from_slice(&(manifest.entries.len() as u32).to_le_bytes());
+    for e in &manifest.entries {
+        let path = e.path.as_bytes();
+        let path_len = u16::try_from(path.len())
+            .map_err(|_| Error::Protocol(format!("path too long: {:?}", e.path)))?;
+        match &e.kind {
+            EntryKind::Dir => out.push(0),
+            EntryKind::File { .. } => out.push(1),
+        }
+        out.extend_from_slice(&path_len.to_le_bytes());
+        out.extend_from_slice(path);
+        if let EntryKind::File {
+            size,
+            xet_hash,
+            sha256,
+            executable,
+        } = &e.kind
+        {
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(parse_hash(xet_hash)?.as_bytes());
+            let sha = hex::decode(sha256)
+                .ok()
+                .filter(|b| b.len() == 32)
+                .ok_or_else(|| Error::Protocol(format!("bad sha256 for {:?}", e.path)))?;
+            out.extend_from_slice(&sha);
+            out.push(u8::from(*executable));
+        }
+    }
+    Ok(lz4_flex::compress_prepend_size(&out))
+}
+
+/// Inverse of [`encode_manifest`], with the decompressed size bounded before allocation.
+/// The result still needs [`Manifest::validate`].
+pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
+    use xet_local::{Entry, EntryKind};
+    let bad = |m: &str| Error::Protocol(format!("malformed manifest: {m}"));
+    let claimed = bytes
+        .get(..4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+        .ok_or_else(|| bad("truncated"))?;
+    if claimed > MAX_MANIFEST_BYTES {
+        return Err(bad("too large"));
+    }
+    let raw = lz4_flex::decompress_size_prepended(bytes).map_err(|_| bad("bad compression"))?;
+    let mut pos = 0;
+    let mut take = |n: usize| -> Result<&[u8]> {
+        let s = raw.get(pos..pos + n).ok_or_else(|| bad("truncated"))?;
+        pos += n;
+        Ok(s)
+    };
+    if take(4)? != MANIFEST_MAGIC {
+        return Err(bad("wrong magic"));
+    }
+    let n = u32::from_le_bytes(take(4)?.try_into().unwrap()) as usize;
+    let mut entries = Vec::with_capacity(n.min(raw.len() / 4));
+    for _ in 0..n {
+        let kind = take(1)?[0];
+        let len = u16::from_le_bytes(take(2)?.try_into().unwrap()) as usize;
+        let path = std::str::from_utf8(take(len)?)
+            .map_err(|_| bad("path is not UTF-8"))?
+            .to_owned();
+        let kind = match kind {
+            0 => EntryKind::Dir,
+            1 => {
+                let size = u64::from_le_bytes(take(8)?.try_into().unwrap());
+                let xet = MerkleHash::from(&<[u8; 32]>::try_from(take(32)?).unwrap());
+                let sha256 = hex::encode(take(32)?);
+                let executable = match take(1)?[0] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(bad("bad flag")),
+                };
+                EntryKind::File {
+                    size,
+                    xet_hash: xet.hex(),
+                    sha256,
+                    executable,
+                }
+            }
+            _ => return Err(bad("unknown entry kind")),
+        };
+        entries.push(Entry { path, kind });
+    }
+    if take(1).is_ok() {
+        return Err(bad("trailing bytes"));
+    }
+    Ok(Manifest {
+        format_version: xet_local::manifest::MANIFEST_FORMAT_VERSION,
+        entries,
+    })
+}
+
 pub(crate) fn to_hex(hashes: impl IntoIterator<Item = MerkleHash>) -> Vec<String> {
     hashes.into_iter().map(|h| h.hex()).collect()
 }
 
 pub(crate) fn parse_hash(s: &str) -> Result<MerkleHash> {
     MerkleHash::from_hex(s).map_err(|_| Error::Protocol(format!("invalid hash {s:?}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xet_local::{Entry, EntryKind};
+
+    #[test]
+    fn manifest_round_trips_and_rejects_garbage() {
+        let m = Manifest {
+            format_version: xet_local::manifest::MANIFEST_FORMAT_VERSION,
+            entries: vec![
+                Entry {
+                    path: "dir".into(),
+                    kind: EntryKind::Dir,
+                },
+                Entry {
+                    path: "dir/ünï.bin".into(),
+                    kind: EntryKind::File {
+                        size: 12345,
+                        xet_hash: MerkleHash::from(&[7u8; 32]).hex(),
+                        sha256: "ab".repeat(32),
+                        executable: true,
+                    },
+                },
+            ],
+        };
+        let enc = encode_manifest(&m).unwrap();
+        assert_eq!(decode_manifest(&enc).unwrap(), m);
+        assert!(decode_manifest(b"").is_err());
+        assert!(decode_manifest(&[0xff, 0xff, 0xff, 0xff, 1, 2, 3]).is_err());
+        let mut bad = enc.clone();
+        bad.truncate(bad.len() - 3);
+        assert!(decode_manifest(&bad).is_err());
+    }
 }

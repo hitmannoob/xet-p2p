@@ -23,7 +23,7 @@ use crate::locks::DestLocks;
 use crate::protocol::{
     ChunkRequest, MAX_CHUNK_LISTS_BYTES, MAX_CHUNK_RUN_BYTES, MAX_CONTROL_FRAME, MAX_OBJECT_HEADER,
     MAX_SHARD_BYTES, MAX_XORB_BYTES, Message, ObjectHeader, ObjectKind, PROTOCOL_VERSION,
-    ReceiverReport, TransferMode, parse_hash, to_hex,
+    ReceiverReport, TransferMode, decode_manifest, parse_hash, to_hex,
 };
 use crate::session::{Session, SessionStore};
 
@@ -184,7 +184,7 @@ impl Receiver {
         .await?;
 
         let manifest = match self.stall(conn, next(recv)).await? {
-            Message::Manifest { manifest } => manifest,
+            Message::Manifest { encoded } => decode_manifest(&encoded)?,
             other => return Err(unexpected(other)),
         };
         manifest.validate()?;

@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use tracing::debug;
 use transport_quic::quinn::{Connection, RecvStream, SendStream};
 use transport_quic::{read_frame, write_frame};
-use xet_local::chunks::encode_chunk_lists;
+use xet_local::chunks::{ChunkRun, encode_chunk_lists};
 use xet_local::{IngestReport, LocalCas, Manifest, MerkleHash};
 
 use crate::budget::MemoryBudget;
@@ -125,7 +125,7 @@ pub async fn push(
         other => return Err(unexpected(other)),
     }
 
-    write_frame(&mut send, &Message::Manifest { manifest }).await?;
+    write_frame(&mut send, &Message::manifest(&manifest)?).await?;
 
     loop {
         match next(&mut recv).await? {
@@ -242,8 +242,46 @@ async fn send_chunk_runs(
     let permits = Arc::new(Semaphore::new(opts.parallel_streams.max(1)));
     let budget = MemoryBudget::new(opts.max_memory_bytes);
     let mut tasks = JoinSet::new();
-    let mut runs_sent = 0;
+    let mut streams = 0;
     let mut total = 0;
+
+    // Consecutive runs (possibly from different xorbs) share one stream up to BATCH bytes: the
+    // receiver verifies each chunk by its own hash, so stream boundaries carry no meaning, and
+    // thousands of tiny per-file runs would otherwise cost a stream and an ACK each.
+    const BATCH: u64 = 4 * 1024 * 1024;
+    let mut batch: Vec<ChunkRun> = Vec::new();
+    let mut batch_bytes = 0u64;
+
+    let mut flush = async |batch: &mut Vec<ChunkRun>, batch_bytes: &mut u64| -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let runs = std::mem::take(batch);
+        let bytes = std::mem::take(batch_bytes);
+        let permit = permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore never closed");
+        let memory = budget.reserve(bytes).await;
+        let (cas, conn, limiter) = (cas.clone(), conn.clone(), limiter.clone());
+        streams += 1;
+        tasks.spawn(async move {
+            let _permits = (permit, memory);
+            let mut body = Vec::with_capacity(bytes as usize);
+            for mut run in runs {
+                cas.read_chunk_run(&mut run).await?;
+                body.extend_from_slice(&run.bytes);
+            }
+            send_object(&conn, &limiter, ObjectKind::ChunkRun, None, body).await
+        });
+        // Surface failures early rather than after planning everything.
+        while let Some(res) = tasks.try_join_next() {
+            total += res.map_err(|e| Error::Protocol(format!("send task failed: {e}")))??;
+        }
+        Ok(())
+    };
+
     for req in requests {
         let file = parse_hash(&req.file)?;
         if !files.contains(&file) {
@@ -252,39 +290,20 @@ async fn send_chunk_runs(
                 req.file
             )));
         }
-        for mut run in cas.plan_chunk_runs(&file, &req.ranges).await? {
-            let permit = permits
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("semaphore never closed");
-            let memory = budget
-                .reserve(run.byte_range.end - run.byte_range.start)
-                .await;
-            let (cas, conn, limiter) = (cas.clone(), conn.clone(), limiter.clone());
-            runs_sent += 1;
-            tasks.spawn(async move {
-                let _permits = (permit, memory);
-                cas.read_chunk_run(&mut run).await?;
-                send_object(
-                    &conn,
-                    &limiter,
-                    ObjectKind::ChunkRun,
-                    Some(run.xorb),
-                    run.bytes,
-                )
-                .await
-            });
-            // Surface failures early rather than after planning everything.
-            while let Some(res) = tasks.try_join_next() {
-                total += res.map_err(|e| Error::Protocol(format!("send task failed: {e}")))??;
+        for run in cas.plan_chunk_runs(&file, &req.ranges).await? {
+            let len = run.byte_range.end - run.byte_range.start;
+            if batch_bytes > 0 && batch_bytes + len > BATCH {
+                flush(&mut batch, &mut batch_bytes).await?;
             }
+            batch_bytes += len;
+            batch.push(run);
         }
     }
+    flush(&mut batch, &mut batch_bytes).await?;
     while let Some(res) = tasks.join_next().await {
         total += res.map_err(|e| Error::Protocol(format!("send task failed: {e}")))??;
     }
-    Ok((total, runs_sent))
+    Ok((total, streams))
 }
 
 type Limiter = Option<Arc<RateLimiter>>;

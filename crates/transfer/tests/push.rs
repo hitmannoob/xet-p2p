@@ -333,7 +333,7 @@ where
     .await
     .unwrap();
     assert!(matches!(next().await, Message::HelloOk { .. }));
-    write_frame(&mut send, &Message::Manifest { manifest })
+    write_frame(&mut send, &Message::manifest(&manifest).unwrap())
         .await
         .unwrap();
 
@@ -478,7 +478,7 @@ async fn interrupted_push(h: &Harness, dest: &str, commit: usize) -> usize {
     .await
     .unwrap();
     assert!(matches!(next().await, Message::HelloOk { .. }));
-    write_frame(&mut send, &Message::Manifest { manifest })
+    write_frame(&mut send, &Message::manifest(&manifest).unwrap())
         .await
         .unwrap();
 
@@ -941,7 +941,7 @@ async fn stalled_sender_is_dropped_and_releases_destination() {
             .unwrap(),
         Message::HelloOk { .. }
     ));
-    write_frame(&mut send, &Message::Manifest { manifest })
+    write_frame(&mut send, &Message::manifest(&manifest).unwrap())
         .await
         .unwrap();
     assert!(matches!(

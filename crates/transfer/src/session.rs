@@ -127,10 +127,12 @@ impl SessionStore {
 
     /// Saves received entries, one file each, so a later attempt need not request them again.
     pub fn put_pending(&self, shard: &PendingShard) -> Result<()> {
-        for (hash, bytes) in shard.split()? {
-            write_atomic(&self.pending_path(&hash), &bytes)?;
-        }
-        Ok(())
+        write_atomic_many(
+            shard
+                .split()?
+                .into_iter()
+                .map(|(hash, bytes)| (self.pending_path(&hash), bytes)),
+        )
     }
 
     /// Drops entries now registered in the CAS.
@@ -162,13 +164,12 @@ impl SessionStore {
 
     /// Saves verified chunk lists, one file each, for later attempts.
     pub fn put_chunk_lists(&self, lists: &[(MerkleHash, ChunkList)]) -> Result<()> {
-        for entry in lists {
-            write_atomic(
-                &self.chunks_path(&entry.0),
-                &encode_chunk_lists(std::slice::from_ref(entry)),
-            )?;
-        }
-        Ok(())
+        write_atomic_many(lists.iter().map(|entry| {
+            (
+                self.chunks_path(&entry.0),
+                encode_chunk_lists(std::slice::from_ref(entry)),
+            )
+        }))
     }
 
     pub fn remove_chunk_lists(&self, hashes: &BTreeSet<MerkleHash>) {
@@ -256,6 +257,41 @@ fn session_key(dest: &str, manifest: &Manifest) -> Result<String> {
     h.update([0]);
     h.update(&json);
     Ok(hex::encode(h.finalize()))
+}
+
+/// [`write_atomic`] for many files in one directory, with one directory sync and one barrier.
+fn write_atomic_many(items: impl IntoIterator<Item = (PathBuf, Vec<u8>)>) -> Result<()> {
+    let mut dir: Option<PathBuf> = None;
+    for (path, bytes) in items {
+        write_atomic_unsynced(&path, &bytes)?;
+        dir.get_or_insert_with(|| path.parent().expect("state paths have a parent").to_owned());
+    }
+    if let Some(dir) = dir {
+        durable::sync_dir(&dir).map_err(io)?;
+        durable::barrier(&dir).map_err(io)?;
+    }
+    Ok(())
+}
+
+/// Temp file, sync, rename over `path`; the caller syncs the directory and issues the barrier.
+fn write_atomic_unsynced(path: &Path, bytes: &[u8]) -> Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().expect("state paths have a parent");
+    let tmp = dir.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        durable::sync_file(&f)?;
+        fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(io)
 }
 
 /// Write to a uniquely named temp file, sync, rename over `path`, sync the directory, barrier.
