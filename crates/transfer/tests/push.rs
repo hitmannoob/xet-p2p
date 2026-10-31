@@ -68,6 +68,10 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
+        Self::with_receiver(|_| {}).await
+    }
+
+    async fn with_receiver(configure: impl FnOnce(&mut ReceiverOptions)) -> Self {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("root");
         fs::create_dir_all(root.join(".xet-p2p")).unwrap();
@@ -86,7 +90,8 @@ impl Harness {
 
         // The receiver's CAS lives inside its root, as in the brief's example layout.
         let receiver_cas = Arc::new(LocalCas::open(root.join(".xet-p2p/cas")).await.unwrap());
-        let opts = ReceiverOptions::new(&receiver_cas);
+        let mut opts = ReceiverOptions::new(&receiver_cas);
+        configure(&mut opts);
         let receiver = Arc::new(Receiver::new(&root, receiver_cas, opts).unwrap());
         tokio::spawn(receiver.serve(server.clone()));
 
@@ -120,11 +125,21 @@ impl Harness {
     }
 
     async fn push(&self, dest: &str) -> transfer::Result<transfer::PushReport> {
+        self.push_with(dest, |_| {}).await
+    }
+
+    async fn push_with(
+        &self,
+        dest: &str,
+        configure: impl FnOnce(&mut PushOptions),
+    ) -> transfer::Result<transfer::PushReport> {
         let conn = self.connect_as(&self.client_id).await?;
-        let opts = PushOptions {
+        let mut opts = PushOptions {
             dest: dest.into(),
             parallel_streams: 4,
+            max_memory_bytes: transfer::DEFAULT_MAX_MEMORY_BYTES,
         };
+        configure(&mut opts);
         let result = push(self.sender_cas.clone(), &self.src(), &conn, &opts).await;
         conn.close(0u32.into(), b"done");
         result
@@ -251,6 +266,7 @@ async fn unauthorized_client_cannot_push() {
         let opts = PushOptions {
             dest: "p".into(),
             parallel_streams: 1,
+            max_memory_bytes: transfer::DEFAULT_MAX_MEMORY_BYTES,
         };
         push(h.sender_cas.clone(), &h.src(), &conn, &opts).await
     }
@@ -588,4 +604,20 @@ async fn concurrent_pushes_to_overlapping_destinations_serialize() {
         fs::read(h.src().join("a.bin")).unwrap()
     );
     assert_trees_equal(&h.src(), &h.root().join("p/inner"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tiny_memory_budgets_still_complete_one_xorb_at_a_time() {
+    // Budgets below one xorb clamp to "one xorb in memory at a time" on both sides.
+    let h = Harness::with_receiver(|o| o.max_memory_bytes = 1).await;
+    write(&h.src(), "big.bin", &random_bytes(36, 90 * MIB));
+    let r = h
+        .push_with("p", |o| {
+            o.max_memory_bytes = 1;
+            o.parallel_streams = 8;
+        })
+        .await
+        .unwrap();
+    assert!(r.xorbs_sent >= 2);
+    assert_trees_equal(&h.src(), &h.root().join("p"));
 }

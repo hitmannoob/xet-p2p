@@ -2,6 +2,7 @@
 //! receiver. Xet content handling lives in `xet-local`; authentication and framing in
 //! `transport-quic`.
 
+mod budget;
 mod error;
 mod locks;
 pub mod protocol;
@@ -12,5 +13,5 @@ mod session;
 pub use error::{Error, Result};
 pub use protocol::ReceiverReport;
 pub use receiver::{Receiver, ReceiverOptions};
-pub use sender::{PushOptions, PushReport, push};
+pub use sender::{DEFAULT_MAX_MEMORY_BYTES, PushOptions, PushReport, push};
 pub use session::SessionRecord;

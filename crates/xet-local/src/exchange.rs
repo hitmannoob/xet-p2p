@@ -123,6 +123,11 @@ impl LocalCas {
             .into())
     }
 
+    /// Size in bytes of a stored xorb, without reading it.
+    pub async fn xorb_len(&self, hash: &MerkleHash) -> Result<u64> {
+        self.client.xorb_raw_length(hash).await.map_err(xet_err)
+    }
+
     /// The subset of `xorbs` not present in this CAS.
     pub async fn absent_xorbs<'a>(
         &self,

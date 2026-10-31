@@ -13,6 +13,7 @@ use transport_quic::{read_frame, read_payload, write_frame};
 use xet_local::manifest::validate_rel_path;
 use xet_local::{LocalCas, MerkleHash, PendingShard, create_confined_dir};
 
+use crate::budget::MemoryBudget;
 use crate::error::{Error, Result};
 use crate::locks::DestLocks;
 use crate::protocol::{
@@ -32,6 +33,9 @@ pub struct ReceiverOptions {
     /// How long a transfer waits for another into an overlapping destination to finish. Longer
     /// than the QUIC idle timeout, so a resume can outwait a dead predecessor's connection.
     pub dest_lock_wait: Duration,
+    /// Upper bound on xorb bytes held in memory at once, across all concurrent transfers
+    /// (at least one xorb always fits).
+    pub max_memory_bytes: u64,
     /// Test hook: pause after committing each xorb, to make interruption timing deterministic.
     pub commit_delay: Option<Duration>,
 }
@@ -43,6 +47,7 @@ impl ReceiverOptions {
             parallel_objects: 4,
             session_dir: cas.root().join("sessions"),
             dest_lock_wait: Duration::from_secs(60),
+            max_memory_bytes: crate::sender::DEFAULT_MAX_MEMORY_BYTES,
             commit_delay: None,
         }
     }
@@ -53,6 +58,7 @@ pub struct Receiver {
     cas: Arc<LocalCas>,
     sessions: SessionStore,
     locks: Arc<DestLocks>,
+    budget: MemoryBudget,
     opts: ReceiverOptions,
 }
 
@@ -65,6 +71,7 @@ impl Receiver {
             sessions: SessionStore::open(&opts.session_dir)?,
             cas,
             locks: Arc::default(),
+            budget: MemoryBudget::new(opts.max_memory_bytes),
             opts: ReceiverOptions {
                 parallel_objects: opts.parallel_objects.max(1),
                 ..opts
@@ -303,6 +310,7 @@ impl Receiver {
                     let mut stream = stream?;
                     remaining -= 1;
                     let (cas, expected, permits) = (self.cas.clone(), expected.clone(), permits.clone());
+                    let budget = self.budget.clone();
                     tasks.spawn(async move {
                         let _permit = permits.acquire_owned().await.expect("semaphore never closed");
                         let header = read_header(&mut stream).await?;
@@ -313,6 +321,10 @@ impl Receiver {
                         if !expected.lock().unwrap().remove(&hash) {
                             return Err(Error::Protocol(format!("unrequested or duplicate xorb {}", hash.hex())));
                         }
+                        if header.len > MAX_XORB_BYTES {
+                            return Err(transport_quic::Error::FrameTooLarge { len: header.len, max: MAX_XORB_BYTES }.into());
+                        }
+                        let _memory = budget.reserve(header.len).await;
                         let bytes = read_payload(&mut stream, header.len, MAX_XORB_BYTES).await?;
                         let len = bytes.len() as u64;
                         cas.commit_xorb(hash, bytes).await?;

@@ -54,6 +54,9 @@ enum Command {
         /// Objects received and verified concurrently.
         #[arg(long, default_value_t = 4)]
         parallel: u32,
+        /// Cap on xorb bytes held in memory across all transfers, in MiB (one xorb always fits).
+        #[arg(long, default_value_t = 256)]
+        max_memory_mib: u64,
         /// Resumable session state (default: <cas-dir>/sessions).
         #[arg(long)]
         session_dir: Option<PathBuf>,
@@ -84,6 +87,9 @@ enum Command {
         /// Xorbs in flight at once.
         #[arg(long, default_value_t = 4)]
         parallel: u32,
+        /// Cap on xorb bytes held in memory, in MiB (one xorb always fits).
+        #[arg(long, default_value_t = 256)]
+        max_memory_mib: u64,
         /// Print the transfer report as JSON on stdout.
         #[arg(long)]
         json: bool,
@@ -133,6 +139,7 @@ async fn main() -> Result<()> {
             key,
             allow_client,
             parallel,
+            max_memory_mib,
             session_dir,
             test_commit_delay_ms,
         } => {
@@ -151,6 +158,7 @@ async fn main() -> Result<()> {
             let cas = Arc::new(LocalCas::open(&cas_dir).await?);
             let mut ropts = ReceiverOptions::new(&cas);
             ropts.parallel_objects = parallel as usize;
+            ropts.max_memory_bytes = max_memory_mib.saturating_mul(1024 * 1024);
             if let Some(dir) = session_dir {
                 ropts.session_dir = dir;
             }
@@ -173,6 +181,7 @@ async fn main() -> Result<()> {
             key,
             peer_cert,
             parallel,
+            max_memory_mib,
             json,
         } => {
             let addr = tokio::net::lookup_host(&to)
@@ -195,6 +204,7 @@ async fn main() -> Result<()> {
             let opts = PushOptions {
                 dest,
                 parallel_streams: parallel as usize,
+                max_memory_bytes: max_memory_mib.saturating_mul(1024 * 1024),
             };
             let result = push(cas, &src, &conn, &opts).await;
             conn.close(0u32.into(), b"done");

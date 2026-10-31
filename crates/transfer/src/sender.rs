@@ -12,6 +12,7 @@ use transport_quic::quinn::{Connection, RecvStream, SendStream};
 use transport_quic::{read_frame, write_frame};
 use xet_local::{IngestReport, LocalCas, Manifest, MerkleHash};
 
+use crate::budget::MemoryBudget;
 use crate::error::{Error, Result};
 use crate::protocol::{
     MAX_CONTROL_FRAME, Message, ObjectHeader, ObjectKind, PROTOCOL_VERSION, ReceiverReport,
@@ -24,7 +25,12 @@ pub struct PushOptions {
     pub dest: String,
     /// Maximum xorbs in flight at once.
     pub parallel_streams: usize,
+    /// Upper bound on xorb bytes held in memory at once (at least one xorb always fits).
+    pub max_memory_bytes: u64,
 }
+
+/// Default for [`PushOptions::max_memory_bytes`] and the receiver's equivalent.
+pub const DEFAULT_MAX_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct PushReport {
@@ -113,8 +119,7 @@ pub async fn push(
                     report.shard_bytes_sent +=
                         send_object(conn, ObjectKind::Shard, None, shard).await?;
                 }
-                report.xorb_bytes_sent +=
-                    send_xorbs(&cas, conn, &xorbs, opts.parallel_streams).await?;
+                report.xorb_bytes_sent += send_xorbs(&cas, conn, &xorbs, opts).await?;
                 report.xorbs_sent += xorbs.len();
             }
             Message::Ack { .. } => {}
@@ -155,9 +160,10 @@ async fn send_xorbs(
     cas: &Arc<LocalCas>,
     conn: &Connection,
     xorbs: &BTreeSet<MerkleHash>,
-    parallel: usize,
+    opts: &PushOptions,
 ) -> Result<u64> {
-    let permits = Arc::new(Semaphore::new(parallel.max(1)));
+    let permits = Arc::new(Semaphore::new(opts.parallel_streams.max(1)));
+    let budget = MemoryBudget::new(opts.max_memory_bytes);
     let mut tasks = JoinSet::new();
     for &hash in xorbs {
         let permit = permits
@@ -165,9 +171,10 @@ async fn send_xorbs(
             .acquire_owned()
             .await
             .expect("semaphore never closed");
+        let memory = budget.reserve(cas.xorb_len(&hash).await?).await;
         let (cas, conn) = (cas.clone(), conn.clone());
         tasks.spawn(async move {
-            let _permit = permit;
+            let _permits = (permit, memory);
             let bytes = cas.read_xorb(&hash).await?;
             send_object(&conn, ObjectKind::Xorb, Some(hash), bytes).await
         });
