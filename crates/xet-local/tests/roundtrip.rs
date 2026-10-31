@@ -420,3 +420,32 @@ async fn stale_staging_directory_is_cleaned_up() {
     f.cas.reconstruct(&m, &f.dest).await.unwrap();
     assert_eq!(snapshot(&f.src), snapshot(&f.dest));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_modified_during_ingest_is_rejected() {
+    let f = fixture().await;
+    let path = f.src.join("busy.bin");
+    write(&f.src, "busy.bin", &random_bytes(40, 48 * MIB));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = std::thread::spawn({
+        let (path, stop) = (path.clone(), stop.clone());
+        move || {
+            use std::io::{Seek, Write};
+            let mut i = 0u8;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.seek(std::io::SeekFrom::Start(1024)).unwrap();
+                file.write_all(&[i; 4096]).unwrap();
+                i = i.wrapping_add(1);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    });
+    let result = f.cas.ingest(&f.src).await;
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+    assert!(
+        matches!(result, Err(Error::Verification { ref reason, .. }) if reason.contains("changed during ingest")),
+        "{result:?}"
+    );
+}

@@ -8,7 +8,11 @@ use crate::manifest::validate_rel_path;
 
 pub(crate) enum WalkedKind {
     Dir,
-    File { size: u64, executable: bool },
+    File {
+        size: u64,
+        executable: bool,
+        modified: Option<std::time::SystemTime>,
+    },
 }
 
 pub(crate) struct WalkedEntry {
@@ -96,6 +100,7 @@ fn file_kind(meta: &fs::Metadata) -> WalkedKind {
     WalkedKind::File {
         size: meta.len(),
         executable,
+        modified: meta.modified().ok(),
     }
 }
 

@@ -15,7 +15,7 @@ use xet_core_structures::metadata_shard::file_structs::MDBFileInfo;
 use xet_core_structures::metadata_shard::shard_in_memory::MDBInMemoryShard;
 use xet_core_structures::xorb_object::{SerializedXorbObject, XorbObject};
 
-use crate::cas::LocalCas;
+use crate::cas::{LocalCas, sync_file_and_parent};
 use crate::error::{Error, Result};
 
 /// Reconstruction metadata received from a peer: parsed, but neither trusted nor registered.
@@ -36,6 +36,7 @@ impl PendingShard {
                 reason: format!("malformed shard: {e}"),
             }
         })?;
+        check_consistent(shard.file_content.values())?;
         let got: BTreeSet<MerkleHash> = shard.file_content.keys().copied().collect();
         if &got != expected {
             return Err(Error::Verification {
@@ -61,6 +62,7 @@ impl PendingShard {
                 reason: format!("malformed shard: {e}"),
             }
         })?;
+        check_consistent(shard.file_content.values())?;
         let mut files = Vec::with_capacity(expected.len());
         for hash in expected {
             files.push(
@@ -170,6 +172,8 @@ impl LocalCas {
             .upload_xorb("default", serialized, None, permit)
             .await
             .map_err(xet_err)?;
+        // Upstream renames into place without fsync; make the commit survive power loss.
+        sync_file_and_parent(&self.xorb_path(&hash))?;
         Ok(())
     }
 
@@ -240,10 +244,13 @@ impl LocalCas {
         }
         let bytes = shard.to_bytes().map_err(xet_err)?;
         let permit = self.client.acquire_upload_permit().await.map_err(xet_err)?;
-        self.client
+        let stored = self
+            .client
             .upload_shard(bytes.into(), permit, None)
             .await
-            .map_err(xet_err)?;
+            .map_err(xet_err)?
+            .ok_or_else(|| Error::Xet("local CAS did not report the stored shard hash".into()))?;
+        sync_file_and_parent(&self.shard_path(&stored))?;
         Ok(())
     }
 
@@ -262,6 +269,82 @@ impl LocalCas {
     }
 }
 
+/// Rejects file entries whose header disagrees with their contents. Upstream asserts on this when
+/// serializing; check first so a malformed peer shard is an error, never a panic.
+fn check_consistent<'a>(files: impl IntoIterator<Item = &'a MDBFileInfo>) -> Result<()> {
+    for info in files {
+        let fail = |reason: &str| Error::Verification {
+            path: format!("file {}", info.metadata.file_hash.hex()),
+            reason: format!("inconsistent shard entry: {reason}"),
+        };
+        if info.metadata.num_entries as usize != info.segments.len() {
+            return Err(fail("segment count does not match header"));
+        }
+        if info.contains_verification() && info.verification.len() != info.segments.len() {
+            return Err(fail("verification count does not match segments"));
+        }
+        if !info.contains_verification() && !info.verification.is_empty() {
+            return Err(fail("unexpected verification entries"));
+        }
+        if info.contains_metadata_ext() != info.metadata_ext.is_some() {
+            return Err(fail("metadata extension flag mismatch"));
+        }
+    }
+    Ok(())
+}
+
 fn xet_err(e: impl std::fmt::Display) -> Error {
     Error::Xet(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use xet_core_structures::metadata_shard::file_structs::{
+        FileDataSequenceEntry, FileDataSequenceHeader, FileVerificationEntry,
+    };
+
+    use super::*;
+
+    fn info(with_verification: bool) -> MDBFileInfo {
+        let seg = FileDataSequenceEntry::new(MerkleHash::default(), 10, 0, 1);
+        MDBFileInfo {
+            metadata: FileDataSequenceHeader::new(
+                MerkleHash::default(),
+                1,
+                with_verification,
+                false,
+            ),
+            segments: vec![seg],
+            verification: if with_verification {
+                vec![FileVerificationEntry::new(MerkleHash::default())]
+            } else {
+                vec![]
+            },
+            metadata_ext: None,
+        }
+    }
+
+    // Wire bytes are parsed per their header, so they are consistent by construction; this
+    // check is defense in depth against upstream asserts on in-memory inconsistencies.
+    #[test]
+    fn inconsistent_entries_rejected() {
+        assert!(check_consistent([&info(true)]).is_ok());
+        assert!(check_consistent([&info(false)]).is_ok());
+
+        let mut missing_verification = info(true);
+        missing_verification.verification.clear();
+        assert!(check_consistent([&missing_verification]).is_err());
+
+        let mut extra_segment = info(false);
+        extra_segment
+            .segments
+            .push(extra_segment.segments[0].clone());
+        assert!(check_consistent([&extra_segment]).is_err());
+
+        let mut stray_verification = info(false);
+        stray_verification
+            .verification
+            .push(FileVerificationEntry::new(MerkleHash::default()));
+        assert!(check_consistent([&stray_verification]).is_err());
+    }
 }

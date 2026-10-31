@@ -96,6 +96,25 @@ impl LocalCas {
         &self.root
     }
 
+    /// Where upstream `LocalClient` stores a xorb. Coupled to the pinned 1.8.0 layout; a mismatch
+    /// surfaces as a sync error at commit, never as silent non-durability.
+    pub(crate) fn xorb_path(&self, hash: &MerkleHash) -> PathBuf {
+        self.client_dir()
+            .join("xorbs")
+            .join(format!("default.{}", hash.hex()))
+    }
+
+    /// Where upstream `LocalClient` stores a shard (same coupling as [`Self::xorb_path`]).
+    pub(crate) fn shard_path(&self, hash: &MerkleHash) -> PathBuf {
+        self.client_dir().join("shards").join(
+            xet_core_structures::metadata_shard::utils::shard_file_name(hash),
+        )
+    }
+
+    fn client_dir(&self) -> PathBuf {
+        self.root.join("xet").join("xorbs")
+    }
+
     /// Chunks, hashes, and stores `src` (a file or directory) as native Xet xorbs and shards.
     /// Returns the manifest needed to reconstruct it.
     pub async fn ingest(&self, src: impl AsRef<Path>) -> Result<(Manifest, IngestReport)> {
@@ -130,8 +149,21 @@ impl LocalCas {
                     report.dirs += 1;
                     EntryKind::Dir
                 }
-                WalkedKind::File { size, executable } => {
+                WalkedKind::File {
+                    size,
+                    executable,
+                    modified,
+                } => {
                     report.files += 1;
+                    // Detect edits made while the file was being read: a changed size or mtime means
+                    // the stored content may not be any single version of the file.
+                    let now = fs::symlink_metadata(&w.abs_path)?;
+                    if now.len() != size || now.modified().ok() != modified {
+                        return Err(Error::Verification {
+                            path: w.rel_path,
+                            reason: "file changed during ingest; retry once it is stable".into(),
+                        });
+                    }
                     let info = infos.next().ok_or_else(|| {
                         Error::Xet("upload returned fewer file infos than files".into())
                     })?;
@@ -255,6 +287,7 @@ impl LocalCas {
     ) -> Result<ReconstructReport> {
         let mut report = ReconstructReport::default();
         let mut staged = Vec::new();
+        let mut touched_dirs = BTreeSet::new();
 
         let session = FileDownloadSession::from_client(&self.ctx, self.client.clone(), None);
         for (i, (entry, size, xet_hash, sha256, executable)) in manifest.files().enumerate() {
@@ -274,6 +307,7 @@ impl LocalCas {
                 path: entry.path.clone(),
                 reason,
             })?;
+            fs::File::open(&tmp)?.sync_all()?;
             set_executable(&tmp, executable)?;
             staged.push((tmp, entry));
             report.bytes += size;
@@ -306,6 +340,19 @@ impl LocalCas {
             }
             fs::rename(&tmp, &target)?;
             report.files += 1;
+            touched_dirs.insert(target.parent().unwrap_or(dest).to_owned());
+        }
+
+        // Make the renames (and any new directories) durable.
+        for entry in &manifest.entries {
+            if matches!(entry.kind, EntryKind::Dir) {
+                let dir = dest.join(validate_rel_path(&entry.path)?);
+                touched_dirs.insert(dir.parent().unwrap_or(dest).to_owned());
+            }
+        }
+        touched_dirs.insert(dest.to_owned());
+        for dir in touched_dirs {
+            sync_dir(&dir)?;
         }
 
         Ok(report)
@@ -315,6 +362,24 @@ impl LocalCas {
 fn parse_hash(path: &str, hex: &str) -> Result<MerkleHash> {
     MerkleHash::from_hex(hex)
         .map_err(|e| Error::InvalidManifest(format!("{path:?}: bad xet_hash: {e}")))
+}
+
+/// fsyncs a file and the directory holding it.
+pub(crate) fn sync_file_and_parent(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all()?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// fsyncs a directory so entries created or renamed in it are durable (no-op off Unix).
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 fn staging_name() -> String {
