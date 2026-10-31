@@ -45,6 +45,9 @@ pub struct ReceiverOptions {
     /// only within one of its scopes (root-relative paths; an empty path means the whole root).
     /// When empty, every authenticated sender may write anywhere under the root.
     pub client_scopes: HashMap<String, Vec<PathBuf>>,
+    /// Abort a transfer when the sender delivers no stream data for this long while the receiver
+    /// is waiting on it (keep-alive pings do not count). Frees the destination lock.
+    pub stall_timeout: Duration,
     /// Test hook: pause after committing each xorb, to make interruption timing deterministic.
     pub commit_delay: Option<Duration>,
 }
@@ -58,6 +61,7 @@ impl ReceiverOptions {
             dest_lock_wait: Duration::from_secs(60),
             max_memory_bytes: crate::sender::DEFAULT_MAX_MEMORY_BYTES,
             client_scopes: HashMap::new(),
+            stall_timeout: Duration::from_secs(120),
             commit_delay: None,
         }
     }
@@ -108,7 +112,9 @@ impl Receiver {
 
     /// Runs one transfer on an established, authenticated connection.
     pub async fn handle(&self, conn: Connection) -> Result<ReceiverReport> {
-        let (mut send, mut recv) = conn.accept_bi().await?;
+        let (mut send, mut recv) = self
+            .stall(&conn, async { Ok(conn.accept_bi().await?) })
+            .await?;
         let result = self.run(&conn, &mut send, &mut recv).await;
         match &result {
             Ok(report) => {
@@ -144,7 +150,7 @@ impl Receiver {
         send: &mut SendStream,
         recv: &mut RecvStream,
     ) -> Result<ReceiverReport> {
-        let (dest, delete, mode) = match next(recv).await? {
+        let (dest, delete, mode) = match self.stall(conn, next(recv)).await? {
             Message::Hello {
                 protocol_version,
                 session_id,
@@ -177,7 +183,7 @@ impl Receiver {
         )
         .await?;
 
-        let manifest = match next(recv).await? {
+        let manifest = match self.stall(conn, next(recv)).await? {
             Message::Manifest { manifest } => manifest,
             other => return Err(unexpected(other)),
         };
@@ -403,7 +409,7 @@ impl Receiver {
     /// Receives chunk runs until every chunk in `outstanding` has arrived and verified. Each
     /// chunk is hashed; unrequested or repeated chunks abort the transfer. Verified native chunk
     /// bytes are packed into new xorbs, committed as each fills.
-    async fn receive_chunk_runs(
+    async fn receive_chunk_runs_unguarded(
         &self,
         conn: &Connection,
         send: &mut SendStream,
@@ -468,6 +474,66 @@ impl Receiver {
             self.flush_pack(&mut packer, session, report).await?;
         }
         Ok(())
+    }
+
+    async fn receive_chunk_runs(
+        &self,
+        conn: &Connection,
+        send: &mut SendStream,
+        outstanding: HashMap<MerkleHash, u64>,
+        session: &mut Session<'_>,
+        report: &mut ReceiverReport,
+    ) -> Result<()> {
+        self.stall(
+            conn,
+            self.receive_chunk_runs_unguarded(conn, send, outstanding, session, report),
+        )
+        .await
+    }
+
+    async fn receive_xorbs(
+        &self,
+        conn: &Connection,
+        send: &mut SendStream,
+        expected: BTreeSet<MerkleHash>,
+        session: &mut Session<'_>,
+    ) -> Result<u64> {
+        self.stall(
+            conn,
+            self.receive_xorbs_unguarded(conn, send, expected, session),
+        )
+        .await
+    }
+
+    /// Runs `fut` (which waits on the sender) but fails if the connection receives no stream data
+    /// for `stall_timeout`. Local work inside `fut` does not stop the sender's data from arriving,
+    /// so only a sender that stops sending trips this.
+    async fn stall<T>(
+        &self,
+        conn: &Connection,
+        fut: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let timeout = self.opts.stall_timeout;
+        let tick = (timeout / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+        let mut interval = tokio::time::interval(tick);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last = conn.stats().frame_rx.stream;
+        let mut since = tokio::time::Instant::now();
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                r = &mut fut => return r,
+                _ = interval.tick() => {
+                    let now = conn.stats().frame_rx.stream;
+                    if now != last {
+                        last = now;
+                        since = tokio::time::Instant::now();
+                    } else if since.elapsed() >= timeout {
+                        return Err(Error::Stalled(timeout));
+                    }
+                }
+            }
+        }
     }
 
     async fn flush_pack(
@@ -542,16 +608,19 @@ impl Receiver {
         kind: ObjectKind,
         max: u64,
     ) -> Result<Vec<u8>> {
-        let mut stream = conn.accept_uni().await?;
-        let header = read_header(&mut stream).await?;
-        if header.kind != kind || header.hash.is_some() {
-            return Err(Error::Protocol(format!("expected a {kind:?} object")));
-        }
-        Ok(read_payload(&mut stream, header.len, max).await?)
+        self.stall(conn, async {
+            let mut stream = conn.accept_uni().await?;
+            let header = read_header(&mut stream).await?;
+            if header.kind != kind || header.hash.is_some() {
+                return Err(Error::Protocol(format!("expected a {kind:?} object")));
+            }
+            Ok(read_payload(&mut stream, header.len, max).await?)
+        })
+        .await
     }
 
     /// Receives exactly the requested xorbs, verifying and committing each, and ACKs each one.
-    async fn receive_xorbs(
+    async fn receive_xorbs_unguarded(
         &self,
         conn: &Connection,
         send: &mut SendStream,

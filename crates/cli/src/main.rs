@@ -58,6 +58,9 @@ enum Command {
         /// Cap on xorb bytes held in memory across all transfers, in MiB (one xorb always fits).
         #[arg(long, default_value_t = 256)]
         max_memory_mib: u64,
+        /// Abort a transfer when the sender sends no data for this many seconds.
+        #[arg(long, default_value_t = 120)]
+        stall_timeout_secs: u64,
         /// Resumable session state (default: <cas-dir>/sessions).
         #[arg(long)]
         session_dir: Option<PathBuf>,
@@ -95,6 +98,9 @@ enum Command {
         /// every new file has been verified; never touches anything outside --dest.
         #[arg(long)]
         delete: bool,
+        /// Cap on payload throughput, in MiB/s (all streams together).
+        #[arg(long)]
+        bwlimit_mib: Option<f64>,
         /// Transfer mode: "chunk" (only missing chunks, default) or "xorb" (whole xorbs).
         #[arg(long, default_value = "chunk", value_parser = ["chunk", "xorb"])]
         mode: String,
@@ -148,6 +154,7 @@ async fn main() -> Result<()> {
             allow_client,
             parallel,
             max_memory_mib,
+            stall_timeout_secs,
             session_dir,
             test_commit_delay_ms,
         } => {
@@ -184,6 +191,7 @@ async fn main() -> Result<()> {
             }
             ropts.commit_delay = test_commit_delay_ms.map(std::time::Duration::from_millis);
             ropts.client_scopes = scopes;
+            ropts.stall_timeout = std::time::Duration::from_secs(stall_timeout_secs.max(1));
             let receiver = Arc::new(Receiver::new(&root, cas, ropts)?);
             eprintln!(
                 "listening on {} (QUIC), root {}",
@@ -204,6 +212,7 @@ async fn main() -> Result<()> {
             parallel,
             max_memory_mib,
             delete,
+            bwlimit_mib,
             mode,
             json,
         } => {
@@ -234,6 +243,9 @@ async fn main() -> Result<()> {
                 } else {
                     TransferMode::Chunk
                 },
+                bandwidth_limit: bwlimit_mib
+                    .filter(|m| *m > 0.0)
+                    .map(|m| m * 1024.0 * 1024.0),
             };
             if delete {
                 eprintln!(

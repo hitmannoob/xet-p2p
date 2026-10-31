@@ -6,6 +6,7 @@ mod budget;
 mod error;
 mod locks;
 pub mod protocol;
+mod rate;
 mod receiver;
 mod sender;
 mod session;

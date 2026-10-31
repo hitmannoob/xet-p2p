@@ -19,6 +19,7 @@ use crate::protocol::{
     ChunkRequest, MAX_CONTROL_FRAME, Message, ObjectHeader, ObjectKind, PROTOCOL_VERSION,
     ReceiverReport, TransferMode, parse_hash,
 };
+use crate::rate::{RateLimiter, SLICE};
 
 #[derive(Debug, Clone)]
 pub struct PushOptions {
@@ -32,6 +33,8 @@ pub struct PushOptions {
     pub delete: bool,
     /// How missing content is moved (chunk-level by default).
     pub mode: TransferMode,
+    /// Cap on payload bytes per second across all streams; `None` for unlimited.
+    pub bandwidth_limit: Option<f64>,
 }
 
 /// Default for [`PushOptions::max_memory_bytes`] and the receiver's equivalent.
@@ -76,6 +79,7 @@ pub async fn push(
     opts: &PushOptions,
 ) -> Result<PushReport> {
     let start = Instant::now();
+    let limiter = opts.bandwidth_limit.map(|b| Arc::new(RateLimiter::new(b)));
     let (manifest, ingest) = cas.ingest(src).await?;
     let files = file_hashes(&manifest)?;
     let referenced = cas.referenced_xorbs(&files).await?;
@@ -135,9 +139,9 @@ pub async fn push(
                 if !reconstructions.is_empty() {
                     let shard = cas.export_shard(&reconstructions).await?;
                     report.shard_bytes_sent +=
-                        send_object(conn, ObjectKind::Shard, None, shard).await?;
+                        send_object(conn, &limiter, ObjectKind::Shard, None, shard).await?;
                 }
-                report.xorb_bytes_sent += send_xorbs(&cas, conn, &xorbs, opts).await?;
+                report.xorb_bytes_sent += send_xorbs(&cas, conn, &xorbs, opts, &limiter).await?;
                 report.xorbs_sent += xorbs.len();
             }
             Message::NeedChunkLists { files: wanted } => {
@@ -145,11 +149,12 @@ pub async fn push(
                 debug!(files = wanted.len(), "NEED_CHUNK_LISTS");
                 let lists = encode_chunk_lists(&cas.chunk_lists(&wanted).await?);
                 report.chunk_list_bytes_sent +=
-                    send_object(conn, ObjectKind::ChunkLists, None, lists).await?;
+                    send_object(conn, &limiter, ObjectKind::ChunkLists, None, lists).await?;
             }
             Message::NeedChunks { requests } => {
                 debug!(files = requests.len(), "NEED_CHUNKS");
-                let (bytes, runs) = send_chunk_runs(&cas, conn, &requests, &files, opts).await?;
+                let (bytes, runs) =
+                    send_chunk_runs(&cas, conn, &requests, &files, opts, &limiter).await?;
                 report.chunk_bytes_sent += bytes;
                 report.chunk_runs_sent += runs;
             }
@@ -192,6 +197,7 @@ async fn send_xorbs(
     conn: &Connection,
     xorbs: &BTreeSet<MerkleHash>,
     opts: &PushOptions,
+    limiter: &Limiter,
 ) -> Result<u64> {
     let permits = Arc::new(Semaphore::new(opts.parallel_streams.max(1)));
     let budget = MemoryBudget::new(opts.max_memory_bytes);
@@ -203,11 +209,11 @@ async fn send_xorbs(
             .await
             .expect("semaphore never closed");
         let memory = budget.reserve(cas.xorb_len(&hash).await?).await;
-        let (cas, conn) = (cas.clone(), conn.clone());
+        let (cas, conn, limiter) = (cas.clone(), conn.clone(), limiter.clone());
         tasks.spawn(async move {
             let _permits = (permit, memory);
             let bytes = cas.read_xorb(&hash).await?;
-            send_object(&conn, ObjectKind::Xorb, Some(hash), bytes).await
+            send_object(&conn, &limiter, ObjectKind::Xorb, Some(hash), bytes).await
         });
     }
     let mut total = 0;
@@ -225,6 +231,7 @@ async fn send_chunk_runs(
     requests: &[ChunkRequest],
     files: &BTreeSet<MerkleHash>,
     opts: &PushOptions,
+    limiter: &Limiter,
 ) -> Result<(u64, usize)> {
     let permits = Arc::new(Semaphore::new(opts.parallel_streams.max(1)));
     let budget = MemoryBudget::new(opts.max_memory_bytes);
@@ -248,12 +255,19 @@ async fn send_chunk_runs(
             let memory = budget
                 .reserve(run.byte_range.end - run.byte_range.start)
                 .await;
-            let (cas, conn) = (cas.clone(), conn.clone());
+            let (cas, conn, limiter) = (cas.clone(), conn.clone(), limiter.clone());
             runs_sent += 1;
             tasks.spawn(async move {
                 let _permits = (permit, memory);
                 cas.read_chunk_run(&mut run).await?;
-                send_object(&conn, ObjectKind::ChunkRun, Some(run.xorb), run.bytes).await
+                send_object(
+                    &conn,
+                    &limiter,
+                    ObjectKind::ChunkRun,
+                    Some(run.xorb),
+                    run.bytes,
+                )
+                .await
             });
             // Surface failures early rather than after planning everything.
             while let Some(res) = tasks.try_join_next() {
@@ -267,8 +281,11 @@ async fn send_chunk_runs(
     Ok((total, runs_sent))
 }
 
+type Limiter = Option<Arc<RateLimiter>>;
+
 async fn send_object(
     conn: &Connection,
+    limiter: &Limiter,
     kind: ObjectKind,
     hash: Option<MerkleHash>,
     bytes: Vec<u8>,
@@ -284,7 +301,15 @@ async fn send_object(
         },
     )
     .await?;
-    stream.write_all(&bytes).await?;
+    match limiter {
+        None => stream.write_all(&bytes).await?,
+        Some(limiter) => {
+            for piece in bytes.chunks(SLICE) {
+                limiter.take(piece.len()).await;
+                stream.write_all(piece).await?;
+            }
+        }
+    }
     let _ = stream.finish();
     Ok(len)
 }

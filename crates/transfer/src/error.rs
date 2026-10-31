@@ -11,6 +11,9 @@ pub enum Error {
     #[error("protocol error: {0}")]
     Protocol(String),
 
+    #[error("transfer stalled: no data from the sender for {}s", .0.as_secs_f64())]
+    Stalled(std::time::Duration),
+
     /// The peer reported a failure.
     #[error("peer reported error: {0}")]
     Remote(String),

@@ -161,6 +161,7 @@ impl Harness {
             max_memory_bytes: transfer::DEFAULT_MAX_MEMORY_BYTES,
             delete: false,
             mode: TransferMode::Chunk,
+            bandwidth_limit: None,
         };
         configure(&mut opts);
         let result = push(cas.clone(), &self.src(), &conn, &opts).await;
@@ -292,6 +293,7 @@ async fn unauthorized_client_cannot_push() {
             max_memory_bytes: transfer::DEFAULT_MAX_MEMORY_BYTES,
             delete: false,
             mode: TransferMode::Chunk,
+            bandwidth_limit: None,
         };
         push(h.sender_cas.clone(), &h.src(), &conn, &opts).await
     }
@@ -903,6 +905,86 @@ async fn chunk_mode_interrupted_push_resumes() {
     assert!(
         rr.chunks_present > 0 && rr.chunks_received < rr.chunks_total,
         "{rr:?}"
+    );
+    assert_trees_equal(&h.src(), &h.root().join("p"));
+}
+
+// ---- M4: stall timeout and bandwidth limit ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stalled_sender_is_dropped_and_releases_destination() {
+    let h =
+        Harness::with_receiver(|o| o.stall_timeout = std::time::Duration::from_millis(800)).await;
+    write(&h.src(), "a.bin", &random_bytes(50, MIB));
+    let (manifest, _) = h.sender_cas.ingest(h.src()).await.unwrap();
+
+    // A sender that announces a transfer, then goes silent while keeping the connection alive.
+    let conn = h.connect_as(&h.client_id).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    write_frame(
+        &mut send,
+        &Message::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: "silent".into(),
+            dest: "p".into(),
+            delete: false,
+            mode: TransferMode::Chunk,
+        },
+    )
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        read_frame::<Message>(&mut recv, MAX_CONTROL_FRAME)
+            .await
+            .unwrap()
+            .unwrap(),
+        Message::HelloOk { .. }
+    ));
+    write_frame(&mut send, &Message::Manifest { manifest })
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_frame::<Message>(&mut recv, MAX_CONTROL_FRAME)
+            .await
+            .unwrap()
+            .unwrap(),
+        Message::NeedChunkLists { .. }
+    ));
+    // ...and never answers.
+    let last = read_frame::<Message>(&mut recv, MAX_CONTROL_FRAME)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(last, Message::Error { ref message } if message.contains("stalled")),
+        "{last:?}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+    // The destination lock is free again: an honest push proceeds at once.
+    let t = std::time::Instant::now();
+    h.push("p").await.unwrap();
+    assert!(t.elapsed() < std::time::Duration::from_secs(10));
+    drop(conn);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn slow_but_steady_sender_is_not_a_stall() {
+    // 4 MiB at 1 MiB/s against a 1.5 s stall timeout: data keeps arriving, so no abort.
+    let h =
+        Harness::with_receiver(|o| o.stall_timeout = std::time::Duration::from_millis(1500)).await;
+    write(&h.src(), "a.bin", &random_bytes(51, 4 * MIB));
+    let t = std::time::Instant::now();
+    let r = h
+        .push_with("p", |o| o.bandwidth_limit = Some(MIB as f64))
+        .await
+        .unwrap();
+    let secs = t.elapsed().as_secs_f64();
+    assert!(
+        secs > 3.0,
+        "bandwidth limit not applied: {secs}s for {} bytes",
+        r.payload_bytes_sent()
     );
     assert_trees_equal(&h.src(), &h.root().join("p"));
 }

@@ -105,6 +105,7 @@ impl Rig {
             max_memory_bytes: transfer::DEFAULT_MAX_MEMORY_BYTES,
             delete: false,
             mode,
+            bandwidth_limit: None,
         };
         let r = push(cas.clone(), src, &conn, &opts).await.unwrap();
         conn.close(0u32.into(), b"done");
