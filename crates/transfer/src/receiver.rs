@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -13,31 +14,61 @@ use xet_local::manifest::validate_rel_path;
 use xet_local::{LocalCas, MerkleHash, PendingShard, create_confined_dir};
 
 use crate::error::{Error, Result};
+use crate::locks::DestLocks;
 use crate::protocol::{
     MAX_CONTROL_FRAME, MAX_OBJECT_HEADER, MAX_SHARD_BYTES, MAX_XORB_BYTES, Message, ObjectHeader,
     ObjectKind, PROTOCOL_VERSION, ReceiverReport, parse_hash, to_hex,
 };
+use crate::session::{Session, SessionStore};
 
-const CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone)]
+pub struct ReceiverOptions {
+    /// Objects received and verified concurrently (each may hold one xorb in memory).
+    pub parallel_objects: usize,
+    /// Durable session state for resuming interrupted transfers.
+    pub session_dir: PathBuf,
+    /// How long a transfer waits for another into an overlapping destination to finish. Longer
+    /// than the QUIC idle timeout, so a resume can outwait a dead predecessor's connection.
+    pub dest_lock_wait: Duration,
+    /// Test hook: pause after committing each xorb, to make interruption timing deterministic.
+    pub commit_delay: Option<Duration>,
+}
+
+impl ReceiverOptions {
+    /// Defaults, keeping session state alongside the CAS.
+    pub fn new(cas: &LocalCas) -> Self {
+        Self {
+            parallel_objects: 4,
+            session_dir: cas.root().join("sessions"),
+            dest_lock_wait: Duration::from_secs(60),
+            commit_delay: None,
+        }
+    }
+}
 
 pub struct Receiver {
     root: PathBuf,
     cas: Arc<LocalCas>,
-    /// Objects verified concurrently (each may hold one xorb in memory).
-    parallel_objects: usize,
-    /// One transfer at a time: concurrent pushes into overlapping trees are not coordinated.
-    busy: tokio::sync::Mutex<()>,
+    sessions: SessionStore,
+    locks: Arc<DestLocks>,
+    opts: ReceiverOptions,
 }
 
 impl Receiver {
     /// `root` must exist; every destination is confined to it. The CAS must not overlap any
     /// destination (checked per transfer).
-    pub fn new(root: &Path, cas: Arc<LocalCas>, parallel_objects: usize) -> Result<Self> {
+    pub fn new(root: &Path, cas: Arc<LocalCas>, opts: ReceiverOptions) -> Result<Self> {
         Ok(Self {
             root: std::fs::canonicalize(root).map_err(xet_local::Error::from)?,
+            sessions: SessionStore::open(&opts.session_dir)?,
             cas,
-            parallel_objects: parallel_objects.max(1),
-            busy: tokio::sync::Mutex::new(()),
+            locks: Arc::default(),
+            opts: ReceiverOptions {
+                parallel_objects: opts.parallel_objects.max(1),
+                ..opts
+            },
         })
     }
 
@@ -61,7 +92,6 @@ impl Receiver {
     /// Runs one transfer on an established, authenticated connection.
     pub async fn handle(&self, conn: Connection) -> Result<ReceiverReport> {
         let (mut send, mut recv) = conn.accept_bi().await?;
-        let _guard = self.busy.lock().await;
         let result = self.run(&conn, &mut send, &mut recv).await;
         match &result {
             Ok(report) => {
@@ -108,12 +138,17 @@ impl Receiver {
                         "unsupported protocol version {protocol_version} (receiver speaks {PROTOCOL_VERSION})"
                     )));
                 }
-                info!(session = %session_id, %dest, "HELLO");
+                info!(connection = %session_id, %dest, "HELLO");
                 self.check_dest(&dest)?;
                 dest
             }
             other => return Err(unexpected(other)),
         };
+        // Held until this transfer ends; overlapping destinations wait their turn.
+        let _dest_guard = self
+            .locks
+            .acquire(&validate_rel_path(&dest)?, self.opts.dest_lock_wait)
+            .await?;
         write_frame(
             send,
             &Message::HelloOk {
@@ -128,36 +163,67 @@ impl Receiver {
         };
         manifest.validate()?;
 
-        let mut report = ReceiverReport::default();
+        let mut session = self.sessions.begin(&dest, &manifest)?;
+        let mut report = ReceiverReport {
+            resumed: session.is_resumed(),
+            attempts: session.record.attempts,
+            prior_xorbs_committed: session.prior.xorbs_committed,
+            prior_xorb_bytes_committed: session.prior.xorb_bytes_committed,
+            ..Default::default()
+        };
+        if report.resumed {
+            info!(%dest, attempt = report.attempts, prior_xorbs = report.prior_xorbs_committed, "resuming session");
+        }
+
         let missing = self.cas.missing_content(&manifest).await?;
         let mut xorbs = missing.xorbs.clone();
+        let mut present = missing.present_xorbs.clone();
 
-        // Round 1: reconstruction metadata for files this CAS has never seen.
+        // Round 1: reconstruction metadata for files this CAS has never seen, unless an earlier
+        // attempt of this session already received it.
         let mut pending = None;
         if !missing.reconstructions.is_empty() {
-            write_frame(
-                send,
-                &Message::Need {
-                    reconstructions: to_hex(missing.reconstructions.iter().copied()),
-                    xorbs: vec![],
-                },
-            )
-            .await?;
-            let shard = self.receive_shard(conn).await?;
-            report.shards_received += 1;
-            report.payload_bytes_received += shard.len() as u64;
-            let p = PendingShard::parse(&shard, &missing.reconstructions)?;
-            write_frame(
-                send,
-                &Message::Ack {
-                    kind: ObjectKind::Shard,
-                    hash: None,
-                },
-            )
-            .await?;
-            xorbs.extend(self.cas.absent_xorbs(&p.referenced_xorbs()).await?);
+            let saved = session
+                .saved_shard
+                .take()
+                .and_then(|b| PendingShard::parse_containing(&b, &missing.reconstructions).ok());
+            let p = match saved {
+                Some(p) => {
+                    report.shard_from_session = true;
+                    p
+                }
+                None => {
+                    write_frame(
+                        send,
+                        &Message::Need {
+                            reconstructions: to_hex(missing.reconstructions.iter().copied()),
+                            xorbs: vec![],
+                        },
+                    )
+                    .await?;
+                    let shard = self.receive_shard(conn).await?;
+                    report.shards_received += 1;
+                    report.payload_bytes_received += shard.len() as u64;
+                    let p = PendingShard::parse(&shard, &missing.reconstructions)?;
+                    session.save_shard(&shard)?;
+                    write_frame(
+                        send,
+                        &Message::Ack {
+                            kind: ObjectKind::Shard,
+                            hash: None,
+                        },
+                    )
+                    .await?;
+                    p
+                }
+            };
+            let referenced = p.referenced_xorbs();
+            let absent = self.cas.absent_xorbs(&referenced).await?;
+            present.extend(referenced.difference(&absent));
+            xorbs.extend(absent);
             pending = Some(p);
         }
+        report.xorbs_already_present = present.len();
 
         // Round 2: whole xorbs not present locally.
         if !xorbs.is_empty() {
@@ -169,7 +235,9 @@ impl Receiver {
                 },
             )
             .await?;
-            report.payload_bytes_received += self.receive_xorbs(conn, send, xorbs.clone()).await?;
+            report.payload_bytes_received += self
+                .receive_xorbs(conn, send, xorbs.clone(), &mut session)
+                .await?;
             report.xorbs_received += xorbs.len();
         }
 
@@ -181,8 +249,10 @@ impl Receiver {
         let dest_dir = create_confined_dir(&self.root, &dest)?;
         let r = self.cas.reconstruct(&manifest, &dest_dir).await?;
         report.files_installed = r.files;
+        report.files_unchanged = r.files_unchanged;
         report.dirs_created = r.dirs;
         report.bytes_reconstructed = r.bytes;
+        session.finish()?;
         Ok(report)
     }
 
@@ -215,22 +285,26 @@ impl Receiver {
         conn: &Connection,
         send: &mut SendStream,
         expected: BTreeSet<MerkleHash>,
+        session: &mut Session<'_>,
     ) -> Result<u64> {
         let mut remaining = expected.len();
         let expected = Arc::new(Mutex::new(expected));
-        let permits = Arc::new(Semaphore::new(self.parallel_objects));
+        let permits = Arc::new(Semaphore::new(self.opts.parallel_objects));
+        let delay = self.opts.commit_delay;
         let mut tasks: JoinSet<Result<(MerkleHash, u64)>> = JoinSet::new();
         let mut total = 0;
 
         while remaining > 0 || !tasks.is_empty() {
             tokio::select! {
-                permit = permits.clone().acquire_owned(), if remaining > 0 => {
-                    let permit = permit.expect("semaphore never closed");
-                    let mut stream = conn.accept_uni().await?;
+                // Accepting is its own branch so ACKs keep flowing while we wait for the next
+                // stream: a sender may legitimately wait for an ACK before sending more. Quinn's
+                // stream limit bounds accepted streams; the permit bounds objects held in memory.
+                stream = conn.accept_uni(), if remaining > 0 => {
+                    let mut stream = stream?;
                     remaining -= 1;
-                    let (cas, expected) = (self.cas.clone(), expected.clone());
+                    let (cas, expected, permits) = (self.cas.clone(), expected.clone(), permits.clone());
                     tasks.spawn(async move {
-                        let _permit = permit;
+                        let _permit = permits.acquire_owned().await.expect("semaphore never closed");
                         let header = read_header(&mut stream).await?;
                         let hash = match (&header.kind, &header.hash) {
                             (ObjectKind::Xorb, Some(h)) => parse_hash(h)?,
@@ -242,12 +316,16 @@ impl Receiver {
                         let bytes = read_payload(&mut stream, header.len, MAX_XORB_BYTES).await?;
                         let len = bytes.len() as u64;
                         cas.commit_xorb(hash, bytes).await?;
+                        if let Some(d) = delay {
+                            tokio::time::sleep(d).await;
+                        }
                         Ok((hash, len))
                     });
                 }
                 Some(done) = tasks.join_next(), if !tasks.is_empty() => {
                     let (hash, len) = done.map_err(|e| Error::Protocol(format!("receive task failed: {e}")))??;
                     total += len;
+                    session.xorb_committed(len)?;
                     write_frame(send, &Message::Ack { kind: ObjectKind::Xorb, hash: Some(hash.hex()) }).await?;
                 }
             }

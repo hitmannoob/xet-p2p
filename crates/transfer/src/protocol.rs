@@ -104,13 +104,28 @@ pub struct ObjectHeader {
 
 /// What the receiver did, reported back to the sender.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReceiverReport {
+    /// Files written into the destination.
     pub files_installed: usize,
+    /// Files already identical at the destination, left untouched.
+    pub files_unchanged: usize,
     pub dirs_created: usize,
     pub bytes_reconstructed: u64,
     pub shards_received: usize,
     pub xorbs_received: usize,
     pub payload_bytes_received: u64,
+    /// Distinct xorbs the manifest needs that were already in the receiver's CAS.
+    pub xorbs_already_present: usize,
+    /// This transfer continued an interrupted session for the same destination and manifest.
+    pub resumed: bool,
+    /// Attempts made on this session, including this one.
+    pub attempts: u32,
+    /// Xorbs committed by earlier, interrupted attempts (resume savings).
+    pub prior_xorbs_committed: u64,
+    pub prior_xorb_bytes_committed: u64,
+    /// The reconstruction shard came from the saved session instead of the wire.
+    pub shard_from_session: bool,
 }
 
 pub(crate) fn to_hex(hashes: impl IntoIterator<Item = MerkleHash>) -> Vec<String> {

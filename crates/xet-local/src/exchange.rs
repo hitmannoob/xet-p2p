@@ -52,6 +52,30 @@ impl PendingShard {
         })
     }
 
+    /// Parses a shard saved by an earlier, interrupted session and keeps only the entries in
+    /// `expected`, all of which must be present. Entries are still fully verified at commit.
+    pub fn parse_containing(bytes: &[u8], expected: &BTreeSet<MerkleHash>) -> Result<Self> {
+        let mut shard = MDBInMemoryShard::from_reader(&mut Cursor::new(bytes)).map_err(|e| {
+            Error::Verification {
+                path: "<saved shard>".into(),
+                reason: format!("malformed shard: {e}"),
+            }
+        })?;
+        let mut files = Vec::with_capacity(expected.len());
+        for hash in expected {
+            files.push(
+                shard
+                    .file_content
+                    .remove(hash)
+                    .ok_or_else(|| Error::Verification {
+                        path: "<saved shard>".into(),
+                        reason: format!("no entry for file {}", hash.hex()),
+                    })?,
+            );
+        }
+        Ok(Self { files })
+    }
+
     pub fn num_files(&self) -> usize {
         self.files.len()
     }

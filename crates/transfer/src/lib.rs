@@ -3,11 +3,14 @@
 //! `transport-quic`.
 
 mod error;
+mod locks;
 pub mod protocol;
 mod receiver;
 mod sender;
+mod session;
 
 pub use error::{Error, Result};
 pub use protocol::ReceiverReport;
-pub use receiver::Receiver;
+pub use receiver::{Receiver, ReceiverOptions};
 pub use sender::{PushOptions, PushReport, push};
+pub use session::SessionRecord;

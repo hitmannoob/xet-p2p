@@ -8,7 +8,7 @@ use std::sync::Arc;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 use transfer::protocol::{MAX_CONTROL_FRAME, Message, ObjectHeader, ObjectKind, PROTOCOL_VERSION};
-use transfer::{Error, PushOptions, Receiver, push};
+use transfer::{Error, PushOptions, Receiver, ReceiverOptions, push};
 use transport_quic::quinn::{Connection, Endpoint};
 use transport_quic::{
     EndpointOptions, GeneratedIdentity, Identity, client_endpoint, connect, generate, read_frame,
@@ -86,7 +86,8 @@ impl Harness {
 
         // The receiver's CAS lives inside its root, as in the brief's example layout.
         let receiver_cas = Arc::new(LocalCas::open(root.join(".xet-p2p/cas")).await.unwrap());
-        let receiver = Arc::new(Receiver::new(&root, receiver_cas, 4).unwrap());
+        let opts = ReceiverOptions::new(&receiver_cas);
+        let receiver = Arc::new(Receiver::new(&root, receiver_cas, opts).unwrap());
         tokio::spawn(receiver.serve(server.clone()));
 
         let sender_cas = Arc::new(LocalCas::open(tmp.path().join("sender-cas")).await.unwrap());
@@ -169,7 +170,12 @@ async fn second_push_of_unchanged_tree_sends_zero_payload() {
     assert_eq!(r.payload_bytes_sent(), 0, "{r:?}");
     assert_eq!(r.xorbs_sent, 0);
     assert_eq!(r.xorbs_reused(), r.xorbs_referenced);
-    assert_eq!(r.receiver.files_installed, 2);
+    assert_eq!(
+        r.receiver.files_installed, 0,
+        "unchanged files must not be rewritten"
+    );
+    assert_eq!(r.receiver.files_unchanged, 2);
+    assert_eq!(r.receiver.xorbs_already_present, r.xorbs_referenced);
     assert_trees_equal(&h.src(), &h.root().join("p"));
 }
 
@@ -397,4 +403,189 @@ async fn oversized_xorb_header_rejected() {
         matches!(last, Message::Error { ref message } if message.contains("exceeds")),
         "{last:?}"
     );
+}
+
+// ---- M2: resume and concurrency ----
+
+/// Runs an honest push that drops the connection after `commit` xorbs have been ACKed.
+/// Returns how many xorbs the receiver asked for.
+async fn interrupted_push(h: &Harness, dest: &str, commit: usize) -> usize {
+    let (manifest, _) = h.sender_cas.ingest(h.src()).await.unwrap();
+    let conn = h.connect_as(&h.client_id).await.unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    let mut next = async || {
+        read_frame::<Message>(&mut recv, MAX_CONTROL_FRAME)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+
+    write_frame(
+        &mut send,
+        &Message::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            session_id: "interrupted".into(),
+            dest: dest.into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(next().await, Message::HelloOk { .. }));
+    write_frame(&mut send, &Message::Manifest { manifest })
+        .await
+        .unwrap();
+
+    let Message::Need {
+        reconstructions, ..
+    } = next().await
+    else {
+        panic!()
+    };
+    let files = reconstructions
+        .iter()
+        .map(|s| MerkleHash::from_hex(s).unwrap())
+        .collect();
+    send_raw(
+        &conn,
+        ObjectKind::Shard,
+        None,
+        &h.sender_cas.export_shard(&files).await.unwrap(),
+    )
+    .await;
+    assert!(matches!(
+        next().await,
+        Message::Ack {
+            kind: ObjectKind::Shard,
+            ..
+        }
+    ));
+
+    let Message::Need { xorbs, .. } = next().await else {
+        panic!()
+    };
+    for x in xorbs.iter().take(commit) {
+        let x = MerkleHash::from_hex(x).unwrap();
+        send_raw(
+            &conn,
+            ObjectKind::Xorb,
+            Some(x),
+            &h.sender_cas.read_xorb(&x).await.unwrap(),
+        )
+        .await;
+        assert!(matches!(
+            next().await,
+            Message::Ack {
+                kind: ObjectKind::Xorb,
+                ..
+            }
+        ));
+    }
+    // Simulate the sender dying mid-transfer.
+    conn.close(1u32.into(), b"killed");
+    xorbs.len()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_push_resumes_without_resending_committed_content() {
+    let h = Harness::new().await;
+    write(&h.src(), "big.bin", &random_bytes(30, 150 * MIB));
+    write(&h.src(), "small.txt", b"also here");
+
+    let needed = interrupted_push(&h, "p", 2).await;
+    assert!(
+        needed >= 3,
+        "need several xorbs to interrupt between; got {needed}"
+    );
+    assert!(
+        !h.root().join("p/big.bin").exists(),
+        "nothing installed by the interrupted attempt"
+    );
+
+    let r = h.push("p").await.unwrap();
+    let rr = &r.receiver;
+    assert!(rr.resumed, "{rr:?}");
+    assert_eq!(rr.attempts, 2);
+    assert_eq!(rr.prior_xorbs_committed, 2);
+    assert!(
+        rr.shard_from_session,
+        "shard must come from the saved session"
+    );
+    assert_eq!(r.shard_bytes_sent, 0);
+    assert_eq!(
+        r.xorbs_sent,
+        needed - 2,
+        "committed xorbs must not be re-sent"
+    );
+    assert_eq!(rr.xorbs_already_present, 2);
+    assert_trees_equal(&h.src(), &h.root().join("p"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupted_before_any_xorb_still_reuses_shard() {
+    let h = Harness::new().await;
+    write(&h.src(), "a.bin", &random_bytes(31, 3 * MIB));
+    let needed = interrupted_push(&h, "p", 0).await;
+    let r = h.push("p").await.unwrap();
+    assert!(r.receiver.resumed && r.receiver.shard_from_session);
+    assert_eq!(r.shard_bytes_sent, 0);
+    assert_eq!(r.xorbs_sent, needed);
+    assert_trees_equal(&h.src(), &h.root().join("p"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completed_session_is_removed() {
+    let h = Harness::new().await;
+    write(&h.src(), "a.bin", &random_bytes(32, MIB));
+    let r1 = h.push("p").await.unwrap();
+    assert!(!r1.receiver.resumed);
+    let sessions = h.root().join(".xet-p2p/cas/sessions");
+    assert_eq!(
+        fs::read_dir(&sessions).unwrap().count(),
+        0,
+        "session left behind"
+    );
+    let r2 = h.push("p").await.unwrap();
+    assert!(!r2.receiver.resumed);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn changed_source_after_interruption_starts_fresh_but_reuses_xorbs() {
+    let h = Harness::new().await;
+    write(&h.src(), "big.bin", &random_bytes(33, 150 * MIB));
+    interrupted_push(&h, "p", 2).await;
+    write(&h.src(), "new.txt", b"added after the interruption");
+    let r = h.push("p").await.unwrap();
+    // Different manifest, so a different session; the committed xorbs are still found in the CAS.
+    assert!(!r.receiver.resumed);
+    assert!(r.receiver.xorbs_already_present >= 2, "{:?}", r.receiver);
+    assert_trees_equal(&h.src(), &h.root().join("p"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_pushes_to_disjoint_destinations() {
+    let h = Harness::new().await;
+    write(&h.src(), "shared.bin", &random_bytes(34, 8 * MIB));
+    write(&h.src(), "d/x.txt", b"x");
+    // Prime the sender's CAS so both pushes only differ on the receiver side.
+    h.sender_cas.ingest(h.src()).await.unwrap();
+    let (a, b, c) = tokio::join!(h.push("a"), h.push("b"), h.push("c"));
+    for (dest, r) in [("a", a), ("b", b), ("c", c)] {
+        r.unwrap_or_else(|e| panic!("{dest}: {e}"));
+        assert_trees_equal(&h.src(), &h.root().join(dest));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_pushes_to_overlapping_destinations_serialize() {
+    let h = Harness::new().await;
+    write(&h.src(), "a.bin", &random_bytes(35, 4 * MIB));
+    h.sender_cas.ingest(h.src()).await.unwrap();
+    let (outer, inner) = tokio::join!(h.push("p"), h.push("p/inner"));
+    outer.unwrap();
+    inner.unwrap();
+    assert_eq!(
+        fs::read(h.root().join("p/a.bin")).unwrap(),
+        fs::read(h.src().join("a.bin")).unwrap()
+    );
+    assert_trees_equal(&h.src(), &h.root().join("p/inner"));
 }
