@@ -17,7 +17,7 @@ Xet (chunks + xorbs + shards + local CAS)  ↔  QUIC (pinned mutual TLS)  ↔  X
 - Every received object is verified before it is stored; every file is verified (size + SHA-256)
   before it is installed, and installation is atomic per file. A failed transfer installs nothing.
 
-Status: **M0–M2 complete** (offline round trip; authenticated QUIC push with whole-xorb
+Status: **M0–M2 complete, post-M2 gaps closed** (offline round trip; authenticated QUIC push with whole-xorb
 transfer; incremental install, durable resume, concurrent pushes). See [PROGRESS.md](PROGRESS.md) for details and what is next, and
 [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md) for the full design brief.
 
@@ -93,12 +93,17 @@ pushed 26 files (124868 logical bytes) in 0.03s
   xorbs, then checks each reconstructed file's size and SHA-256 against the manifest.
 - **Least disclosure.** The sender serves only objects referenced by the manifest it is pushing, so a
   receiver cannot pull other content from the sender's CAS.
+- **Per-sender scopes.** `--allow-client sender.crt=projects/alice` confines that sender to
+  `<root>/projects/alice`. A bare `--allow-client sender.crt` grants the whole root. Once any scope is
+  configured, every sender needs an entry.
 - **Bounded resources.** Control frames, object headers, xorbs (80 MiB), and shards (256 MiB) have
-  hard size limits; concurrent data streams and in-memory objects are capped (`--parallel`).
+  hard size limits; concurrent streams are capped by `--parallel` and in-memory xorb bytes by
+  `--max-memory-mib` (default 256; at least one xorb always fits).
+- **Durability.** Received xorbs and shards are fsynced on commit, installed files before their
+  rename and directories after; session state is written temp-file + fsync + rename.
 - Keys and certificates are never logged. Errors returned to a peer contain paths and hashes only.
 
-Not yet covered: certificate rotation/revocation (replace the pinned file), and per-sender
-destination policies (any allowed sender may write anywhere under `--root`).
+Not yet covered: certificate rotation/revocation (replace the pinned file and restart).
 
 ## Commands
 
@@ -112,6 +117,14 @@ destination policies (any allowed sender may write anywhere under `--root`).
 
 Run any command with `--help` for all options. Set `RUST_LOG=debug` for verbose logs.
 
+## Mirroring with `--delete`
+
+By default a push never removes anything on the receiver. With `push --delete`, everything under
+`--dest` that is not in the source is removed, rsync-style — including a file sitting where the
+source has a directory, and vice versa. Deletion happens only after every new file has been
+reconstructed and verified, so a failed push deletes nothing. Symlinks are removed, never followed,
+and nothing outside `--dest` (nor the CAS or session state) is ever touched.
+
 ## Resume and concurrency
 
 The receiver keeps a durable session per (destination, manifest) under `<cas-dir>/sessions`
@@ -119,7 +132,7 @@ The receiver keeps a durable session per (destination, manifest) under `<cas-dir
 killed — run the same push again. The receiver reuses the reconstruction metadata it already has and
 requests only xorbs it has not yet verified and stored. `push` reports `resumed interrupted session`
 with what was saved. If the source changed in between, a new session starts, but every xorb already
-stored is still reused. Sessions are removed on success and discarded after 7 days idle.
+stored is still reused, and so is the reconstruction metadata of every file that did not change. Sessions are removed on success and discarded after 7 days idle.
 
 Pushes into disjoint destinations run concurrently; pushes into overlapping destinations (one inside
 the other) wait for each other.

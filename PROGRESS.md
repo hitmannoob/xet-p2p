@@ -110,23 +110,37 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
 3. Benchmark wire bytes vs whole-xorb transfer on overlapping edits (insertions at start/middle,
    checkpoint-like binaries). Report exact conditions.
 
+### 2026-10-31 — closing the recorded gaps
+
+Every gap recorded after M2 was addressed (6 commits after `7eb64fe`):
+
+| Gap | Resolution |
+|---|---|
+| Upstream does not fsync xorb/shard commits | `commit_xorb`/`commit_shard` fsync file + directory after upstream's rename (paths follow the pinned `LocalClient` layout; a mismatch fails the commit). Installed files are fsynced before rename, their directories after. |
+| Edit during ingest undetected (beyond size) | Each file is re-stat'ed after reading; a size or mtime change rejects it ("file changed during ingest; retry"). Racing-writer test. |
+| Upstream assert on inconsistent `MDBFileInfo` | `check_consistent` validates every parsed shard entry (segment/verification counts, ext flag) before use; unit-tested. |
+| Each xorb fully in memory × `--parallel` | Byte budget on both sides (`--max-memory-mib`, default 256), independent of `--parallel`; receiver budget spans all transfers; budgets below one xorb clamp to one at a time (tested at 1 byte, 90 MiB push). Whole-object buffering itself remains (upstream `upload_xorb` takes a `Vec`); streaming is M4. |
+| Resume requires an identical manifest | Received shard entries are pooled per file hash (`sessions/pending/<hash>.shard`), so an edited source re-requests metadata only for new/changed files; xorbs were already reused. |
+| Any sender may write anywhere under `--root` | `--allow-client CERT=SCOPE` confines a sender (by certificate fingerprint) to `<root>/SCOPE`, component-wise; repeatable; senders without an entry are refused once scopes exist. |
+| No mirroring | Opt-in `push --delete`: prunes what the manifest does not describe (incl. type conflicts) only after every file verifies; symlinks removed, never followed; never outside `--dest`. |
+| Session dir could overlap a destination | Destinations are now rejected if they overlap the session directory, as for the CAS. |
+
+Tests: workspace total now 74 (5 transport, 4+10+28 xet-local, 2+24 transfer, 1 CLI crash test).
+CLI smoke: scoped sender in-scope push OK, out-of-scope refused; `--delete` removed exactly the
+deleted file and its directory, left the unchanged file untouched.
+
 ## Known gaps / risks
 
-- `LocalClient::upload_xorb` does not verify when a footer is supplied; receiver must call
-  `XorbObject::validate_xorb_object` first.
-- Ingest does not detect a file modified mid-read beyond a size check; content changes of equal size are
-  hashed as read.
-- Directory install is per-file atomic after all files verify, not a single atomic swap of the tree.
-- Push does not delete receiver files absent from the source (no mirroring; out of scope for v0.1).
-- Xorb commits are not fsynced by upstream (`SafeFileCreator` renames without `sync_all`). Process
-  crashes are safe (tested); a power loss could leave a truncated xorb that `xorb_exists` still
-  reports, failing later reconstructions of files that use it. Fix options: fsync after commit
-  (needs the xorb path — layout coupling) or verify-on-resume; decide in M4.
-- Any authorized sender may write anywhere under `--root`; no per-sender destination policy yet.
-- A resumed push must re-ingest the source (cheap: all chunks dedup locally) and must present an
-  identical manifest to hit its session; an edited source starts a new session (xorbs still reused).
-- Each xorb is held fully in memory while sent/verified (≤ 80 MiB × `--parallel`); streaming is M4.
+- Directory install is per-file atomic after all files verify, not one atomic swap of the tree. A
+  crash mid-install leaves a mix of old and new verified files; re-running the push completes it
+  (unchanged files skipped). An atomic tree swap was considered and not taken.
+- Xorbs are still buffered whole (bounded by the memory budget): upstream's `upload_xorb` and
+  `get_xorb_raw_bytes` take/return whole buffers. True streaming needs our own xorb file I/O; M4.
+- Sender-side CAS writes during ingest are not fsynced (upstream sessions). A sender power loss can
+  corrupt its own CAS; the receiver rejects any bad xorb, so the result is a failed push, never
+  corrupt data on the receiver. Recovery: delete the sender's `--cas-dir`.
+- Ingest change detection relies on mtime/size; an edit that restores both exactly is not seen.
 - No `transport` trait yet: `transfer` uses Quinn types directly. Abstract when M5 adds a fallback.
-- Upstream debug-asserts on an inconsistent `MDBFileInfo` (`file_structs.rs:372`). Shards parsed from
-  the wire are internally consistent, but a task panic would only abort that one transfer.
-- `LocalClient` lives in upstream's `simulation` module — no stability promise. Wrapped behind `xet-local`.
+- `LocalClient` lives in upstream's `simulation` module — no stability promise; pinned `=1.8.0` and
+  wrapped behind `xet-local`, with durability paths coupled to its on-disk layout.
+- Certificates: no rotation/revocation beyond replacing the pinned file and restarting.
