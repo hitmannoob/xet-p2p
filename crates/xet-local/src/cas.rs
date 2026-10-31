@@ -32,6 +32,10 @@ pub struct LocalCas {
     /// The same store upstream sessions open for `config` (redb handles are shared per path).
     pub(crate) client: Arc<LocalClient>,
     pub(crate) index: ChunkIndex,
+    /// Advisory lock on `<root>/.lock`: shared for normal use, exclusive for GC. Held for the
+    /// lifetime of this value.
+    _lock: fs::File,
+    exclusive: bool,
 }
 
 /// SHA-256 of zero bytes. Upstream 1.8.0 reports all zeros for empty files.
@@ -91,9 +95,43 @@ impl LocalCas {
     ///
     /// When called inside a multi-threaded tokio runtime, upstream reuses that runtime.
     pub async fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root.as_ref();
+        Self::open_with(root.as_ref(), false).await
+    }
+
+    /// Opens the CAS for exclusive use (required by [`LocalCas::gc`]). Fails while any other
+    /// handle, in this or another process, has it open.
+    pub async fn open_exclusive(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(root.as_ref(), true).await
+    }
+
+    pub fn is_exclusive(&self) -> bool {
+        self.exclusive
+    }
+
+    async fn open_with(root: &Path, exclusive: bool) -> Result<Self> {
         fs::create_dir_all(root)?;
         let root = fs::canonicalize(root)?;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(root.join(".lock"))?;
+        let locked = if exclusive {
+            lock.try_lock()
+        } else {
+            lock.try_lock_shared()
+        };
+        if let Err(e) = locked {
+            return Err(Error::Busy(match (exclusive, e) {
+                (true, fs::TryLockError::WouldBlock) => {
+                    "in use by another process (stop serve/push first)".into()
+                }
+                (false, fs::TryLockError::WouldBlock) => {
+                    "garbage collection is running on this CAS".into()
+                }
+                (_, fs::TryLockError::Error(e)) => e.to_string(),
+            }));
+        }
         let ctx = XetContext::default()?;
         let config = Arc::new(TranslatorConfig::local_config(&ctx, &root)?);
         // Mirrors `xet_data::processing::create_remote_client` for `local://` endpoints.
@@ -107,6 +145,8 @@ impl LocalCas {
             config,
             client,
             index,
+            _lock: lock,
+            exclusive,
         };
         cas.sync_index().await?;
         Ok(cas)
@@ -338,6 +378,16 @@ impl LocalCas {
         fs::create_dir(&staging)?;
         let result = self.reconstruct_via(manifest, &dest, &staging, opts).await;
         let _ = fs::remove_dir_all(&staging);
+        if result.is_ok() {
+            let files: BTreeSet<MerkleHash> = manifest
+                .files()
+                .filter(|(_, size, ..)| *size > 0)
+                .filter_map(|(_, _, h, ..)| MerkleHash::from_hex(h).ok())
+                .collect();
+            if let Ok(xorbs) = self.referenced_xorbs(&files).await {
+                self.touch_xorbs(&xorbs);
+            }
+        }
         result
     }
 

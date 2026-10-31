@@ -83,6 +83,7 @@ pub async fn push(
     let (manifest, ingest) = cas.ingest(src).await?;
     let files = file_hashes(&manifest)?;
     let referenced = cas.referenced_xorbs(&files).await?;
+    cas.touch_xorbs(&referenced); // recency for GC on the sender's CAS
 
     let mut report = PushReport {
         ingest,

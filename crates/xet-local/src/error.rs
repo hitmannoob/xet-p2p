@@ -23,6 +23,10 @@ pub enum Error {
     #[error("local CAS is missing content: {files} file reconstruction(s), {xorbs} xorb(s)")]
     MissingContent { files: usize, xorbs: usize },
 
+    /// The CAS is locked by another user (e.g. GC, or a running serve/push during GC).
+    #[error("CAS busy: {0}")]
+    Busy(String),
+
     #[error("verification failed for {path:?}: {reason}")]
     Verification { path: String, reason: String },
 }

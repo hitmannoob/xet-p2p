@@ -9,10 +9,16 @@ pub mod protocol;
 mod rate;
 mod receiver;
 mod sender;
-mod session;
+pub mod session;
 
 pub use error::{Error, Result};
 pub use protocol::{ReceiverReport, TransferMode};
 pub use receiver::{Receiver, ReceiverOptions};
 pub use sender::{DEFAULT_MAX_MEMORY_BYTES, PushOptions, PushReport, push};
 pub use session::SessionRecord;
+
+/// Opens (creating if needed) a receiver session directory, discarding state idle longer than
+/// [`session::STATE_MAX_AGE`]. Used by `gc`.
+pub fn purge_stale_session_state(dir: &std::path::Path) -> Result<()> {
+    session::SessionStore::open(dir).map(|_| ())
+}

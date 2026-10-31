@@ -9,6 +9,7 @@ mod cas;
 pub mod chunks;
 mod error;
 mod exchange;
+pub mod gc;
 mod index;
 pub mod manifest;
 mod walk;

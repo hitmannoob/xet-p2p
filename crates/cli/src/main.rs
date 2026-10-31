@@ -108,6 +108,25 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Reclaim CAS space: delete unreferenced xorbs past a grace period and, with a size cap,
+    /// evict least recently used content (re-fetched from a peer when next needed). Requires that
+    /// no serve/push is using the CAS.
+    Gc {
+        #[arg(long)]
+        cas_dir: PathBuf,
+        /// Evict least recently used xorbs until the CAS holds at most this many MiB.
+        #[arg(long)]
+        max_size_mib: Option<u64>,
+        /// Keep unreferenced xorbs younger than this many days (resumable transfers use them).
+        #[arg(long, default_value_t = 7)]
+        orphan_grace_days: u64,
+        /// Receiver session state to purge of stale entries (default: <cas-dir>/sessions).
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+        /// Report only; delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Offline operations against a local CAS (no network).
     #[command(subcommand)]
     Local(LocalCommand),
@@ -262,6 +281,54 @@ async fn main() -> Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&report_json(&report))?);
             }
+            Ok(())
+        }
+        Command::Gc {
+            cas_dir,
+            max_size_mib,
+            orphan_grace_days,
+            session_dir,
+            dry_run,
+        } => {
+            let cas = LocalCas::open_exclusive(&cas_dir).await?;
+            let opts = xet_local::gc::GcOptions {
+                orphan_grace: std::time::Duration::from_secs(orphan_grace_days * 24 * 3600),
+                max_bytes: max_size_mib.map(|m| m.saturating_mul(1024 * 1024)),
+                dry_run,
+            };
+            let r = cas.gc(&opts).await?;
+            if !dry_run {
+                let sessions = session_dir.unwrap_or_else(|| cas.root().join("sessions"));
+                if sessions.exists() {
+                    transfer::purge_stale_session_state(&sessions)?;
+                }
+            }
+            let mib = |b: u64| b as f64 / 1048576.0;
+            eprintln!(
+                "{}CAS before: {} files, {} xorbs, {:.1} MiB",
+                if dry_run { "[dry run] " } else { "" },
+                r.files_before,
+                r.xorbs_before,
+                mib(r.bytes_before)
+            );
+            eprintln!(
+                "  orphans deleted: {} xorbs, {:.1} MiB ({} kept within {}-day grace)",
+                r.orphan_xorbs_deleted,
+                mib(r.orphan_bytes_deleted),
+                r.orphans_kept_in_grace,
+                orphan_grace_days
+            );
+            eprintln!(
+                "  evicted (LRU): {} xorbs, {:.1} MiB; {} files will be re-fetched when needed",
+                r.xorbs_evicted,
+                mib(r.bytes_evicted),
+                r.files_invalidated
+            );
+            eprintln!(
+                "  shards deleted: {}; CAS after: {:.1} MiB",
+                r.shards_deleted,
+                mib(r.bytes_after)
+            );
             Ok(())
         }
         Command::Local(LocalCommand::Ingest {

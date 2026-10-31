@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
-use redb::{Database, ReadableDatabase, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use xet_core_structures::merklehash::MerkleHash;
 
 use crate::error::{Error, Result};
@@ -58,6 +58,26 @@ impl ChunkIndex {
             indexed
                 .insert(key(xorb), chunks.len() as u32)
                 .map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)
+    }
+
+    /// Forgets `xorb`: drops its chunks' entries that still point at it, and its indexed marker.
+    pub fn remove_xorb(&self, xorb: &MerkleHash, chunks: &[MerkleHash]) -> Result<()> {
+        let txn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut table = txn.open_table(CHUNKS).map_err(db_err)?;
+            for chunk in chunks {
+                let points_here = table
+                    .get(key(chunk))
+                    .map_err(db_err)?
+                    .is_some_and(|v| v.value().0 == key(xorb));
+                if points_here {
+                    table.remove(key(chunk)).map_err(db_err)?;
+                }
+            }
+            let mut indexed = txn.open_table(INDEXED_XORBS).map_err(db_err)?;
+            indexed.remove(key(xorb)).map_err(db_err)?;
         }
         txn.commit().map_err(db_err)
     }
