@@ -21,8 +21,8 @@ Xet (chunks + xorbs + shards + local CAS)  ↔  QUIC (pinned mutual TLS)  ↔  X
 - Every received object is verified before it is stored; every file is verified (size + SHA-256)
   before it is installed, and installation is atomic per file. A failed transfer installs nothing.
 
-Status: **M0–M4 complete; M5 local parts complete** (sandbox providers, `pull`, TLS-over-TCP
-fallback, `doctor`; Modal adapter tested against a fake SDK, real-Modal run pending). See [PROGRESS.md](PROGRESS.md) for details and what is next, and
+Status: **M0–M5 complete for Modal** (sandbox providers, `pull`, TLS-over-TCP fallback,
+`doctor`; verified against a real Modal sandbox). E2B and Daytona are not implemented yet. See [PROGRESS.md](PROGRESS.md) for details and what is next, and
 [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md) for the full design brief.
 
 ## Build

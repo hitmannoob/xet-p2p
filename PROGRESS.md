@@ -11,7 +11,7 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
 | M2 — Incremental transfer + durable resume | **Done** (exit gate met) |
 | M3 — Chunk-level transfer optimization | **Done** (exit gate met; [benchmark](docs/BENCHMARK_M3.md)) |
 | M4 — Performance and reliability | **Done** ([benchmark vs rsync](docs/BENCHMARK_M4.md)) |
-| M5 — Provider-agnostic sandbox integration | **Local parts done**; real Modal run pending |
+| M5 — Provider-agnostic sandbox integration | **Done for Modal** (real sandbox verified); E2B/Daytona not implemented |
 
 ## Pins
 
@@ -192,12 +192,48 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
 - Tests: 38 push/pull tests × 2 transports, 5 TCP transport tests, URI parsing, 4 local-provider
   CLI tests, 2 fake-Modal CLI tests.
 
-### Blocked: real Modal run
+### 2026-10-31 — M5: real Modal run
 
-From this environment, Modal API calls (`modal.Sandbox.list()`) time out after 60 s, sandboxed or
-not, and running outside the shell sandbox was declined. Needed from the user: confirm `modal app
-list` works from their shell, and allow the run (it creates one small test sandbox — 1 CPU,
-30-minute timeout, `unencrypted_ports=[4434]` — and terminates it afterwards).
+Run against a real Modal sandbox created for the test (`sb-SH3jRTgHpHwUYozzZZDbUS`: debian_slim,
+1 CPU, 30-min timeout, `unencrypted_ports=[4434]`, Linux x86_64), then terminated. The user's
+pre-existing sandbox was not touched.
+
+| Check | Result |
+|---|---|
+| push 8 MB tree | arrived, reconstructed and SHA-256-verified in the sandbox; "TLS over TCP (not QUIC), relayed by the provider" |
+| repeat push | 0 payload bytes; 2 files unchanged |
+| push after an 8-byte edit | 131 KiB (1 of 120 chunks; 119 already present) |
+| pull back | byte-identical (`diff -r`) |
+| `--transport quic` | refused with an explanation |
+| `doctor` | linux/x86_64, ephemeral storage, QUIC n/a, TCP tunnel ok, relayed |
+| cleanup | no session credentials or agent left; only the cached agent binary |
+
+Throughput is set by the path, not the stack: raw sockets through the tunnel measured 1.86 MB/s
+up and 0.12 MB/s down from this machine; xet-p2p push ran at 0.8 MB/s (room to tune: one TCP
+connection, TLS + yamux) and pull at 0.21 MB/s.
+
+Found by the real run (none visible to the fake SDK):
+
+1. **NAT64 on this network**: DNS returns synthesized `64:ff9b::` IPv6 addresses first and they do
+   not route. The Modal SDK (gRPC) never fell back, so every API call timed out at 60 s. The helper
+   now prefers IPv4 (IPv6 kept as fallback), and xet-p2p's dialer tries every resolved address,
+   IPv4 first, each with its own timeout.
+2. **Modal retired `Sandbox.open()`** ("legacy Sandbox filesystem API is no longer supported").
+   The helper now uses `sb.filesystem.write_bytes` / `copy_from_local` (agent uploaded without
+   buffering it in Python); the fake SDK now rejects `open()` too.
+3. **A failed agent start left an empty session directory** (no key had been written yet). The
+   helper now kills any started agent and deletes the session on every start failure; covered by a
+   fake-SDK test.
+
+Setup to reproduce: `cargo zigbuild --release --target x86_64-unknown-linux-musl -p xet-p2p`,
+`XET_P2P_AGENT_LINUX_BIN=…`, a sandbox with `unencrypted_ports=[4434]`, then
+`xet-p2p push SRC modal://SANDBOX_ID/workspace/project`.
+
+## Next
+
+- E2B and Daytona adapters (same `Sandbox` trait; verify their exec/file/port APIs first).
+- Tune the TCP fallback for long-RTT links (multiple TCP connections or larger windows); measure.
+- Opt-in automated real-provider test (`XET_P2P_TEST_MODAL=1`), off by default since it bills.
 
 ## Known gaps / risks
 
@@ -220,7 +256,6 @@ list` works from their shell, and allow the run (it creates one small test sandb
 - The receiver's repacked xorbs differ from the sender's; content identity is per chunk and per
   file hash, so this is invisible to reconstruction, but receiver-side dedup ratios depend on
   arrival order of chunks within a pack.
-- No `transport` trait yet: `transfer` uses Quinn types directly. Abstract when M5 adds a fallback.
 - `LocalClient` lives in upstream's `simulation` module — no stability promise; pinned `=1.8.0` and
   wrapped behind `xet-local`, with durability paths coupled to its on-disk layout.
 - Certificates: no rotation/revocation beyond replacing the pinned file and restarting.

@@ -42,6 +42,14 @@ pub fn generate(label: &str) -> Result<GeneratedIdentity> {
 }
 
 impl Identity {
+    /// A copy for one connection attempt (private keys are not `Clone` by design).
+    pub fn clone_for_attempt(&self) -> Result<Self> {
+        Ok(Self {
+            cert: self.cert.clone(),
+            key: self.key.clone_key(),
+        })
+    }
+
     pub fn load(cert_path: &Path, key_path: &Path) -> Result<Self> {
         Ok(Self {
             cert: load_cert(cert_path)?,

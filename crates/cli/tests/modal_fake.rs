@@ -158,3 +158,28 @@ fn quic_only_fails_and_misconfigured_sandboxes_are_explained() {
     assert!(!e.tmp.path().join("sbroot/p").exists());
     e.no_session_state();
 }
+
+#[test]
+fn failed_agent_start_leaves_no_session_behind() {
+    let e = Env::new();
+    let src = e.tmp.path().join("src").display().to_string();
+    // A file where the agent binary should be: upload works, but the agent cannot start.
+    let bogus = e.tmp.path().join("not-an-agent");
+    std::fs::write(&bogus, b"#!/bin/sh\nexit 3\n").unwrap();
+    let out = Command::new(BIN)
+        .args(["push", &src, &e.uri("sb-test", "p")])
+        .env("HOME", e.tmp.path())
+        .env("XET_P2P_MODAL_PYTHON", "python3")
+        .env(
+            "PYTHONPATH",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_modal"),
+        )
+        .env("XET_P2P_AGENT_LINUX_BIN", &bogus)
+        .env("FAKE_MODAL_SANDBOXES", e.sandboxes())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(err.contains("agent exited"), "{err}");
+    e.no_session_state();
+}

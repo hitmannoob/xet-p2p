@@ -7,10 +7,16 @@
 import hashlib
 import json
 import shlex
+import socket
 import sys
 import time
 
-import modal
+# Prefer IPv4: on networks with DNS64 but broken NAT64, the synthesized IPv6 addresses come first
+# and never connect, and the SDK's gRPC client does not fall back. IPv6 stays as a fallback.
+_getaddrinfo = socket.getaddrinfo
+socket.getaddrinfo = lambda *a, **k: sorted(_getaddrinfo(*a, **k), key=lambda i: i[0] != socket.AF_INET)
+
+import modal  # noqa: E402
 
 
 def run(sb, *cmd, timeout=60):
@@ -42,13 +48,28 @@ def cmd_info(req):
 
 
 def write_file(sb, path, data, mode):
-    with sb.open(path, "wb") as f:
-        f.write(data)
+    # Modal's filesystem API (sb.open() was retired); then restrict permissions.
+    sb.filesystem.write_bytes(data, path)
     run(sb, "chmod", mode, path)
 
 
 def cmd_start(req):
     sb = modal.Sandbox.from_id(req["id"])
+    state = {"pid": None}
+    try:
+        return _start(sb, req, state)
+    except Exception:
+        # A failed start must not leave an agent or session credentials behind.
+        try:
+            if state["pid"]:
+                run(sb, "sh", "-c", f"kill {int(state['pid'])} 2>/dev/null || true")
+            run(sb, "rm", "-rf", req["session_dir"])
+        except Exception:
+            pass
+        raise
+
+
+def _start(sb, req, started):
     tunnel = tunnel_for(sb, req["port"])
     if tunnel is None:
         raise RuntimeError(
@@ -58,15 +79,20 @@ def cmd_start(req):
     state, session = req["state_dir"], req["session_dir"]
 
     # Agent binary: upload only if this exact build is not already there.
+    h = hashlib.sha256()
     with open(req["agent"], "rb") as f:
-        binary = f.read()
-    digest = hashlib.sha256(binary).hexdigest()
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    digest = h.hexdigest()
     remote_bin = f"{state}/bin/xet-p2p-{digest[:16]}"
     run(sb, "mkdir", "-p", f"{state}/bin", session, req["root"])
     have = run(sb, "sh", "-c", f"sha256sum {shlex.quote(remote_bin)} 2>/dev/null || true").split()
     if not have or have[0] != digest:
-        write_file(sb, remote_bin, binary, "755")
+        sb.filesystem.copy_from_local(req["agent"], remote_bin)
+        run(sb, "chmod", "755", remote_bin)
 
+    # Create the key file empty with 0600 first, so the key is never readable by others.
+    run(sb, "sh", "-c", f"umask 077 && : > {shlex.quote(session)}/server.key")
     write_file(sb, f"{session}/server.key", req["server_key_pem"].encode(), "600")
     write_file(sb, f"{session}/server.crt", req["server_cert_pem"].encode(), "644")
     write_file(sb, f"{session}/client.crt", req["client_cert_pem"].encode(), "644")
@@ -79,6 +105,7 @@ def cmd_start(req):
     ]
     line = " ".join(shlex.quote(a) for a in args)
     pid = run(sb, "sh", "-c", f"nohup {line} > {shlex.quote(session)}/agent.log 2>&1 & echo $!").strip()
+    started["pid"] = pid
 
     deadline = time.time() + 30
     while time.time() < deadline:

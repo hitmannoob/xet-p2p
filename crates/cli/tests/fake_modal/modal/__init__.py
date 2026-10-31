@@ -35,7 +35,19 @@ class _Tunnel:
         return (self.unencrypted_host, self.unencrypted_port)
 
 
+class _Filesystem:
+    def write_bytes(self, data, remote_path):
+        with open(remote_path, "wb") as f:
+            f.write(data)
+
+    def copy_from_local(self, local_path, remote_path):
+        import shutil
+        shutil.copyfile(local_path, remote_path)
+
+
 class Sandbox:
+    filesystem = _Filesystem()
+
     @staticmethod
     def from_id(sandbox_id):
         ports = json.loads(os.environ.get("FAKE_MODAL_SANDBOXES", "{}")).get(sandbox_id)
@@ -49,7 +61,8 @@ class Sandbox:
         return _Process(cmd, timeout)
 
     def open(self, path, mode):
-        return open(path, mode)
+        # Mirrors Modal: the legacy file API is gone.
+        raise RuntimeError("UnimplementedError: The legacy Sandbox filesystem API is no longer supported.")
 
     def tunnels(self, timeout=None):
         return {p: _Tunnel(p) for p in self._ports}

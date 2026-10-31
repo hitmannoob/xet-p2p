@@ -95,7 +95,8 @@ impl Connected {
     }
 }
 
-const QUIC_ATTEMPT: Duration = Duration::from_secs(5);
+/// Per-address connection attempt limit (handshake included).
+const ATTEMPT: Duration = Duration::from_secs(8);
 
 pub async fn connect_target(
     registry: &Registry,
@@ -268,33 +269,52 @@ async fn dial(
     identity: Identity,
     pinned: CertificateDer<'static>,
 ) -> Result<(Conn, Option<QuicClient>)> {
-    let addr = tokio::net::lookup_host(&ep.host_port)
-        .await?
-        .next()
-        .ok_or_else(|| Error::Unreachable(format!("{} resolved to no address", ep.host_port)))?;
-    match kind {
-        TransportKind::Quic => {
-            let client = client_endpoint(
-                identity,
-                vec![pinned],
-                &EndpointOptions::default(),
-                bind_addr_for(addr),
-            )?;
-            let conn = tokio::time::timeout(QUIC_ATTEMPT, client.connect(addr))
-                .await
-                .map_err(|_| {
-                    Error::Unreachable(format!(
-                        "no QUIC answer from {addr} in {}s",
-                        QUIC_ATTEMPT.as_secs()
-                    ))
-                })??;
-            Ok((conn, Some(client)))
-        }
-        TransportKind::TlsTcp => Ok((
-            transport_tcp::tcp_connect(addr, identity, vec![pinned]).await?,
-            None,
-        )),
+    // Try every address, IPv4 first: networks with DNS64 but broken NAT64 return unusable
+    // synthesized IPv6 addresses first, and a single attempt would hang on them.
+    let mut addrs: Vec<_> = tokio::net::lookup_host(&ep.host_port).await?.collect();
+    addrs.sort_by_key(|a| !a.is_ipv4());
+    if addrs.is_empty() {
+        return Err(Error::Unreachable(format!(
+            "{} resolved to no address",
+            ep.host_port
+        )));
     }
+    let mut failures = Vec::new();
+    for addr in addrs {
+        let attempt = async {
+            match kind {
+                TransportKind::Quic => {
+                    let client = client_endpoint(
+                        identity.clone_for_attempt()?,
+                        vec![pinned.clone()],
+                        &EndpointOptions::default(),
+                        bind_addr_for(addr),
+                    )?;
+                    let conn = client.connect(addr).await?;
+                    Ok::<_, Error>((conn, Some(client)))
+                }
+                TransportKind::TlsTcp => Ok((
+                    transport_tcp::tcp_connect(
+                        addr,
+                        identity.clone_for_attempt()?,
+                        vec![pinned.clone()],
+                    )
+                    .await?,
+                    None,
+                )),
+            }
+        };
+        match tokio::time::timeout(ATTEMPT, attempt).await {
+            Ok(Ok(c)) => return Ok(c),
+            Ok(Err(e)) => failures.push(format!("{addr}: {e}")),
+            Err(_) => failures.push(format!("{addr}: no answer in {}s", ATTEMPT.as_secs())),
+        }
+    }
+    Err(Error::Unreachable(format!(
+        "{kind} to {}: {}",
+        ep.host_port,
+        failures.join("; ")
+    )))
 }
 
 /// What `doctor` found.
