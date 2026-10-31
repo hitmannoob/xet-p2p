@@ -22,6 +22,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use xet_local::chunks::{ChunkList, decode_chunk_lists, encode_chunk_lists};
+use xet_local::durable;
 use xet_local::{Manifest, MerkleHash, PendingShard};
 
 use crate::error::{Error, Result};
@@ -257,7 +258,7 @@ fn session_key(dest: &str, manifest: &Manifest) -> Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
-/// Write to a uniquely named temp file, fsync, rename over `path`, then fsync the directory.
+/// Write to a uniquely named temp file, sync, rename over `path`, sync the directory, barrier.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().expect("state paths have a parent");
@@ -269,11 +270,10 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let result = (|| {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(bytes)?;
-        f.sync_all()?;
+        durable::sync_file(&f)?;
         fs::rename(&tmp, path)?;
-        #[cfg(unix)]
-        fs::File::open(dir)?.sync_all()?;
-        Ok(())
+        durable::sync_dir(dir)?;
+        durable::barrier(dir)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);

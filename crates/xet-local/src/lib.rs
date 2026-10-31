@@ -7,6 +7,7 @@
 
 mod cas;
 pub mod chunks;
+pub mod durable;
 mod error;
 mod exchange;
 pub mod gc;

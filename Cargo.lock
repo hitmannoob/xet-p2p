@@ -3298,7 +3298,9 @@ dependencies = [
 name = "xet-local"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "hex",
+ "libc",
  "rand 0.9.5",
  "redb",
  "serde",

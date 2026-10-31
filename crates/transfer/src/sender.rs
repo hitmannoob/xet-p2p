@@ -54,6 +54,8 @@ pub struct PushReport {
     pub chunk_list_bytes_sent: u64,
     pub receiver: ReceiverReport,
     pub udp_bytes_sent: u64,
+    /// UDP bytes received from the receiver (requests, ACKs, handshake).
+    pub udp_bytes_received: u64,
     pub elapsed: Duration,
 }
 
@@ -97,6 +99,7 @@ pub async fn push(
         chunk_list_bytes_sent: 0,
         receiver: ReceiverReport::default(),
         udp_bytes_sent: 0,
+        udp_bytes_received: 0,
         elapsed: Duration::ZERO,
     };
 
@@ -169,7 +172,9 @@ pub async fn push(
     }
 
     let _ = send.finish();
-    report.udp_bytes_sent = conn.stats().udp_tx.bytes;
+    let stats = conn.stats();
+    report.udp_bytes_sent = stats.udp_tx.bytes;
+    report.udp_bytes_received = stats.udp_rx.bytes;
     report.elapsed = start.elapsed();
     Ok(report)
 }

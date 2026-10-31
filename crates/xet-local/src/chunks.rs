@@ -129,12 +129,29 @@ pub struct VerifiedChunk {
 
 /// Parses native serialized chunks, decompressing and hashing each one. CPU-bound.
 pub fn parse_chunk_run(bytes: &[u8]) -> Result<Vec<VerifiedChunk>> {
+    let mut out = Vec::new();
+    for_each_chunk(bytes, |hash, plain, span| {
+        out.push(VerifiedChunk {
+            hash,
+            size: plain.len() as u32,
+            span,
+        });
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Decodes native serialized chunks, calling `f(hash, uncompressed, span)` for each in order.
+/// Sizes are bounded by `MAX_CHUNK_SIZE` before decompression.
+pub(crate) fn for_each_chunk(
+    bytes: &[u8],
+    mut f: impl FnMut(MerkleHash, &[u8], Range<usize>) -> Result<()>,
+) -> Result<()> {
     let fail = |reason: String| Error::Verification {
         path: "<chunk run>".into(),
         reason,
     };
     let max = *MAX_CHUNK_SIZE;
-    let mut out = Vec::new();
     let mut pos = 0;
     while pos < bytes.len() {
         let header_bytes: [u8; XORB_CHUNK_HEADER_LENGTH] = bytes
@@ -145,7 +162,6 @@ pub fn parse_chunk_run(bytes: &[u8]) -> Result<Vec<VerifiedChunk>> {
             parse_chunk_header(header_bytes).map_err(|e| fail(format!("bad chunk header: {e}")))?;
         let compressed = header.get_compressed_length() as usize;
         let size = header.get_uncompressed_length() as usize;
-        // Bound decompression before doing it.
         if size == 0 || size > max || compressed > max + 4096 {
             return Err(fail(format!(
                 "chunk sizes out of range ({compressed}/{size})"
@@ -162,14 +178,14 @@ pub fn parse_chunk_run(bytes: &[u8]) -> Result<Vec<VerifiedChunk>> {
         if plain.len() != size {
             return Err(fail("decompressed size differs from header".into()));
         }
-        out.push(VerifiedChunk {
-            hash: compute_data_hash(&plain),
-            size: size as u32,
-            span: pos..data_start + compressed,
-        });
+        f(
+            compute_data_hash(&plain),
+            &plain,
+            pos..data_start + compressed,
+        )?;
         pos = data_start + compressed;
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Accumulates verified native chunks into the body of a new xorb.
@@ -430,6 +446,71 @@ impl LocalCas {
         self.commit_shard(PendingShard::from_infos(infos)).await
     }
 
+    /// Writes `file`'s bytes to `out` from this CAS: each segment's native chunks are read in one
+    /// range read (footers cached), decoded, and checked against the chunk hashes in the xorb's
+    /// footer. Returns (bytes written, SHA-256 hex) computed in the same pass.
+    pub(crate) async fn write_file_from_cas(
+        &self,
+        file: &MerkleHash,
+        out: &std::path::Path,
+    ) -> Result<(u64, String)> {
+        use sha2::Digest;
+        use std::io::Write;
+
+        let info = self.file_info(file).await?;
+        let mut writer = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(out)?);
+        let mut sha = sha2::Sha256::new();
+        let mut written = 0u64;
+        for seg in &info.segments {
+            let footer = self.footer(&seg.xorb_hash).await?;
+            let (lo, hi) = footer
+                .get_byte_offset(seg.chunk_index_start, seg.chunk_index_end)
+                .map_err(xet_err)?;
+            let expected: Vec<MerkleHash> = footer
+                .info
+                .chunk_hashes
+                .get(seg.chunk_index_start as usize..seg.chunk_index_end as usize)
+                .ok_or_else(|| xet_err("segment outside xorb"))?
+                .to_vec();
+            let path = self.xorb_path(&seg.xorb_hash);
+            let xorb = seg.xorb_hash;
+            let (bytes, w, h, n) = tokio::task::spawn_blocking(move || -> Result<_> {
+                let bytes = read_range(&path, lo as u64, hi as u64)?;
+                let (mut w, mut h, mut n) = (writer, sha, 0u64);
+                let mut i = 0;
+                for_each_chunk(&bytes, |hash, plain, _| {
+                    if expected.get(i) != Some(&hash) {
+                        return Err(Error::Verification {
+                            path: format!("xorb {}", xorb.hex()),
+                            reason: format!("stored chunk {i} does not match its hash"),
+                        });
+                    }
+                    i += 1;
+                    w.write_all(plain)?;
+                    h.update(plain);
+                    n += plain.len() as u64;
+                    Ok(())
+                })?;
+                if i != expected.len() {
+                    return Err(xet_err("segment ended early"));
+                }
+                Ok((bytes.len(), w, h, n))
+            })
+            .await
+            .map_err(xet_err)??;
+            let _ = bytes;
+            writer = w;
+            sha = h;
+            written += n;
+        }
+        writer.flush()?;
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        tokio::task::spawn_blocking(move || crate::durable::sync_file(&file))
+            .await
+            .map_err(xet_err)??;
+        Ok((written, hex::encode(sha.finalize())))
+    }
+
     async fn file_info(&self, file: &MerkleHash) -> Result<MDBFileInfo> {
         Ok(self
             .client
@@ -442,15 +523,23 @@ impl LocalCas {
 
     async fn footer_cached<'a>(
         &self,
-        cache: &'a mut HashMap<MerkleHash, XorbObject>,
+        cache: &'a mut HashMap<MerkleHash, std::sync::Arc<XorbObject>>,
         xorb: &MerkleHash,
     ) -> Result<&'a XorbObject> {
         if !cache.contains_key(xorb) {
-            let footer = self.client.xorb_footer(xorb).await.map_err(xet_err)?;
-            cache.insert(*xorb, footer);
+            cache.insert(*xorb, self.footer(xorb).await?);
         }
         Ok(&cache[xorb])
     }
+}
+
+fn read_range(path: &std::path::Path, lo: u64, hi: u64) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(lo))?;
+    let mut buf = vec![0u8; (hi - lo) as usize];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
 }
 
 fn xet_err(e: impl std::fmt::Display) -> Error {

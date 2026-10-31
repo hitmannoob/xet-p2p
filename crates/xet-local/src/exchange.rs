@@ -228,7 +228,7 @@ impl LocalCas {
     /// every referenced chunk range must exist, segment sizes must match, and the file hash
     /// recomputed from the chunk hashes must equal the entry's claimed hash.
     pub async fn commit_shard(&self, pending: PendingShard) -> Result<()> {
-        let mut footers: HashMap<MerkleHash, XorbObject> = HashMap::new();
+        let mut footers: HashMap<MerkleHash, std::sync::Arc<XorbObject>> = HashMap::new();
 
         for info in &pending.files {
             let claimed = info.metadata.file_hash;
@@ -253,12 +253,7 @@ impl LocalCas {
                                 seg.xorb_hash.hex()
                             )));
                         }
-                        e.insert(
-                            self.client
-                                .xorb_footer(&seg.xorb_hash)
-                                .await
-                                .map_err(xet_err)?,
-                        )
+                        e.insert(self.footer(&seg.xorb_hash).await?)
                     }
                 };
                 let range = footer

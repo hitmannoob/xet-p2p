@@ -6,12 +6,14 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use xet_client::cas_client::{Client, DirectAccessClient, LocalClient};
 use xet_core_structures::merklehash::MerkleHash;
+use xet_core_structures::xorb_object::XorbObject;
 use xet_data::deduplication::DeduplicationMetrics;
 use xet_data::processing::configurations::TranslatorConfig;
-use xet_data::processing::{FileDownloadSession, FileUploadSession, Sha256Policy, XetFileInfo};
+use xet_data::processing::{FileUploadSession, Sha256Policy};
 use xet_runtime::core::XetContext;
 
 use crate::error::{Error, Result};
@@ -27,7 +29,6 @@ use crate::walk::{WalkedKind, walk};
 /// shard directories and its redb index); treat it as opaque.
 pub struct LocalCas {
     root: PathBuf,
-    ctx: XetContext,
     config: Arc<TranslatorConfig>,
     /// The same store upstream sessions open for `config` (redb handles are shared per path).
     pub(crate) client: Arc<LocalClient>,
@@ -36,7 +37,12 @@ pub struct LocalCas {
     /// lifetime of this value.
     _lock: fs::File,
     exclusive: bool,
+    /// Parsed xorb footers. Xorbs are immutable, so entries stay valid until GC deletes the xorb.
+    footers: std::sync::Mutex<std::collections::HashMap<MerkleHash, Arc<XorbObject>>>,
 }
+
+/// Footers kept in memory (each is a few KiB to a few hundred KiB).
+const FOOTER_CACHE_ENTRIES: usize = 4096;
 
 /// SHA-256 of zero bytes. Upstream 1.8.0 reports all zeros for empty files.
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -141,12 +147,12 @@ impl LocalCas {
         let index = ChunkIndex::open(&root.join("chunk_index.redb"))?;
         let cas = Self {
             root,
-            ctx,
             config,
             client,
             index,
             _lock: lock,
             exclusive,
+            footers: Default::default(),
         };
         cas.sync_index().await?;
         Ok(cas)
@@ -169,6 +175,31 @@ impl LocalCas {
         self.client_dir().join("shards").join(
             xet_core_structures::metadata_shard::utils::shard_file_name(hash),
         )
+    }
+
+    /// A xorb's parsed footer, read once with buffered I/O and then cached.
+    pub(crate) async fn footer(&self, xorb: &MerkleHash) -> Result<Arc<XorbObject>> {
+        if let Some(f) = self.footers.lock().unwrap().get(xorb) {
+            return Ok(f.clone());
+        }
+        let path = self.xorb_path(xorb);
+        let footer = tokio::task::spawn_blocking(move || {
+            let mut r = std::io::BufReader::new(fs::File::open(&path)?);
+            XorbObject::deserialize(&mut r).map_err(|e| Error::Xet(e.to_string()))
+        })
+        .await
+        .map_err(|e| Error::Xet(e.to_string()))??;
+        let footer = Arc::new(footer);
+        let mut cache = self.footers.lock().unwrap();
+        if cache.len() >= FOOTER_CACHE_ENTRIES {
+            cache.clear();
+        }
+        cache.insert(*xorb, footer.clone());
+        Ok(footer)
+    }
+
+    pub(crate) fn forget_footer(&self, xorb: &MerkleHash) {
+        self.footers.lock().unwrap().remove(xorb);
     }
 
     fn client_dir(&self) -> PathBuf {
@@ -280,11 +311,7 @@ impl LocalCas {
             if self.index.is_indexed(&xorb)? {
                 continue;
             }
-            let footer = self
-                .client
-                .xorb_footer(&xorb)
-                .await
-                .map_err(|e| Error::Xet(e.to_string()))?;
+            let footer = self.footer(&xorb).await?;
             self.index.insert_xorb(&xorb, &footer.info.chunk_hashes)?;
             added += 1;
         }
@@ -402,7 +429,8 @@ impl LocalCas {
         let mut staged = Vec::new();
         let mut touched_dirs = BTreeSet::new();
 
-        let session = FileDownloadSession::from_client(&self.ctx, self.client.clone(), None);
+        // Decide what to write; identical files already in place are left alone.
+        let mut work = Vec::new();
         for (i, (entry, size, xet_hash, sha256, executable)) in manifest.files().enumerate() {
             let rel = validate_rel_path(&entry.path)?;
             if let Some(existing) = existing_regular_file(dest, &rel)
@@ -412,20 +440,54 @@ impl LocalCas {
                 report.files_unchanged += 1;
                 continue;
             }
-            let tmp = staging.join(i.to_string());
-            session
-                .download_file(&XetFileInfo::new(xet_hash.to_owned(), size), &tmp)
-                .await?;
-            verify_file(&tmp, size, sha256).map_err(|reason| Error::Verification {
-                path: entry.path.clone(),
-                reason,
-            })?;
-            fs::File::open(&tmp)?.sync_all()?;
-            set_executable(&tmp, executable)?;
-            staged.push((tmp, entry));
+            work.push((
+                staging.join(i.to_string()),
+                entry.path.clone(),
+                size,
+                xet_hash.to_owned(),
+                sha256.to_owned(),
+                executable,
+            ));
+        }
+
+        // Reconstruct and verify concurrently. Each file is decoded from its native segments with
+        // cached footers; every chunk is checked against its stored hash, and size + SHA-256
+        // against the manifest, before anything is installed.
+        let parallel = std::thread::available_parallelism().map_or(4, |n| n.get() * 2);
+        let results: Vec<Result<_>> = futures::stream::iter(work)
+            .map(
+                |(tmp, path, size, xet_hash, sha256, executable)| async move {
+                    let fail = |reason: String| Error::Verification {
+                        path: path.clone(),
+                        reason,
+                    };
+                    if size == 0 {
+                        crate::durable::sync_file(&fs::File::create(&tmp)?)?;
+                    } else {
+                        let hash = parse_hash(&path, &xet_hash)?;
+                        let (n, sha) = self.write_file_from_cas(&hash, &tmp).await?;
+                        if n != size {
+                            return Err(fail(format!("size {n}, expected {size}")));
+                        }
+                        if !sha.eq_ignore_ascii_case(&sha256) {
+                            return Err(fail(format!("SHA-256 {sha}, expected {sha256}")));
+                        }
+                    }
+                    if size == 0 && !sha256.eq_ignore_ascii_case(EMPTY_SHA256) {
+                        return Err(fail("SHA-256 of empty file does not match".into()));
+                    }
+                    set_executable(&tmp, executable)?;
+                    Ok((tmp, path, size))
+                },
+            )
+            .buffer_unordered(parallel)
+            .collect()
+            .await;
+        for r in results {
+            let (tmp, path, size) = r?;
+            staged.push((tmp, path));
             report.bytes += size;
         }
-        session.finalize().await?;
 
         // Everything is verified; only now may anything at the destination be removed.
         if opts.delete_extraneous {
@@ -448,8 +510,8 @@ impl LocalCas {
             }
         }
 
-        for (tmp, entry) in staged {
-            let rel = validate_rel_path(&entry.path)?;
+        for (tmp, path) in staged {
+            let rel = validate_rel_path(&path)?;
             if let Some(parent) = rel.parent() {
                 ensure_dir(dest, parent)?;
             }
@@ -458,7 +520,7 @@ impl LocalCas {
                 Ok(m) if m.is_file() => {}
                 Ok(_) => {
                     return Err(Error::UnsafePath {
-                        path: entry.path.clone(),
+                        path,
                         reason: "destination exists and is not a regular file",
                     });
                 }
@@ -481,6 +543,8 @@ impl LocalCas {
         for dir in touched_dirs {
             sync_dir(&dir)?;
         }
+        // One drive-cache flush makes every file and directory synced above durable.
+        crate::durable::barrier(dest)?;
 
         Ok(report)
     }
@@ -491,19 +555,16 @@ fn parse_hash(path: &str, hex: &str) -> Result<MerkleHash> {
         .map_err(|e| Error::InvalidManifest(format!("{path:?}: bad xet_hash: {e}")))
 }
 
-/// fsyncs a file and the directory holding it.
+/// Makes one stored object (and its directory entry) durable.
 pub(crate) fn sync_file_and_parent(path: &Path) -> Result<()> {
-    fs::File::open(path)?.sync_all()?;
-    if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
-    }
+    crate::durable::persist(path)?;
     Ok(())
 }
 
 /// fsyncs a directory so entries created or renamed in it are durable (no-op off Unix).
 fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
-    fs::File::open(dir)?.sync_all()?;
+    crate::durable::sync_dir(dir)?;
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())

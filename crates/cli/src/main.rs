@@ -514,6 +514,7 @@ fn report_json(r: &PushReport) -> serde_json::Value {
         "chunk_list_bytes_sent": r.chunk_list_bytes_sent,
         "payload_bytes_sent": r.payload_bytes_sent(),
         "udp_bytes_sent": r.udp_bytes_sent,
+        "udp_bytes_received": r.udp_bytes_received,
         "elapsed_secs": r.elapsed.as_secs_f64(),
         "receiver": r.receiver,
     })

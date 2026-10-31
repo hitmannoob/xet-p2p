@@ -196,10 +196,11 @@ impl LocalCas {
         }
         let doomed_set: HashSet<MerkleHash> = doomed.iter().copied().collect();
         for xorb in &doomed {
-            if let Ok(footer) = self.client.xorb_footer(xorb).await {
+            if let Ok(footer) = self.footer(xorb).await {
                 self.index.remove_xorb(xorb, &footer.info.chunk_hashes)?;
             }
             self.client.delete_xorb(xorb).await;
+            self.forget_footer(xorb);
         }
         debug_assert!(doomed_set.len() == doomed.len());
         Ok(report)
