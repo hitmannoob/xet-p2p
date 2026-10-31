@@ -16,12 +16,45 @@ class _Stream:
         return self._data
 
 
+class _Stdin:
+    def __init__(self, proc):
+        self._proc, self._buf = proc, []
+
+    def write(self, data):
+        self._buf.append(data if isinstance(data, str) else data.decode())
+
+    def write_eof(self):
+        pass
+
+    def drain(self):
+        pass
+
+
+class _LazyStream:
+    def __init__(self, proc, which):
+        self._proc, self._which = proc, which
+
+    def read(self):
+        self._proc._finish()
+        return self._proc._out if self._which == "out" else self._proc._err
+
+
 class _Process:
     def __init__(self, cmd, timeout):
-        r = subprocess.run(list(cmd), capture_output=True, text=True, timeout=timeout)
-        self.stdout, self.stderr, self.returncode = _Stream(r.stdout), _Stream(r.stderr), r.returncode
+        self._cmd, self._timeout, self._done = list(cmd), timeout, False
+        self.stdin = _Stdin(self)
+        self.stdout, self.stderr = _LazyStream(self, "out"), _LazyStream(self, "err")
+        self.returncode = None
+
+    def _finish(self):
+        if self._done:
+            return
+        r = subprocess.run(self._cmd, input="".join(self.stdin._buf), capture_output=True,
+                           text=True, timeout=self._timeout)
+        self._out, self._err, self.returncode, self._done = r.stdout, r.stderr, r.returncode, True
 
     def wait(self):
+        self._finish()
         return self.returncode
 
 

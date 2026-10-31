@@ -37,6 +37,9 @@ pub struct AgentSpec {
     pub client_cert_pem: String,
     /// Sandbox path of the agent's CAS.
     pub cas_dir: String,
+    /// Keep the agent running after the session until it has been idle this long; it then
+    /// exits and deletes its credentials. `None`: the agent is stopped when the session ends.
+    pub idle_exit: Option<std::time::Duration>,
 }
 
 /// A reachable endpoint of a running agent.
@@ -72,6 +75,10 @@ pub trait Sandbox: Send + Sync {
     async fn start_agent(&self, spec: &AgentSpec) -> Result<AgentEndpoints>;
     /// Stops the agent and removes session credentials. Never removes user files or the CAS.
     async fn close(&self) -> Result<()>;
+    /// Releases this handle but leaves an agent started with `idle_exit` running.
+    async fn detach(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Where the local `xet-p2p` binary is, for providers that run the agent on this machine.

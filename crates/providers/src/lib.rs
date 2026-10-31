@@ -16,7 +16,7 @@ pub use provider::{
     AgentEndpoint, AgentEndpoints, AgentSpec, Capabilities, Sandbox, SandboxProvider,
 };
 pub use session::{
-    Connected, DirectCredentials, DoctorReport, Probe, Registry, TransportPolicy, connect_target,
-    doctor,
+    Connected, DirectCredentials, DoctorReport, KeepAgent, Probe, Registry, TransportPolicy,
+    connect_target, doctor,
 };
 pub use uri::{DirectTransport, Target};

@@ -68,6 +68,45 @@ pub struct Receiver {
     fetcher: Fetcher,
     locks: Arc<DestLocks>,
     opts: ReceiverOptions,
+    activity: Arc<Activity>,
+}
+
+/// Connection activity, for agents that exit when idle.
+#[derive(Debug)]
+pub struct Activity {
+    active: std::sync::atomic::AtomicUsize,
+    last: std::sync::Mutex<std::time::Instant>,
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self {
+            active: Default::default(),
+            last: std::sync::Mutex::new(std::time::Instant::now()),
+        }
+    }
+}
+
+impl Activity {
+    fn begin(&self) {
+        self.active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.last.lock().unwrap() = std::time::Instant::now();
+    }
+
+    fn end(&self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        *self.last.lock().unwrap() = std::time::Instant::now();
+    }
+
+    /// How long nothing has been connected, or `None` while a connection is open.
+    pub fn idle_for(&self) -> Option<Duration> {
+        if self.active.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            return None;
+        }
+        Some(self.last.lock().unwrap().elapsed())
+    }
 }
 
 impl Receiver {
@@ -89,6 +128,7 @@ impl Receiver {
             fetcher,
             locks: Arc::default(),
             opts,
+            activity: Arc::default(),
         })
     }
 
@@ -99,14 +139,23 @@ impl Receiver {
             tokio::spawn(async move {
                 let remote = incoming.remote;
                 match incoming.handshake.await {
-                    Ok(conn) => match this.handle(conn).await {
-                        Ok(r) => info!(%remote, ?r, "transfer complete"),
-                        Err(e) => warn!(%remote, "transfer failed: {e}"),
-                    },
+                    Ok(conn) => {
+                        this.activity.begin();
+                        match this.handle(conn).await {
+                            Ok(r) => info!(%remote, ?r, "transfer complete"),
+                            Err(e) => warn!(%remote, "transfer failed: {e}"),
+                        }
+                        this.activity.end();
+                    }
                     Err(e) => warn!(%remote, "handshake failed: {e}"),
                 }
             });
         }
+    }
+
+    /// Connection activity across all listeners.
+    pub fn activity(&self) -> Arc<Activity> {
+        self.activity.clone()
     }
 
     /// Runs one transfer on an established, authenticated connection.

@@ -183,3 +183,35 @@ fn failed_agent_start_leaves_no_session_behind() {
     assert!(err.contains("agent exited"), "{err}");
     e.no_session_state();
 }
+
+#[test]
+fn keep_agent_through_fake_modal() {
+    let e = Env::new();
+    let src = e.tmp.path().join("src").display().to_string();
+    let sb = e.sandboxes();
+    let uri = e.uri("sb-test", "kept");
+    let push = |extra: &[&str]| {
+        let mut args = vec![
+            "push",
+            src.as_str(),
+            uri.as_str(),
+            "--json",
+            "--keep-agent-secs",
+            "3",
+        ];
+        args.extend_from_slice(extra);
+        let out = e.run(&args, &sb);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    assert_eq!(push(&[])["reused_agent"], false);
+    let second = push(&[]);
+    assert_eq!(second["reused_agent"], true);
+    assert_eq!(second["payload_bytes_sent"], 0);
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    e.no_session_state();
+}

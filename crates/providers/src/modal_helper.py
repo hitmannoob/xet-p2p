@@ -1,15 +1,21 @@
 # xet-p2p Modal adapter helper. Run by the Rust adapter with the Python that has the Modal SDK.
 #
-# Usage: python -c <this script> <command>   with a JSON request on stdin; writes one JSON object
-# to stdout. Private keys arrive on stdin only (never argv), and are written with mode 0600.
+# A long-lived process for one xet-p2p command: it reads one JSON request per line on stdin and
+# writes one JSON response per line on stdout, so the SDK is imported and the sandbox looked up
+# once. Every remote step is batched to keep round trips to Modal's API to a minimum:
 #
-# The helper only attaches to an existing sandbox (Sandbox.from_id). It never creates one.
+#   attach     Sandbox.from_id + tunnels()                      (no remote command)
+#   bootstrap  one remote shell script: CPU check, agent binary check, credentials (from stdin,
+#              written under umask 077), launch, wait for readiness *inside the sandbox*
+#              (+ one upload the first time this agent build is used)
+#   stop       one remote command: kill the agent, delete its session directory
+#
+# The helper only attaches to existing sandboxes. It never creates or terminates one.
+import base64
 import hashlib
 import json
-import shlex
 import socket
 import sys
-import time
 
 # Prefer IPv4: on networks with DNS64 but broken NAT64, the synthesized IPv6 addresses come first
 # and never connect, and the SDK's gRPC client does not fall back. IPv6 stays as a fallback.
@@ -18,122 +24,113 @@ socket.getaddrinfo = lambda *a, **k: sorted(_getaddrinfo(*a, **k), key=lambda i:
 
 import modal  # noqa: E402
 
+BOOTSTRAP = r"""
+set -u
+BIN=$1 SHA=$2 ARCH=$3 ROOT=$4 CAS=$5 SESSION=$6 PORT=$7 IDLE=$8
+sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
+M=$(uname -m)
+if [ "$ARCH" != any ] && [ "$M" != "$ARCH" ]; then echo "sandbox CPU is $M but the agent is built for $ARCH" >&2; exit 11; fi
+if [ ! -f "$BIN" ] || [ "$(sha "$BIN" 2>/dev/null)" != "$SHA" ]; then echo '{"need_binary": true}'; exit 0; fi
+chmod 755 "$BIN"
+umask 077
+mkdir -p "$SESSION" && mkdir -p "$ROOT" || exit 14
+IFS= read -r K; IFS= read -r C; IFS= read -r CL
+printf %s "$K" | base64 -d > "$SESSION/server.key" && printf %s "$C" | base64 -d > "$SESSION/server.crt" \
+  && printf %s "$CL" | base64 -d > "$SESSION/client.crt" || { rm -rf "$SESSION"; exit 15; }
+set -- "$BIN" serve --no-quic --listen-tcp "0.0.0.0:$PORT" --root "$ROOT" --cas-dir "$CAS" \
+  --cert "$SESSION/server.crt" --key "$SESSION/server.key" --allow-client "$SESSION/client.crt" \
+  --ready-file "$SESSION/ready.json"
+if [ "$IDLE" != 0 ]; then set -- "$@" --idle-exit-secs "$IDLE" --cleanup-on-exit "$SESSION"; fi
+nohup "$@" > "$SESSION/agent.log" 2>&1 < /dev/null &
+PID=$!
+I=0
+while [ ! -s "$SESSION/ready.json" ]; do
+  if ! kill -0 "$PID" 2>/dev/null; then echo "agent exited: $(tail -c 1500 "$SESSION/agent.log")" >&2; rm -rf "$SESSION"; exit 12; fi
+  I=$((I + 1)); if [ "$I" -gt 300 ]; then kill "$PID"; rm -rf "$SESSION"; echo "agent not ready in 30 s" >&2; exit 13; fi
+  sleep 0.1
+done
+echo "{\"pid\": $PID, \"uname\": \"$(uname -sm)\"}"
+"""
 
-def run(sb, *cmd, timeout=60):
-    p = sb.exec(*cmd, timeout=timeout)
-    out = p.stdout.read()
-    err = p.stderr.read()
+_sandboxes = {}
+
+
+def sandbox(sid):
+    if sid not in _sandboxes:
+        _sandboxes[sid] = modal.Sandbox.from_id(sid)
+    return _sandboxes[sid]
+
+
+def run(sb, script, args, stdin=None, timeout=120):
+    p = sb.exec("sh", "-c", script, "sh", *args, timeout=timeout)
+    if stdin is not None:
+        p.stdin.write(stdin)
+        p.stdin.write_eof()
+        p.stdin.drain()
+    out, err = p.stdout.read(), p.stderr.read()
     p.wait()
-    if p.returncode != 0:
-        raise RuntimeError(f"{' '.join(cmd[:2])}... failed ({p.returncode}): {err.strip()[:400]}")
-    return out
+    return p.returncode, out, err
 
 
-def tunnel_for(sb, port):
-    t = sb.tunnels(timeout=30).get(port)
-    if t is None or not getattr(t, "unencrypted_host", None):
-        return None
-    host, p = t.tcp_socket
-    return [host, p]
+def elf_arch(path):
+    """CPU of an ELF binary (as `uname -m` names it), or "any" if it is not ELF."""
+    with open(path, "rb") as f:
+        head = f.read(20)
+    if head[:4] != b"\x7fELF":
+        return "any"
+    machine = int.from_bytes(head[18:20], "little")
+    return {0x3E: "x86_64", 0xB7: "aarch64"}.get(machine, f"elf-{machine:#x}")
 
 
-def cmd_info(req):
-    sb = modal.Sandbox.from_id(req["id"])
-    uname = run(sb, "uname", "-sm").split()
-    return {
-        "os": uname[0].lower() if uname else "unknown",
-        "arch": uname[1] if len(uname) > 1 else "unknown",
-        "tunnel": tunnel_for(sb, req["port"]),
-    }
+def cmd_attach(req):
+    sb = sandbox(req["id"])
+    t = sb.tunnels(timeout=30).get(req["port"])
+    tunnel = list(t.tcp_socket) if t is not None and getattr(t, "unencrypted_host", None) else None
+    return {"tunnel": tunnel}
 
 
-def write_file(sb, path, data, mode):
-    # Modal's filesystem API (sb.open() was retired); then restrict permissions.
-    sb.filesystem.write_bytes(data, path)
-    run(sb, "chmod", mode, path)
-
-
-def cmd_start(req):
-    sb = modal.Sandbox.from_id(req["id"])
-    state = {"pid": None}
-    try:
-        return _start(sb, req, state)
-    except Exception:
-        # A failed start must not leave an agent or session credentials behind.
-        try:
-            if state["pid"]:
-                run(sb, "sh", "-c", f"kill {int(state['pid'])} 2>/dev/null || true")
-            run(sb, "rm", "-rf", req["session_dir"])
-        except Exception:
-            pass
-        raise
-
-
-def _start(sb, req, started):
-    tunnel = tunnel_for(sb, req["port"])
-    if tunnel is None:
-        raise RuntimeError(
-            f"sandbox has no unencrypted (raw TCP) tunnel for port {req['port']}; create it with "
-            f"unencrypted_ports=[{req['port']}] (Modal cannot add tunnels to a running sandbox)"
-        )
-    state, session = req["state_dir"], req["session_dir"]
-
-    # Agent binary: upload only if this exact build is not already there.
+def cmd_bootstrap(req):
+    sb = sandbox(req["id"])
     h = hashlib.sha256()
     with open(req["agent"], "rb") as f:
         for block in iter(lambda: f.read(1 << 20), b""):
             h.update(block)
     digest = h.hexdigest()
-    remote_bin = f"{state}/bin/xet-p2p-{digest[:16]}"
-    run(sb, "mkdir", "-p", f"{state}/bin", session, req["root"])
-    have = run(sb, "sh", "-c", f"sha256sum {shlex.quote(remote_bin)} 2>/dev/null || true").split()
-    if not have or have[0] != digest:
-        sb.filesystem.copy_from_local(req["agent"], remote_bin)
-        run(sb, "chmod", "755", remote_bin)
-
-    # Create the key file empty with 0600 first, so the key is never readable by others.
-    run(sb, "sh", "-c", f"umask 077 && : > {shlex.quote(session)}/server.key")
-    write_file(sb, f"{session}/server.key", req["server_key_pem"].encode(), "600")
-    write_file(sb, f"{session}/server.crt", req["server_cert_pem"].encode(), "644")
-    write_file(sb, f"{session}/client.crt", req["client_cert_pem"].encode(), "644")
-
-    args = [
-        remote_bin, "serve", "--no-quic", "--listen-tcp", f"0.0.0.0:{req['port']}",
-        "--root", req["root"], "--cas-dir", req["cas_dir"],
-        "--cert", f"{session}/server.crt", "--key", f"{session}/server.key",
-        "--allow-client", f"{session}/client.crt", "--ready-file", f"{session}/ready.json",
-    ]
-    line = " ".join(shlex.quote(a) for a in args)
-    pid = run(sb, "sh", "-c", f"nohup {line} > {shlex.quote(session)}/agent.log 2>&1 & echo $!").strip()
-    started["pid"] = pid
-
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        ready = run(sb, "sh", "-c", f"cat {shlex.quote(session)}/ready.json 2>/dev/null || true")
-        if ready.strip():
-            return {"pid": int(pid), "tcp": tunnel}
-        alive = run(sb, "sh", "-c", f"kill -0 {pid} 2>/dev/null && echo up || echo down").strip()
-        if alive != "up":
-            log = run(sb, "sh", "-c", f"tail -c 2000 {shlex.quote(session)}/agent.log || true")
-            raise RuntimeError(f"agent exited: {log.strip()}")
-        time.sleep(0.5)
-    raise RuntimeError("agent did not become ready in 30 s")
+    remote_bin = f"{req['state_dir']}/bin/xet-p2p-{digest[:16]}"
+    secrets = "\n".join(base64.b64encode(req[k].encode()).decode()
+                        for k in ("server_key_pem", "server_cert_pem", "client_cert_pem")) + "\n"
+    args = [remote_bin, digest, elf_arch(req["agent"]), req["root"], req["cas_dir"],
+            req["session_dir"], str(req["port"]), str(req.get("idle_exit_secs") or 0)]
+    for attempt in range(2):
+        code, out, err = run(sb, BOOTSTRAP, args, stdin=secrets, timeout=180)
+        if code != 0:
+            raise RuntimeError(err.strip()[:1500] or f"bootstrap failed ({code})")
+        reply = json.loads(out.strip().splitlines()[-1])
+        if not reply.get("need_binary"):
+            return reply
+        if attempt == 0:  # first use of this agent build in this sandbox
+            run(sb, 'mkdir -p "$1"', [f"{req['state_dir']}/bin"])
+            sb.filesystem.copy_from_local(req["agent"], remote_bin)
+    raise RuntimeError("agent binary did not verify after upload")
 
 
 def cmd_stop(req):
-    sb = modal.Sandbox.from_id(req["id"])
-    if req.get("pid"):
-        run(sb, "sh", "-c", f"kill {int(req['pid'])} 2>/dev/null || true")
-    run(sb, "rm", "-rf", req["session_dir"])
+    sb = sandbox(req["id"])
+    pid = int(req.get("pid") or 0)
+    script = '[ "$1" -gt 0 ] && kill "$1" 2>/dev/null; rm -rf "$2"; true'
+    run(sb, script, [str(pid), req["session_dir"]])
     return {"stopped": True}
 
 
-COMMANDS = {"info": cmd_info, "start": cmd_start, "stop": cmd_stop}
+COMMANDS = {"attach": cmd_attach, "bootstrap": cmd_bootstrap, "stop": cmd_stop}
 
 if __name__ == "__main__":
-    try:
-        req = json.load(sys.stdin)
-        print(json.dumps(COMMANDS[sys.argv[1]](req)))
-    except Exception as e:  # reported to the adapter as a provider error
-        print(json.dumps({"error": f"{type(e).__name__}: {e}"}))
-        sys.exit(1)
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            req = json.loads(line)
+            reply = COMMANDS[req["cmd"]](req)
+        except Exception as e:  # reported to the adapter as a provider error
+            reply = {"error": f"{type(e).__name__}: {e}"}
+        print(json.dumps(reply), flush=True)

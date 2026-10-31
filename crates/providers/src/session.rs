@@ -77,21 +77,161 @@ pub struct Connected {
     pub relayed: bool,
     /// What was tried and why, for the user.
     pub notes: Vec<String>,
+    /// Reused a kept agent from an earlier command (no provider calls were made).
+    pub reused_agent: bool,
+    /// Time spent attaching and starting the agent (zero when reused or direct).
+    pub bootstrap: Duration,
     sandbox: Option<Box<dyn Sandbox>>,
     quic: Option<QuicClient>,
+    keep: bool,
 }
 
 impl Connected {
-    /// Closes the connection and, for sandboxes, stops the agent and removes session credentials.
+    /// Closes the connection. For sandboxes, stops the agent and removes its credentials, unless
+    /// it was started to be kept (it then exits by itself once idle).
     pub async fn finish(self) -> Result<()> {
         self.conn.close(0, b"done");
         if let Some(q) = &self.quic {
             let _ = tokio::time::timeout(Duration::from_secs(5), q.wait_idle()).await;
         }
         if let Some(sb) = self.sandbox {
-            sb.close().await?;
+            if self.keep {
+                sb.detach().await?;
+            } else {
+                sb.close().await?;
+            }
         }
         Ok(())
+    }
+}
+
+/// Keep the agent running between commands (`--keep-agent`).
+#[derive(Debug, Clone)]
+pub struct KeepAgent {
+    /// The agent exits after this much idle time.
+    pub idle: Duration,
+    /// Where this machine caches kept sessions (client key, pinned agent cert, endpoint).
+    pub cache_dir: std::path::PathBuf,
+}
+
+/// A kept agent session, cached locally (mode 0600: it holds this client's private key).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct KeptSession {
+    client_cert_pem: String,
+    client_key_pem: String,
+    server_cert_pem: String,
+    host_port: String,
+    relayed: bool,
+    quic: bool,
+    workspace_root: String,
+    expires_unix: u64,
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+fn kept_path(
+    keep: &KeepAgent,
+    provider: &str,
+    id: &str,
+    options: &std::collections::BTreeMap<String, String>,
+) -> std::path::PathBuf {
+    let opts: Vec<String> = options.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let key = format!("{provider}://{id}?{}", opts.join("&"));
+    let digest = transport::fingerprint(key.as_bytes());
+    keep.cache_dir
+        .join(format!("{provider}-{}.json", &digest[..16]))
+}
+
+fn save_kept(path: &std::path::Path, session: &KeptSession) -> Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp)?;
+    f.write_all(&serde_json::to_vec(session).map_err(|e| Error::Provider(e.to_string()))?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Reconnects to a kept agent without any provider call. Returns `None` (and forgets the cached
+/// session) if it has expired or no longer answers.
+async fn reuse_kept(
+    path: &std::path::Path,
+    target_path: &str,
+    policy: TransportPolicy,
+) -> Option<Connected> {
+    let session: KeptSession = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let forget = || {
+        let _ = std::fs::remove_file(path);
+    };
+    let kind = if session.quic {
+        TransportKind::Quic
+    } else {
+        TransportKind::TlsTcp
+    };
+    let allowed = match policy {
+        TransportPolicy::Auto => true,
+        TransportPolicy::Quic => kind == TransportKind::Quic,
+        TransportPolicy::Tcp => kind == TransportKind::TlsTcp,
+    };
+    if session.expires_unix <= now_unix() || !allowed {
+        forget();
+        return None;
+    }
+    let caps = Capabilities {
+        workspace_root: session.workspace_root.clone(),
+        ..Default::default()
+    };
+    let rel = relative_to_workspace(&caps, target_path).ok()?;
+    let identity = Identity::from_pem(&session.client_cert_pem, &session.client_key_pem).ok()?;
+    let pinned = {
+        use transport::rustls::pki_types::pem::PemObject;
+        CertificateDer::from_pem_slice(session.server_cert_pem.as_bytes()).ok()?
+    };
+    let ep = AgentEndpoint {
+        host_port: session.host_port.clone(),
+        relayed: session.relayed,
+    };
+    match dial(kind, &ep, identity, pinned).await {
+        Ok((conn, quic)) => {
+            let mut notes = vec!["reused the agent kept from an earlier command".to_string()];
+            if kind != TransportKind::Quic {
+                notes.push(format!("using {} — this is not QUIC", conn.kind()));
+            }
+            if session.relayed {
+                notes.push("a provider relay is in the data path".into());
+            }
+            Some(Connected {
+                transport: conn.kind(),
+                conn,
+                path: rel,
+                relayed: session.relayed,
+                notes,
+                reused_agent: true,
+                bootstrap: Duration::ZERO,
+                sandbox: None,
+                quic,
+                keep: true,
+            })
+        }
+        Err(_) => {
+            forget();
+            None
+        }
     }
 }
 
@@ -103,6 +243,7 @@ pub async fn connect_target(
     target: &Target,
     policy: TransportPolicy,
     direct: Option<DirectCredentials>,
+    keep: Option<KeepAgent>,
 ) -> Result<Connected> {
     match target {
         Target::Direct {
@@ -137,8 +278,11 @@ pub async fn connect_target(
                 path: path.clone(),
                 relayed: false,
                 notes: Vec::new(),
+                reused_agent: false,
+                bootstrap: Duration::ZERO,
                 sandbox: None,
                 quic,
+                keep: false,
             })
         }
         Target::Sandbox {
@@ -147,10 +291,27 @@ pub async fn connect_target(
             path,
             options,
         } => {
+            let kept = keep.as_ref().map(|k| kept_path(k, provider, id, options));
+            if let Some(p) = &kept
+                && let Some(c) = reuse_kept(p, path, policy).await
+            {
+                return Ok(c);
+            }
+            let started = std::time::Instant::now();
             let provider = registry.get(provider)?;
             let sandbox = provider.attach(id, options).await?;
-            match connect_sandbox(sandbox.as_ref(), path, policy).await {
-                Ok(mut c) => {
+            let idle = keep.as_ref().map(|k| k.idle);
+            match connect_sandbox(sandbox.as_ref(), path, policy, idle).await {
+                Ok((mut c, session)) => {
+                    c.bootstrap = started.elapsed();
+                    if let (Some(p), Some(session)) = (&kept, session) {
+                        save_kept(p, &session)?;
+                        c.keep = true;
+                        c.notes.push(format!(
+                            "agent kept for reuse; it exits after {} min idle",
+                            idle.unwrap_or_default().as_secs() / 60
+                        ));
+                    }
                     c.sandbox = Some(sandbox);
                     Ok(c)
                 }
@@ -167,7 +328,8 @@ async fn connect_sandbox(
     sandbox: &dyn Sandbox,
     path: &str,
     policy: TransportPolicy,
-) -> Result<Connected> {
+    idle: Option<Duration>,
+) -> Result<(Connected, Option<KeptSession>)> {
     let caps = sandbox.capabilities().await?;
     let rel = relative_to_workspace(&caps, path)?;
     let mut notes = Vec::new();
@@ -197,6 +359,7 @@ async fn connect_sandbox(
         server_key_pem: server.key_pem.clone(),
         client_cert_pem: client.cert_pem.clone(),
         cas_dir: format!("{}/.xet-p2p/cas", caps.workspace_root.trim_end_matches('/')),
+        idle_exit: idle,
     };
     let endpoints = sandbox.start_agent(&spec).await?;
     let pinned = Identity::from_pem(&server.cert_pem, &server.key_pem)?.cert;
@@ -224,15 +387,32 @@ async fn connect_sandbox(
                 if ep.relayed {
                     notes.push("a provider relay is in the data path".into());
                 }
-                return Ok(Connected {
-                    transport: conn.kind(),
-                    conn,
-                    path: rel,
+                let kept = idle.map(|idle| KeptSession {
+                    client_cert_pem: client.cert_pem.clone(),
+                    client_key_pem: client.key_pem.clone(),
+                    server_cert_pem: server.cert_pem.clone(),
+                    host_port: ep.host_port.clone(),
                     relayed: ep.relayed,
-                    notes,
-                    sandbox: None,
-                    quic,
+                    quic: kind == TransportKind::Quic,
+                    workspace_root: caps.workspace_root.clone(),
+                    // Conservative: assume the agent may exit `idle` after this session starts.
+                    expires_unix: now_unix() + idle.as_secs(),
                 });
+                return Ok((
+                    Connected {
+                        transport: conn.kind(),
+                        conn,
+                        path: rel,
+                        relayed: ep.relayed,
+                        notes,
+                        reused_agent: false,
+                        bootstrap: Duration::ZERO,
+                        sandbox: None,
+                        quic,
+                        keep: false,
+                    },
+                    kept,
+                ));
             }
             Err(e) => notes.push(format!("{kind} to {}: {e}", ep.host_port)),
         }
@@ -379,10 +559,15 @@ pub async fn doctor(registry: &Registry, target: &Target) -> Result<DoctorReport
         server_key_pem: server.key_pem.clone(),
         client_cert_pem: client.cert_pem.clone(),
         cas_dir: format!("{}/.xet-p2p/cas", caps.workspace_root.trim_end_matches('/')),
+        idle_exit: None,
     };
     let endpoints = match sandbox.start_agent(&spec).await {
         Ok(e) => {
             report.agent = Ok(());
+            // Some providers learn the platform only when the agent starts.
+            if let Ok(c) = sandbox.capabilities().await {
+                report.capabilities = Some(c);
+            }
             e
         }
         Err(e) => {

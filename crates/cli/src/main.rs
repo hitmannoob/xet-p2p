@@ -48,6 +48,12 @@ enum Command {
         /// Once listening, write {"quic": ADDR|null, "tcp": ADDR|null} here (agent bootstrap).
         #[arg(long, hide = true)]
         ready_file: Option<PathBuf>,
+        /// Exit after this many seconds with no connection (agent mode).
+        #[arg(long, hide = true)]
+        idle_exit_secs: Option<u64>,
+        /// Delete this directory (the agent's session credentials) when exiting idle.
+        #[arg(long, hide = true, requires = "idle_exit_secs")]
+        cleanup_on_exit: Option<PathBuf>,
         /// Directory every destination is confined to.
         #[arg(long)]
         root: PathBuf,
@@ -174,6 +180,14 @@ struct ConnArgs {
     /// Direct targets: the server's certificate, pinned.
     #[arg(long)]
     peer_cert: Option<PathBuf>,
+    /// Sandbox targets: keep the agent running for reuse by later commands, until it has been
+    /// idle this many minutes (it then exits and deletes its credentials). Later commands
+    /// reconnect directly, with no provider API calls.
+    #[arg(long, value_name = "MINUTES", conflicts_with = "keep_agent_secs")]
+    keep_agent: Option<u64>,
+    /// Test hook: --keep-agent in seconds.
+    #[arg(long, hide = true)]
+    keep_agent_secs: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -213,6 +227,8 @@ async fn main() -> Result<()> {
             listen_tcp,
             no_quic,
             ready_file,
+            idle_exit_secs,
+            cleanup_on_exit,
             root,
             cas_dir,
             cert,
@@ -302,7 +318,28 @@ async fn main() -> Result<()> {
                     receiver.clone().serve(Arc::new(t)).await;
                 }
             };
-            tokio::join!(serve_quic, serve_tcp);
+            let idle_exit = async {
+                let Some(secs) = idle_exit_secs else {
+                    return std::future::pending::<()>().await;
+                };
+                let limit = std::time::Duration::from_secs(secs.max(1));
+                let activity = receiver.activity();
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1).min(limit)).await;
+                    if activity.idle_for().is_some_and(|idle| idle >= limit) {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = async { tokio::join!(serve_quic, serve_tcp) } => {}
+                _ = idle_exit => {
+                    eprintln!("idle for {}s; exiting", idle_exit_secs.unwrap_or_default());
+                    if let Some(dir) = &cleanup_on_exit {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                }
+            }
             Ok(())
         }
         Command::Push {
@@ -343,11 +380,15 @@ async fn main() -> Result<()> {
                 );
             }
             let result = push(cas, &src, &remote.conn, &opts).await;
+            let (bootstrap, reused) = (remote.bootstrap, remote.reused_agent);
             remote.finish().await?;
             let report = result?;
             print_push_report(&report);
             if json {
-                println!("{}", serde_json::to_string_pretty(&report_json(&report))?);
+                let mut j = report_json(&report);
+                j["bootstrap_secs"] = bootstrap.as_secs_f64().into();
+                j["reused_agent"] = reused.into();
+                println!("{}", serde_json::to_string_pretty(&j)?);
             }
             Ok(())
         }
@@ -540,7 +581,24 @@ async fn open_target(target: &str, args: &ConnArgs) -> Result<providers::Connect
         }),
         _ => None,
     };
-    let remote = providers::connect_target(&registry()?, &parsed, policy, direct).await?;
+    let keep_secs = args.keep_agent.map(|m| m * 60).or(args.keep_agent_secs);
+    let keep = match keep_secs {
+        Some(secs) if secs > 0 => Some(providers::KeepAgent {
+            idle: std::time::Duration::from_secs(secs),
+            cache_dir: cas_dir(args)?
+                .parent()
+                .map(|p| p.join("agents"))
+                .unwrap_or_else(|| PathBuf::from("agents")),
+        }),
+        _ => None,
+    };
+    let remote = providers::connect_target(&registry()?, &parsed, policy, direct, keep).await?;
+    if !remote.bootstrap.is_zero() {
+        eprintln!(
+            "attached and started the agent in {:.1}s",
+            remote.bootstrap.as_secs_f64()
+        );
+    }
     eprintln!(
         "connected to {} via {}{} (peer certificate pinned)",
         target,

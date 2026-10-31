@@ -145,10 +145,17 @@ impl Sandbox for LocalSandbox {
         if self.tcp {
             cmd.args(["--listen-tcp", "127.0.0.1:0"]);
         }
+        if let Some(idle) = spec.idle_exit {
+            // A kept agent outlives this command, exits once idle, and deletes its credentials.
+            cmd.arg("--idle-exit-secs")
+                .arg(idle.as_secs().max(1).to_string())
+                .arg("--cleanup-on-exit")
+                .arg(&session);
+        }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(log)
-            .kill_on_drop(true);
+            .kill_on_drop(spec.idle_exit.is_none());
         let mut child = cmd.spawn().map_err(|e| {
             Error::Provider(format!("cannot start agent {}: {e}", self.binary.display()))
         })?;
@@ -185,6 +192,12 @@ impl Sandbox for LocalSandbox {
             quic: endpoint("quic"),
             tcp: endpoint("tcp"),
         })
+    }
+
+    async fn detach(&self) -> Result<()> {
+        // Leave a kept agent running; dropping the handle does not kill it.
+        self.running.lock().await.take();
+        Ok(())
     }
 
     async fn close(&self) -> Result<()> {

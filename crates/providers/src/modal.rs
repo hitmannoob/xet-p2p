@@ -9,8 +9,10 @@
 //!
 //! There is no Rust SDK: the adapter drives a small helper (`modal_helper.py`) with the Python
 //! that has the Modal SDK installed (`$XET_P2P_MODAL_PYTHON`, else the interpreter of the
-//! `modal` command on `PATH`), using the user's existing Modal credentials. The helper attaches
-//! with `Sandbox.from_id`; it never creates or terminates sandboxes.
+//! `modal` command on `PATH`), using the user's existing Modal credentials. One helper process
+//! serves the whole command (JSON lines over stdin/stdout), and remote work is batched into as
+//! few Modal API calls as possible, since each is a round trip to Modal's servers. The helper
+//! attaches with `Sandbox.from_id`; it never creates or terminates sandboxes.
 //!
 //! The agent must be a Linux build matching the sandbox CPU: `$XET_P2P_AGENT_LINUX_BIN` (see the
 //! README for cross-compiling with `cargo zigbuild`).
@@ -21,8 +23,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
@@ -101,78 +103,101 @@ impl SandboxProvider for ModalProvider {
             }
             Ok(v.trim_end_matches('/').to_owned())
         };
+        let helper = Helper::spawn(&self.python)?;
         let sandbox = ModalSandbox {
             id: id.to_owned(),
-            python: self.python.clone(),
             agent: self.agent.clone(),
             port,
             root: abs("root", DEFAULT_ROOT)?,
             state: abs("state", DEFAULT_STATE)?,
+            helper: Mutex::new(helper),
+            tunnel: Mutex::new(None),
+            uname: Mutex::new(None),
             running: Mutex::new(None),
         };
-        // Attaching means: the sandbox exists and answers. (`info` uses Sandbox.from_id.)
-        sandbox.info().await?;
+        // Attaching means: the sandbox exists and answers (Sandbox.from_id + tunnels).
+        let v = sandbox
+            .call(
+                json!({"cmd": "attach", "id": id, "port": port}),
+                Duration::from_secs(90),
+            )
+            .await?;
+        *sandbox.tunnel.lock().await = v["tunnel"]
+            .as_array()
+            .map(|t| format!("{}:{}", t[0].as_str().unwrap_or_default(), t[1]));
         Ok(Box::new(sandbox))
     }
 }
 
-struct ModalSandbox {
-    id: String,
-    python: PathBuf,
-    agent: Option<PathBuf>,
-    port: u16,
-    root: String,
-    state: String,
-    running: Mutex<Option<(u64, String)>>,
+/// One helper process for the whole command.
+struct Helper {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
 }
 
-impl ModalSandbox {
-    async fn helper(&self, command: &str, request: Value, timeout: Duration) -> Result<Value> {
-        let mut child = Command::new(&self.python)
+impl Helper {
+    fn spawn(python: &PathBuf) -> Result<Self> {
+        let mut child = Command::new(python)
+            .arg("-u")
             .arg("-c")
             .arg(HELPER)
-            .arg(command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .map_err(|e| {
                 Error::Provider(format!(
                     "cannot run the Modal SDK's Python ({}): {e}",
-                    self.python.display()
+                    python.display()
                 ))
             })?;
-        let mut stdin = child.stdin.take().expect("piped");
-        stdin.write_all(request.to_string().as_bytes()).await?;
-        drop(stdin);
-        let out = tokio::time::timeout(timeout, child.wait_with_output())
+        Ok(Self {
+            stdin: child.stdin.take().expect("piped"),
+            stdout: BufReader::new(child.stdout.take().expect("piped")),
+            _child: child,
+        })
+    }
+}
+
+struct ModalSandbox {
+    id: String,
+    agent: Option<PathBuf>,
+    port: u16,
+    root: String,
+    state: String,
+    helper: Mutex<Helper>,
+    tunnel: Mutex<Option<String>>,
+    uname: Mutex<Option<String>>,
+    running: Mutex<Option<(u64, String)>>,
+}
+
+impl ModalSandbox {
+    async fn call(&self, request: Value, timeout: Duration) -> Result<Value> {
+        let cmd = request["cmd"].as_str().unwrap_or("?").to_owned();
+        let mut h = self.helper.lock().await;
+        let exchange = async {
+            h.stdin.write_all(format!("{request}\n").as_bytes()).await?;
+            h.stdin.flush().await?;
+            let mut line = String::new();
+            if h.stdout.read_line(&mut line).await? == 0 {
+                return Err(Error::Provider(format!(
+                    "modal {cmd}: the helper exited (is the Modal SDK installed?)"
+                )));
+            }
+            serde_json::from_str::<Value>(&line)
+                .map_err(|_| Error::Provider(format!("modal {cmd}: bad helper reply {line:?}")))
+        };
+        let v = tokio::time::timeout(timeout, exchange)
             .await
             .map_err(|_| {
-                Error::Provider(format!(
-                    "modal {command}: no answer in {}s",
-                    timeout.as_secs()
-                ))
+                Error::Provider(format!("modal {cmd}: no answer in {}s", timeout.as_secs()))
             })??;
-        let v: Value = serde_json::from_slice(&out.stdout).map_err(|_| {
-            Error::Provider(format!(
-                "modal {command}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))
-        })?;
         if let Some(e) = v.get("error").and_then(Value::as_str) {
-            return Err(Error::Provider(format!("modal {command}: {e}")));
+            return Err(Error::Provider(format!("modal {cmd}: {e}")));
         }
         Ok(v)
-    }
-
-    async fn info(&self) -> Result<Value> {
-        self.helper(
-            "info",
-            json!({ "id": self.id, "port": self.port }),
-            Duration::from_secs(90),
-        )
-        .await
     }
 }
 
@@ -183,10 +208,17 @@ impl Sandbox for ModalSandbox {
     }
 
     async fn capabilities(&self) -> Result<Capabilities> {
-        let info = self.info().await?;
-        let tunnel = info["tunnel"]
-            .as_array()
-            .map(|t| format!("{}:{}", t[0].as_str().unwrap_or("?"), t[1]));
+        let tunnel = self.tunnel.lock().await.clone();
+        let (os, arch) = match self.uname.lock().await.as_deref() {
+            Some(u) => {
+                let mut it = u.split_whitespace();
+                (
+                    it.next().unwrap_or("unknown").to_lowercase(),
+                    it.next().unwrap_or("unknown").to_owned(),
+                )
+            }
+            None => ("checked when the agent starts".into(), String::new()),
+        };
         let mut notes = vec![
             "Modal exposes sandbox ports only through tunnels; none carry UDP, so QUIC is impossible".into(),
             "traffic is relayed by Modal's tunnel; pinned mutual TLS authenticates both ends".into(),
@@ -199,8 +231,8 @@ impl Sandbox for ModalSandbox {
             )),
         }
         Ok(Capabilities {
-            os: info["os"].as_str().unwrap_or("unknown").into(),
-            arch: info["arch"].as_str().unwrap_or("unknown").into(),
+            os,
+            arch,
             workspace_root: self.root.clone(),
             inbound_udp: false,
             inbound_tcp: tunnel.is_some(),
@@ -216,15 +248,22 @@ impl Sandbox for ModalSandbox {
                     .into(),
             )
         })?;
+        let Some(tunnel) = self.tunnel.lock().await.clone() else {
+            return Err(Error::Provider(format!(
+                "sandbox has no unencrypted (raw TCP) tunnel for port {}; create it with \
+                 unencrypted_ports=[{}] (Modal cannot add tunnels to a running sandbox)",
+                self.port, self.port
+            )));
+        };
         let session = format!(
             "{}/session-{}",
             self.state,
             hex::encode(rand::random::<[u8; 8]>())
         );
         let v = self
-            .helper(
-                "start",
+            .call(
                 json!({
+                    "cmd": "bootstrap",
                     "id": self.id,
                     "port": self.port,
                     "root": self.root,
@@ -232,6 +271,7 @@ impl Sandbox for ModalSandbox {
                     "state_dir": self.state,
                     "session_dir": session,
                     "agent": agent,
+                    "idle_exit_secs": spec.idle_exit.map(|d| d.as_secs().max(1)),
                     "server_cert_pem": spec.server_cert_pem,
                     "server_key_pem": spec.server_key_pem,
                     "client_cert_pem": spec.client_cert_pem,
@@ -239,24 +279,31 @@ impl Sandbox for ModalSandbox {
                 Duration::from_secs(300),
             )
             .await?;
-        let pid = v["pid"].as_u64().unwrap_or(0);
-        *self.running.lock().await = Some((pid, session));
-        let tcp = v["tcp"].as_array().map(|t| AgentEndpoint {
-            host_port: format!("{}:{}", t[0].as_str().unwrap_or_default(), t[1]),
-            relayed: true,
-        });
-        Ok(AgentEndpoints { quic: None, tcp })
+        *self.uname.lock().await = v["uname"].as_str().map(str::to_owned);
+        *self.running.lock().await = Some((v["pid"].as_u64().unwrap_or(0), session));
+        Ok(AgentEndpoints {
+            quic: None,
+            tcp: Some(AgentEndpoint {
+                host_port: tunnel,
+                relayed: true,
+            }),
+        })
     }
 
     async fn close(&self) -> Result<()> {
         if let Some((pid, session)) = self.running.lock().await.take() {
-            self.helper(
-                "stop",
-                json!({ "id": self.id, "pid": pid, "session_dir": session }),
+            self.call(
+                json!({ "cmd": "stop", "id": self.id, "pid": pid, "session_dir": session }),
                 Duration::from_secs(90),
             )
             .await?;
         }
+        Ok(())
+    }
+
+    async fn detach(&self) -> Result<()> {
+        // The agent was started with an idle timeout: it exits and cleans up by itself.
+        self.running.lock().await.take();
         Ok(())
     }
 }

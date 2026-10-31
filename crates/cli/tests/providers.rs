@@ -181,3 +181,35 @@ fn bad_targets_fail_without_side_effects() {
     );
     e.assert_no_session_state();
 }
+
+#[test]
+fn keep_agent_reuses_then_expires_cleanly() {
+    let e = Env::new();
+    let src = e.p("src");
+    let target = "local://box1/keep";
+
+    let (r1, err) = e.ok(&["push", &src, target, "--keep-agent-secs", "3", "--json"]);
+    assert_eq!(r1["reused_agent"], false, "{err}");
+    assert!(err.contains("agent kept for reuse"), "{err}");
+
+    // Immediately again: direct reconnect to the kept agent, no bootstrap.
+    let (r2, err) = e.ok(&["push", &src, target, "--keep-agent-secs", "3", "--json"]);
+    assert_eq!(r2["reused_agent"], true, "{err}");
+    assert_eq!(r2["bootstrap_secs"], 0.0);
+    assert_eq!(r2["payload_bytes_sent"], 0);
+    assert!(err.contains("reused the agent"), "{err}");
+
+    // After the idle limit the agent exits by itself and deletes its credentials.
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    e.assert_no_session_state();
+
+    // The next command notices and bootstraps a fresh agent.
+    let (r3, err) = e.ok(&["push", &src, target, "--keep-agent-secs", "3", "--json"]);
+    assert_eq!(r3["reused_agent"], false, "{err}");
+    assert_same(
+        &e.tmp.path().join("src"),
+        &e.tmp.path().join("sandboxes/box1/keep"),
+    );
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    e.assert_no_session_state();
+}
