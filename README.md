@@ -10,12 +10,15 @@ Xet (chunks + xorbs + shards + local CAS)  ↔  QUIC (pinned mutual TLS)  ↔  X
   [`xet-core`](https://github.com/huggingface/xet-core) (pinned `=1.8.0`). No custom formats.
 - Each peer keeps an **embedded, on-disk CAS**. There is no CAS server, no cloud storage, no Hugging
   Face account. The receiver runs a QUIC listener that is part of this tool, not a CAS API.
-- Only content the receiver lacks is sent. A repeat push of unchanged files sends zero payload bytes.
+- Only content the receiver lacks is sent. A repeat push of unchanged files sends zero payload bytes
+  and leaves the destination files untouched.
+- Interrupted pushes resume: re-run the same command and only what is still missing is sent, even if
+  the receiver process was killed.
 - Every received object is verified before it is stored; every file is verified (size + SHA-256)
   before it is installed, and installation is atomic per file. A failed transfer installs nothing.
 
-Status: **M0 and M1 complete** (offline round trip; authenticated QUIC push with whole-xorb
-transfer). See [PROGRESS.md](PROGRESS.md) for details and what is next, and
+Status: **M0–M2 complete** (offline round trip; authenticated QUIC push with whole-xorb
+transfer; incremental install, durable resume, concurrent pushes). See [PROGRESS.md](PROGRESS.md) for details and what is next, and
 [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md) for the full design brief.
 
 ## Build
@@ -109,11 +112,24 @@ destination policies (any allowed sender may write anywhere under `--root`).
 
 Run any command with `--help` for all options. Set `RUST_LOG=debug` for verbose logs.
 
+## Resume and concurrency
+
+The receiver keeps a durable session per (destination, manifest) under `<cas-dir>/sessions`
+(`--session-dir` to move it). If a push is interrupted — network drop, sender killed, receiver
+killed — run the same push again. The receiver reuses the reconstruction metadata it already has and
+requests only xorbs it has not yet verified and stored. `push` reports `resumed interrupted session`
+with what was saved. If the source changed in between, a new session starts, but every xorb already
+stored is still reused. Sessions are removed on success and discarded after 7 days idle.
+
+Pushes into disjoint destinations run concurrently; pushes into overlapping destinations (one inside
+the other) wait for each other.
+
 ## Metrics
 
-`push` prints logical bytes, local chunk/dedup counts, xorbs referenced/sent/reused, payload bytes
+`push` prints (or emits with `--json`) logical bytes, local chunk/dedup counts, xorbs referenced/sent/reused, payload bytes
 (native xorb + shard bytes), UDP bytes actually sent (all QUIC overhead included), elapsed time, and
-throughput. Whole-xorb reuse (what M1 does) and chunk-level wire dedup (M3) are different; the
+throughput, files installed vs unchanged, xorbs already present on the receiver, and resume
+savings. Whole-xorb reuse (what M1 does) and chunk-level wire dedup (M3) are different; the
 numbers here are whole-xorb.
 
 ## Layout

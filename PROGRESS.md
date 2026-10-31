@@ -8,7 +8,7 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
 |---|---|
 | M0 — Upstream audit + offline Xet round trip | **Done** (exit gate met) |
 | M1 — Direct QUIC push, full-xorb transport | **Done** (exit gate met) |
-| M2 — Incremental transfer + durable resume | Not started |
+| M2 — Incremental transfer + durable resume | **Done** (exit gate met) |
 | M3 — Chunk-level transfer optimization | Not started |
 | M4 — Performance and reliability | Not started |
 | M5 — Provider-agnostic sandbox integration | Not started |
@@ -72,14 +72,43 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
     pinned cert refused at handshake. No external CAS or cloud requests.
   - README with build, quick start, and security model.
 
-## Next: M2 — incremental transfer + durable resume
+- **M2 implemented.**
+  - Incremental install: reconstruct leaves a destination file untouched when it is already a
+    regular file (reached without symlinks) with matching size + SHA-256, applying only an exec-bit
+    change; reports `files_unchanged`. A locally modified file is restored. Stale
+    `.xet-p2p-staging-*` dirs from a crashed run are removed.
+  - Durable receiver sessions (`<cas-dir>/sessions`, overridable with `--session-dir`): key =
+    `sha256(dest ‖ 0 ‖ manifest-json)`; record (attempts, xorbs/bytes committed) and the received
+    shard are written with temp-file + fsync + rename + dir fsync, updated after every committed xorb,
+    deleted on success, purged after 7 days idle. On resume the saved shard is reused
+    (`PendingShard::parse_containing`; still fully verified at commit) and committed xorbs are found
+    in the CAS, so neither is re-sent.
+  - Per-destination locks replace the global lock: overlapping destinations (one a path prefix of
+    the other) serialize, disjoint ones run concurrently. Waits up to 60 s, longer than the QUIC idle
+    timeout, so a resume outwaits a dead predecessor connection.
+  - Metrics: `ReceiverReport` adds `files_unchanged`, `xorbs_already_present`, `resumed`,
+    `attempts`, `prior_xorbs_committed`, `prior_xorb_bytes_committed`, `shard_from_session`;
+    `push` prints them and `push --json` emits the whole report.
+  - **Bug found and fixed:** the receiver awaited the next object stream inside a `select!` arm,
+    blocking ACKs; a sender that waits for each ACK deadlocked. Accepting is now its own branch.
+    (M1's `push` never waits for ACKs, so M1 tests could not see it; the resume tests did.)
+  - Tests: 5 more `xet-local` (unchanged files keep their inode, tampered file restored, exec-bit-only
+    change, identical file behind a symlink not trusted, stale staging cleaned); 6 more transfer
+    tests (resume after 2 of ≥3 xorbs: shard from session, 0 shard bytes, only remaining xorbs sent;
+    resume with 0 xorbs committed; session removed on success; changed source after interruption
+    starts a fresh session but reuses xorbs; 3 concurrent disjoint pushes sharing content; concurrent
+    overlapping pushes serialize); 1 dest-lock unit test; 1 process test that SIGKILLs `serve`
+    mid-transfer (hidden `--test-commit-delay-ms` makes timing deterministic), restarts it, and
+    verifies the resumed push re-sends no committed xorb and no shard.
 
-1. Persist session state on the receiver (session id → manifest digest, verified objects).
-2. Resume: on reconnect with the same manifest, re-check the CAS and request only what is still
-   missing (already true for committed xorbs; make it explicit, tested, and reported).
-3. Kill-mid-transfer test proving committed xorbs are not re-sent.
-4. Skip rewriting destination files whose content already matches (today every push reinstalls).
-5. Concurrent-push safety beyond the current one-transfer-at-a-time lock.
+## Next: M3 — chunk-level transfer
+
+1. Receiver resolves needed chunks per xorb range, not whole xorbs: skip chunks it already holds in
+   *other* xorbs (cross-xorb dedup), using the global-dedup chunk index.
+2. Choose between partial-range caching (with explicit completeness metadata) and repacking missing
+   chunks into new native xorbs with rewritten reconstruction terms; measure both.
+3. Benchmark wire bytes vs whole-xorb transfer on overlapping edits (insertions at start/middle,
+   checkpoint-like binaries). Report exact conditions.
 
 ## Known gaps / risks
 
@@ -89,7 +118,13 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
   hashed as read.
 - Directory install is per-file atomic after all files verify, not a single atomic swap of the tree.
 - Push does not delete receiver files absent from the source (no mirroring; out of scope for v0.1).
-- Receiver handles one transfer at a time (global lock).
+- Xorb commits are not fsynced by upstream (`SafeFileCreator` renames without `sync_all`). Process
+  crashes are safe (tested); a power loss could leave a truncated xorb that `xorb_exists` still
+  reports, failing later reconstructions of files that use it. Fix options: fsync after commit
+  (needs the xorb path — layout coupling) or verify-on-resume; decide in M4.
+- Any authorized sender may write anywhere under `--root`; no per-sender destination policy yet.
+- A resumed push must re-ingest the source (cheap: all chunks dedup locally) and must present an
+  identical manifest to hit its session; an edited source starts a new session (xorbs still reused).
 - Each xorb is held fully in memory while sent/verified (≤ 80 MiB × `--parallel`); streaming is M4.
 - No `transport` trait yet: `transfer` uses Quinn types directly. Abstract when M5 adds a fallback.
 - Upstream debug-asserts on an inconsistent `MDBFileInfo` (`file_structs.rs:372`). Shards parsed from

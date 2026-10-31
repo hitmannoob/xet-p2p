@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use transfer::{PushOptions, PushReport, Receiver, push};
+use transfer::{PushOptions, PushReport, Receiver, ReceiverOptions, push};
 use transport_quic::{
     EndpointOptions, Identity, bind_addr_for, client_endpoint, connect, fingerprint, generate,
     load_cert, server_endpoint,
@@ -54,6 +54,12 @@ enum Command {
         /// Objects received and verified concurrently.
         #[arg(long, default_value_t = 4)]
         parallel: u32,
+        /// Resumable session state (default: <cas-dir>/sessions).
+        #[arg(long)]
+        session_dir: Option<PathBuf>,
+        /// Test hook: pause after committing each xorb.
+        #[arg(long, hide = true)]
+        test_commit_delay_ms: Option<u64>,
     },
     /// Push a file or directory to a receiver.
     Push {
@@ -78,6 +84,9 @@ enum Command {
         /// Xorbs in flight at once.
         #[arg(long, default_value_t = 4)]
         parallel: u32,
+        /// Print the transfer report as JSON on stdout.
+        #[arg(long)]
+        json: bool,
     },
     /// Offline operations against a local CAS (no network).
     #[command(subcommand)]
@@ -124,6 +133,8 @@ async fn main() -> Result<()> {
             key,
             allow_client,
             parallel,
+            session_dir,
+            test_commit_delay_ms,
         } => {
             let allowed = allow_client
                 .iter()
@@ -138,7 +149,13 @@ async fn main() -> Result<()> {
             };
             let endpoint = server_endpoint(listen, Identity::load(&cert, &key)?, allowed, &opts)?;
             let cas = Arc::new(LocalCas::open(&cas_dir).await?);
-            let receiver = Arc::new(Receiver::new(&root, cas, parallel as usize)?);
+            let mut ropts = ReceiverOptions::new(&cas);
+            ropts.parallel_objects = parallel as usize;
+            if let Some(dir) = session_dir {
+                ropts.session_dir = dir;
+            }
+            ropts.commit_delay = test_commit_delay_ms.map(std::time::Duration::from_millis);
+            let receiver = Arc::new(Receiver::new(&root, cas, ropts)?);
             eprintln!(
                 "listening on {} (QUIC), root {}",
                 endpoint.local_addr()?,
@@ -156,6 +173,7 @@ async fn main() -> Result<()> {
             key,
             peer_cert,
             parallel,
+            json,
         } => {
             let addr = tokio::net::lookup_host(&to)
                 .await
@@ -181,7 +199,11 @@ async fn main() -> Result<()> {
             let result = push(cas, &src, &conn, &opts).await;
             conn.close(0u32.into(), b"done");
             endpoint.wait_idle().await;
-            print_push_report(&result?);
+            let report = result?;
+            print_push_report(&report);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report_json(&report))?);
+            }
             Ok(())
         }
         Command::Local(LocalCommand::Ingest {
@@ -294,8 +316,46 @@ fn print_push_report(r: &PushReport) {
             r.payload_bytes_sent() as f64 / secs / 1048576.0
         );
     }
+    let rr = &r.receiver;
     eprintln!(
-        "  receiver: installed {} files, {} bytes reconstructed and verified",
-        r.receiver.files_installed, r.receiver.bytes_reconstructed
+        "  receiver: {} files installed, {} unchanged; {} bytes reconstructed and verified",
+        rr.files_installed, rr.files_unchanged, rr.bytes_reconstructed
     );
+    if rr.resumed {
+        eprintln!(
+            "  resumed interrupted session (attempt {}): {} xorbs / {} bytes already committed{}",
+            rr.attempts,
+            rr.prior_xorbs_committed,
+            rr.prior_xorb_bytes_committed,
+            if rr.shard_from_session {
+                "; shard reused"
+            } else {
+                ""
+            }
+        );
+    }
+}
+
+fn report_json(r: &PushReport) -> serde_json::Value {
+    let d = &r.ingest.dedup;
+    serde_json::json!({
+        "files": r.ingest.files,
+        "dirs": r.ingest.dirs,
+        "logical_bytes": r.logical_bytes,
+        "ingest": {
+            "total_chunks": d.total_chunks,
+            "new_chunks": d.new_chunks,
+            "new_bytes": d.new_bytes,
+            "deduped_bytes": d.deduped_bytes,
+        },
+        "xorbs_referenced": r.xorbs_referenced,
+        "xorbs_sent": r.xorbs_sent,
+        "xorbs_reused": r.xorbs_reused(),
+        "xorb_bytes_sent": r.xorb_bytes_sent,
+        "shard_bytes_sent": r.shard_bytes_sent,
+        "payload_bytes_sent": r.payload_bytes_sent(),
+        "udp_bytes_sent": r.udp_bytes_sent,
+        "elapsed_secs": r.elapsed.as_secs_f64(),
+        "receiver": r.receiver,
+    })
 }
