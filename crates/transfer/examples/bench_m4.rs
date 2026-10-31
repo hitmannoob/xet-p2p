@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 use transfer::{PushOptions, Receiver, ReceiverOptions, TransferMode, push};
+use transport::Listener as _;
 use transport_quic::{
     EndpointOptions, GeneratedIdentity, Identity, client_endpoint, connect, generate,
     server_endpoint,
@@ -324,17 +325,22 @@ async fn xet(scn: &Scenario) -> Measure {
     let server_id = generate("receiver").unwrap();
     let client_id = generate("sender").unwrap();
     let id = |g: &GeneratedIdentity| Identity::from_pem(&g.cert_pem, &g.key_pem).unwrap();
-    let server = server_endpoint(
-        "127.0.0.1:0".parse().unwrap(),
-        id(&server_id),
-        vec![id(&client_id).cert],
-        &EndpointOptions::default(),
-    )
-    .unwrap();
+    let server = Arc::new(
+        server_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            id(&server_id),
+            vec![id(&client_id).cert],
+            &EndpointOptions::default(),
+        )
+        .unwrap(),
+    );
     let addr = server.local_addr().unwrap();
     let rcas = Arc::new(LocalCas::open(tmp.path().join("rcas")).await.unwrap());
     let ropts = ReceiverOptions::new(&rcas);
-    tokio::spawn(Arc::new(Receiver::new(&root, rcas, ropts).unwrap()).serve(server.clone()));
+    tokio::spawn(
+        Arc::new(Receiver::new(&root, rcas, ropts).unwrap())
+            .serve(server.clone() as Arc<dyn transport::Listener>),
+    );
     let scas = Arc::new(LocalCas::open(tmp.path().join("scas")).await.unwrap());
 
     let run = || async {
@@ -356,7 +362,7 @@ async fn xet(scn: &Scenario) -> Measure {
             bandwidth_limit: None,
         };
         let r = push(scas.clone(), &src, &conn, &opts).await.unwrap();
-        conn.close(0u32.into(), b"done");
+        conn.close(0, b"done");
         Measure {
             sent: r.udp_bytes_sent,
             total: r.udp_bytes_sent + r.udp_bytes_received,

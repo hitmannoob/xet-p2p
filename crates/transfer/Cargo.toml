@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 xet-local.workspace = true
-transport-quic.workspace = true
+transport.workspace = true
 hex.workspace = true
 lz4_flex.workspace = true
 serde_bytes.workspace = true
@@ -21,4 +21,5 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+transport-quic.workspace = true
 tempfile.workspace = true

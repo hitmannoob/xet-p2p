@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use transfer::{PushOptions, PushReport, Receiver, ReceiverOptions, TransferMode, push};
+use transport::Listener as _;
 use transport_quic::{
     EndpointOptions, Identity, bind_addr_for, client_endpoint, connect, fingerprint, generate,
     load_cert, server_endpoint,
@@ -217,7 +218,7 @@ async fn main() -> Result<()> {
                 endpoint.local_addr()?,
                 root.display()
             );
-            receiver.serve(endpoint).await;
+            receiver.serve(Arc::new(endpoint)).await;
             Ok(())
         }
         Command::Push {
@@ -249,7 +250,10 @@ async fn main() -> Result<()> {
             let conn = connect(&endpoint, addr)
                 .await
                 .with_context(|| format!("connecting to {addr}"))?;
-            eprintln!("connected to {addr} (QUIC, direct; receiver certificate pinned)");
+            eprintln!(
+                "connected to {addr} via {} (direct; receiver certificate pinned)",
+                conn.kind()
+            );
 
             let cas = Arc::new(LocalCas::open(&cas_dir).await?);
             let opts = PushOptions {
@@ -274,7 +278,7 @@ async fn main() -> Result<()> {
                 );
             }
             let result = push(cas, &src, &conn, &opts).await;
-            conn.close(0u32.into(), b"done");
+            conn.close(0, b"done");
             endpoint.wait_idle().await;
             let report = result?;
             print_push_report(&report);

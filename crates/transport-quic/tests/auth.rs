@@ -3,7 +3,9 @@
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
-use transport_quic::quinn::{Connection, Endpoint};
+use tokio::io::AsyncWriteExt;
+use transport::{Conn, Listener};
+use transport_quic::QuicListener as Endpoint;
 use transport_quic::{
     EndpointOptions, Error, GeneratedIdentity, Identity, client_endpoint, connect, generate,
     read_frame, read_payload, server_endpoint, write_frame,
@@ -30,7 +32,7 @@ fn localhost() -> SocketAddr {
 }
 
 struct Setup {
-    server: Endpoint,
+    server: std::sync::Arc<Endpoint>,
     server_id: GeneratedIdentity,
     client_id: GeneratedIdentity,
 }
@@ -38,13 +40,15 @@ struct Setup {
 fn setup() -> Setup {
     let server_id = generate("receiver").unwrap();
     let client_id = generate("sender").unwrap();
-    let server = server_endpoint(
-        localhost(),
-        identity(&server_id),
-        vec![cert(&client_id)],
-        &EndpointOptions::default(),
-    )
-    .unwrap();
+    let server = std::sync::Arc::new(
+        server_endpoint(
+            localhost(),
+            identity(&server_id),
+            vec![cert(&client_id)],
+            &EndpointOptions::default(),
+        )
+        .unwrap(),
+    );
     Setup {
         server,
         server_id,
@@ -56,7 +60,7 @@ async fn dial(
     s: &Setup,
     client: &GeneratedIdentity,
     pinned: &GeneratedIdentity,
-) -> transport_quic::Result<Connection> {
+) -> transport_quic::Result<Conn> {
     let ep = client_endpoint(
         identity(client),
         vec![cert(pinned)],
@@ -67,13 +71,15 @@ async fn dial(
 }
 
 /// Echo one frame back on the first bidirectional stream.
-fn spawn_echo(server: Endpoint) -> tokio::task::JoinHandle<transport_quic::Result<()>> {
+fn spawn_echo(
+    server: std::sync::Arc<Endpoint>,
+) -> tokio::task::JoinHandle<transport_quic::Result<()>> {
     tokio::spawn(async move {
-        let conn = server.accept().await.unwrap().await?;
+        let conn = server.accept().await.unwrap().handshake.await?;
         let (mut send, mut recv) = conn.accept_bi().await?;
         let msg: Ping = read_frame(&mut recv, 1024).await?.unwrap();
         write_frame(&mut send, &msg).await?;
-        send.finish().unwrap();
+        send.shutdown().await.unwrap();
         conn.closed().await;
         Ok(())
     })
@@ -96,7 +102,7 @@ async fn mutual_tls_round_trip() {
         read_frame::<Ping>(&mut recv, 1024).await.unwrap().is_none(),
         "clean EOF"
     );
-    conn.close(0u32.into(), b"done");
+    conn.close(0, b"done");
     server.await.unwrap().unwrap();
 }
 
@@ -106,7 +112,9 @@ async fn client_rejects_unpinned_server() {
     let _server = spawn_echo(s.server.clone());
     let impostor = generate("impostor").unwrap();
     // The client pins a different certificate than the one the server presents.
-    let err = dial(&s, &s.client_id, &impostor).await.unwrap_err();
+    let Err(err) = dial(&s, &s.client_id, &impostor).await else {
+        panic!("connected to an unpinned server")
+    };
     assert!(matches!(err, Error::Connection(_)), "{err:?}");
 }
 
@@ -147,7 +155,7 @@ async fn oversized_frame_rejected() {
     let server = tokio::spawn({
         let server = s.server.clone();
         async move {
-            let conn = server.accept().await.unwrap().await.unwrap();
+            let conn = server.accept().await.unwrap().handshake.await.unwrap();
             let (_send, mut recv) = conn.accept_bi().await.unwrap();
             read_frame::<Ping>(&mut recv, 16).await
         }
@@ -175,7 +183,7 @@ async fn payload_length_enforced() {
     let server = tokio::spawn({
         let server = s.server.clone();
         async move {
-            let conn = server.accept().await.unwrap().await.unwrap();
+            let conn = server.accept().await.unwrap().handshake.await.unwrap();
             let mut results = Vec::new();
             for (len, max) in [(4, 100), (4, 100), (200, 100)] {
                 let mut recv = conn.accept_uni().await.unwrap();
@@ -188,7 +196,7 @@ async fn payload_length_enforced() {
     for payload in [&b"abcd"[..], &b"abcdef"[..], &[0u8; 200][..]] {
         let mut send = conn.open_uni().await.unwrap();
         send.write_all(payload).await.unwrap();
-        send.finish().unwrap();
+        send.shutdown().await.unwrap();
     }
     let results = server.await.unwrap();
     assert_eq!(results[0].as_ref().unwrap(), &4);

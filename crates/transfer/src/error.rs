@@ -6,7 +6,7 @@ pub enum Error {
     Local(#[from] xet_local::Error),
 
     #[error(transparent)]
-    Transport(#[from] transport_quic::Error),
+    Transport(#[from] transport::Error),
 
     #[error("protocol error: {0}")]
     Protocol(String),
@@ -19,14 +19,8 @@ pub enum Error {
     Remote(String),
 }
 
-impl From<transport_quic::quinn::ConnectionError> for Error {
-    fn from(e: transport_quic::quinn::ConnectionError) -> Self {
-        Error::Transport(e.into())
-    }
-}
-
-impl From<transport_quic::quinn::WriteError> for Error {
-    fn from(e: transport_quic::quinn::WriteError) -> Self {
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
         Error::Transport(e.into())
     }
 }

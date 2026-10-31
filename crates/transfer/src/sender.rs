@@ -5,11 +5,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::debug;
-use transport_quic::quinn::{Connection, RecvStream, SendStream};
-use transport_quic::{read_frame, write_frame};
+use transport::{Conn, RecvStream, SendStream, TransportKind};
+use transport::{read_frame, write_frame};
 use xet_local::chunks::{ChunkRun, encode_chunk_lists};
 use xet_local::{IngestReport, LocalCas, Manifest, MerkleHash};
 
@@ -53,9 +54,12 @@ pub struct PushReport {
     pub chunk_runs_sent: usize,
     pub chunk_list_bytes_sent: u64,
     pub receiver: ReceiverReport,
+    /// Bytes the transport sent / received for this connection, all overhead included (UDP
+    /// datagrams for QUIC, TCP payload for TLS-over-TCP).
     pub udp_bytes_sent: u64,
-    /// UDP bytes received from the receiver (requests, ACKs, handshake).
     pub udp_bytes_received: u64,
+    /// The transport actually used.
+    pub transport: TransportKind,
     pub elapsed: Duration,
 }
 
@@ -77,7 +81,7 @@ impl PushReport {
 pub async fn push(
     cas: Arc<LocalCas>,
     src: &Path,
-    conn: &Connection,
+    conn: &Conn,
     opts: &PushOptions,
 ) -> Result<PushReport> {
     let start = Instant::now();
@@ -100,6 +104,7 @@ pub async fn push(
         receiver: ReceiverReport::default(),
         udp_bytes_sent: 0,
         udp_bytes_received: 0,
+        transport: conn.kind(),
         elapsed: Duration::ZERO,
     };
 
@@ -171,10 +176,11 @@ pub async fn push(
         }
     }
 
-    let _ = send.finish();
-    let stats = conn.stats();
-    report.udp_bytes_sent = stats.udp_tx.bytes;
-    report.udp_bytes_received = stats.udp_rx.bytes;
+    let _ = send.shutdown().await;
+    let stats = conn.wire_stats();
+    report.udp_bytes_sent = stats.tx;
+    report.udp_bytes_received = stats.rx;
+    report.transport = conn.kind();
     report.elapsed = start.elapsed();
     Ok(report)
 }
@@ -200,7 +206,7 @@ fn parse_subset(
 
 async fn send_xorbs(
     cas: &Arc<LocalCas>,
-    conn: &Connection,
+    conn: &Conn,
     xorbs: &BTreeSet<MerkleHash>,
     opts: &PushOptions,
     limiter: &Limiter,
@@ -233,7 +239,7 @@ async fn send_xorbs(
 /// stream and memory limits. Returns (bytes, runs).
 async fn send_chunk_runs(
     cas: &Arc<LocalCas>,
-    conn: &Connection,
+    conn: &Conn,
     requests: &[ChunkRequest],
     files: &BTreeSet<MerkleHash>,
     opts: &PushOptions,
@@ -309,7 +315,7 @@ async fn send_chunk_runs(
 type Limiter = Option<Arc<RateLimiter>>;
 
 async fn send_object(
-    conn: &Connection,
+    conn: &Conn,
     limiter: &Limiter,
     kind: ObjectKind,
     hash: Option<MerkleHash>,
@@ -335,7 +341,7 @@ async fn send_object(
             }
         }
     }
-    let _ = stream.finish();
+    let _ = stream.shutdown().await;
     Ok(len)
 }
 

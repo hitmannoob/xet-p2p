@@ -11,6 +11,7 @@ use std::time::Instant;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 use transfer::{PushOptions, PushReport, Receiver, ReceiverOptions, TransferMode, push};
+use transport::Listener as _;
 use transport_quic::{
     EndpointOptions, Identity, client_endpoint, connect, generate, server_endpoint,
 };
@@ -36,7 +37,7 @@ struct Rig {
     addr: std::net::SocketAddr,
     server_id: transport_quic::GeneratedIdentity,
     client_id: transport_quic::GeneratedIdentity,
-    _server: transport_quic::quinn::Endpoint,
+    _server: Arc<transport_quic::QuicListener>,
 }
 
 impl Rig {
@@ -49,13 +50,15 @@ impl Rig {
         let id = |g: &transport_quic::GeneratedIdentity| {
             Identity::from_pem(&g.cert_pem, &g.key_pem).unwrap()
         };
-        let server = server_endpoint(
-            "127.0.0.1:0".parse().unwrap(),
-            id(&server_id),
-            vec![id(&client_id).cert],
-            &EndpointOptions::default(),
-        )
-        .unwrap();
+        let server = Arc::new(
+            server_endpoint(
+                "127.0.0.1:0".parse().unwrap(),
+                id(&server_id),
+                vec![id(&client_id).cert],
+                &EndpointOptions::default(),
+            )
+            .unwrap(),
+        );
         let addr = server.local_addr().unwrap();
         let cas = Arc::new(
             LocalCas::open(tmp.path().join("receiver-cas"))
@@ -63,7 +66,10 @@ impl Rig {
                 .unwrap(),
         );
         let opts = ReceiverOptions::new(&cas);
-        tokio::spawn(Arc::new(Receiver::new(&root, cas, opts).unwrap()).serve(server.clone()));
+        tokio::spawn(
+            Arc::new(Receiver::new(&root, cas, opts).unwrap())
+                .serve(server.clone() as Arc<dyn transport::Listener>),
+        );
         Self {
             tmp,
             addr,
@@ -108,7 +114,7 @@ impl Rig {
             bandwidth_limit: None,
         };
         let r = push(cas.clone(), src, &conn, &opts).await.unwrap();
-        conn.close(0u32.into(), b"done");
+        conn.close(0, b"done");
         // Byte-for-byte check of what landed.
         for (entry, ..) in xet_local::LocalCas::open(self.path("verify-cas"))
             .await

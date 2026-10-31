@@ -7,9 +7,11 @@ use std::sync::Arc;
 
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 use transfer::protocol::{MAX_CONTROL_FRAME, Message, ObjectHeader, ObjectKind, PROTOCOL_VERSION};
 use transfer::{Error, PushOptions, Receiver, ReceiverOptions, TransferMode, push};
-use transport_quic::quinn::{Connection, Endpoint};
+use transport::{Conn as Connection, Listener};
+type Endpoint = Arc<transport_quic::QuicListener>;
 use transport_quic::{
     EndpointOptions, GeneratedIdentity, Identity, client_endpoint, connect, generate, read_frame,
     server_endpoint, write_frame,
@@ -84,13 +86,15 @@ impl Harness {
 
         let server_id = generate("receiver").unwrap();
         let client_id = generate("sender").unwrap();
-        let server = server_endpoint(
-            "127.0.0.1:0".parse().unwrap(),
-            identity(&server_id),
-            vec![identity(&client_id).cert],
-            &EndpointOptions::default(),
-        )
-        .unwrap();
+        let server = Arc::new(
+            server_endpoint(
+                "127.0.0.1:0".parse().unwrap(),
+                identity(&server_id),
+                vec![identity(&client_id).cert],
+                &EndpointOptions::default(),
+            )
+            .unwrap(),
+        );
         let addr = server.local_addr().unwrap();
 
         // The receiver's CAS lives inside its root, as in the brief's example layout.
@@ -101,7 +105,7 @@ impl Harness {
             &transport_quic::fingerprint(&identity(&client_id).cert),
         );
         let receiver = Arc::new(Receiver::new(&root, receiver_cas, opts).unwrap());
-        tokio::spawn(receiver.serve(server.clone()));
+        tokio::spawn(receiver.serve(server.clone() as Arc<dyn transport::Listener>));
 
         let sender_cas = Arc::new(LocalCas::open(tmp.path().join("sender-cas")).await.unwrap());
         Self {
@@ -165,7 +169,7 @@ impl Harness {
         };
         configure(&mut opts);
         let result = push(cas.clone(), &self.src(), &conn, &opts).await;
-        conn.close(0u32.into(), b"done");
+        conn.close(0, b"done");
         result
     }
 }
@@ -367,7 +371,7 @@ where
             m => break m,
         }
     };
-    conn.close(0u32.into(), b"done");
+    conn.close(0, b"done");
     last
 }
 
@@ -384,7 +388,7 @@ async fn send_raw(conn: &Connection, kind: ObjectKind, hash: Option<MerkleHash>,
     .await
     .unwrap();
     s.write_all(bytes).await.unwrap();
-    s.finish().unwrap();
+    s.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -441,7 +445,7 @@ async fn oversized_xorb_header_rejected() {
             len: 1 << 40,
         };
         write_frame(&mut s, &header).await.unwrap();
-        let _ = s.finish();
+        let _ = s.shutdown().await;
     })
     .await;
     assert!(
@@ -528,7 +532,7 @@ async fn interrupted_push(h: &Harness, dest: &str, commit: usize) -> usize {
         ));
     }
     // Simulate the sender dying mid-transfer.
-    conn.close(1u32.into(), b"killed");
+    conn.close(1, b"killed");
     xorbs.len()
 }
 

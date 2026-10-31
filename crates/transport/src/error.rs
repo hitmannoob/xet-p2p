@@ -14,17 +14,9 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(String),
 
-    #[error("connect error: {0}")]
-    Connect(#[from] quinn::ConnectError),
-
+    /// Establishing or keeping the connection failed (handshake, peer rejected, lost).
     #[error("connection error: {0}")]
-    Connection(#[from] quinn::ConnectionError),
-
-    #[error("stream write error: {0}")]
-    Write(#[from] quinn::WriteError),
-
-    #[error("stream read error: {0}")]
-    Read(#[from] quinn::ReadExactError),
+    Connection(String),
 
     #[error("stream error: {0}")]
     Stream(String),

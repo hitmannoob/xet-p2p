@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
-use transport_quic::quinn::{Connection, Endpoint, RecvStream, SendStream};
-use transport_quic::{fingerprint, peer_certificate, read_frame, read_payload, write_frame};
+use transport::{Conn, Listener, RecvStream, SendStream};
+use transport::{fingerprint, read_frame, read_payload, write_frame};
 use xet_local::chunks::{VerifiedChunk, XorbPacker, decode_chunk_lists, parse_chunk_run};
 use xet_local::manifest::validate_rel_path;
 use xet_local::{
@@ -94,12 +95,12 @@ impl Receiver {
     }
 
     /// Accepts connections until the endpoint closes. Per-connection failures are logged.
-    pub async fn serve(self: Arc<Self>, endpoint: Endpoint) {
-        while let Some(incoming) = endpoint.accept().await {
+    pub async fn serve(self: Arc<Self>, listener: Arc<dyn Listener>) {
+        while let Some(incoming) = listener.accept().await {
             let this = self.clone();
             tokio::spawn(async move {
-                let remote = incoming.remote_address();
-                match incoming.await {
+                let remote = incoming.remote;
+                match incoming.handshake.await {
                     Ok(conn) => match this.handle(conn).await {
                         Ok(r) => info!(%remote, ?r, "transfer complete"),
                         Err(e) => warn!(%remote, "transfer failed: {e}"),
@@ -111,7 +112,7 @@ impl Receiver {
     }
 
     /// Runs one transfer on an established, authenticated connection.
-    pub async fn handle(&self, conn: Connection) -> Result<ReceiverReport> {
+    pub async fn handle(&self, conn: Conn) -> Result<ReceiverReport> {
         let (mut send, mut recv) = self
             .stall(&conn, async { Ok(conn.accept_bi().await?) })
             .await?;
@@ -136,17 +137,17 @@ impl Receiver {
                 .await;
             }
         }
-        let _ = send.finish();
+        let _ = send.shutdown().await;
         // Give the sender a moment to read the final frame and close first, then close regardless:
         // its keep-alives would otherwise hold the connection open indefinitely.
         let _ = tokio::time::timeout(CLOSE_GRACE, conn.closed()).await;
-        conn.close(0u32.into(), b"done");
+        conn.close(0, b"done");
         result
     }
 
     async fn run(
         &self,
-        conn: &Connection,
+        conn: &Conn,
         send: &mut SendStream,
         recv: &mut RecvStream,
     ) -> Result<ReceiverReport> {
@@ -238,7 +239,7 @@ impl Receiver {
     /// Whole-xorb mode: the sender's native shard entries and xorbs, as stored.
     async fn fetch_whole_xorbs(
         &self,
-        conn: &Connection,
+        conn: &Conn,
         send: &mut SendStream,
         missing: &MissingContent,
         session: &mut Session<'_>,
@@ -321,7 +322,7 @@ impl Receiver {
     /// xorbs, and register fresh reconstructions for the new files.
     async fn fetch_chunks(
         &self,
-        conn: &Connection,
+        conn: &Conn,
         send: &mut SendStream,
         manifest: &Manifest,
         missing: &MissingContent,
@@ -411,7 +412,7 @@ impl Receiver {
     /// bytes are packed into new xorbs, committed as each fills.
     async fn receive_chunk_runs_unguarded(
         &self,
-        conn: &Connection,
+        conn: &Conn,
         send: &mut SendStream,
         mut outstanding: HashMap<MerkleHash, u64>,
         session: &mut Session<'_>,
@@ -438,7 +439,7 @@ impl Receiver {
                             return Err(Error::Protocol("expected a chunk run".into()));
                         }
                         if header.len > MAX_CHUNK_RUN_BYTES {
-                            return Err(transport_quic::Error::FrameTooLarge { len: header.len, max: MAX_CHUNK_RUN_BYTES }.into());
+                            return Err(transport::Error::FrameTooLarge { len: header.len, max: MAX_CHUNK_RUN_BYTES }.into());
                         }
                         let memory = budget.reserve(header.len).await;
                         let bytes = read_payload(&mut stream, header.len, MAX_CHUNK_RUN_BYTES).await?;
@@ -478,7 +479,7 @@ impl Receiver {
 
     async fn receive_chunk_runs(
         &self,
-        conn: &Connection,
+        conn: &Conn,
         send: &mut SendStream,
         outstanding: HashMap<MerkleHash, u64>,
         session: &mut Session<'_>,
@@ -493,7 +494,7 @@ impl Receiver {
 
     async fn receive_xorbs(
         &self,
-        conn: &Connection,
+        conn: &Conn,
         send: &mut SendStream,
         expected: BTreeSet<MerkleHash>,
         session: &mut Session<'_>,
@@ -510,21 +511,21 @@ impl Receiver {
     /// so only a sender that stops sending trips this.
     async fn stall<T>(
         &self,
-        conn: &Connection,
+        conn: &Conn,
         fut: impl std::future::Future<Output = Result<T>>,
     ) -> Result<T> {
         let timeout = self.opts.stall_timeout;
         let tick = (timeout / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
         let mut interval = tokio::time::interval(tick);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last = conn.stats().frame_rx.stream;
+        let mut last = conn.rx_progress();
         let mut since = tokio::time::Instant::now();
         tokio::pin!(fut);
         loop {
             tokio::select! {
                 r = &mut fut => return r,
                 _ = interval.tick() => {
-                    let now = conn.stats().frame_rx.stream;
+                    let now = conn.rx_progress();
                     if now != last {
                         last = now;
                         since = tokio::time::Instant::now();
@@ -578,11 +579,12 @@ impl Receiver {
     }
 
     /// Enforces the sender's configured destination scopes, if any.
-    fn check_scope(&self, conn: &Connection, dest: &str) -> Result<()> {
+    fn check_scope(&self, conn: &Conn, dest: &str) -> Result<()> {
         if self.opts.client_scopes.is_empty() {
             return Ok(());
         }
-        let cert = peer_certificate(conn)
+        let cert = conn
+            .peer_certificate()
             .ok_or_else(|| Error::Protocol("peer presented no certificate".into()))?;
         let fp = fingerprint(&cert);
         let scopes = self
@@ -602,12 +604,7 @@ impl Receiver {
     }
 
     /// Receives one object of `kind` (without a hash) of at most `max` bytes.
-    async fn receive_single(
-        &self,
-        conn: &Connection,
-        kind: ObjectKind,
-        max: u64,
-    ) -> Result<Vec<u8>> {
+    async fn receive_single(&self, conn: &Conn, kind: ObjectKind, max: u64) -> Result<Vec<u8>> {
         self.stall(conn, async {
             let mut stream = conn.accept_uni().await?;
             let header = read_header(&mut stream).await?;
@@ -622,7 +619,7 @@ impl Receiver {
     /// Receives exactly the requested xorbs, verifying and committing each, and ACKs each one.
     async fn receive_xorbs_unguarded(
         &self,
-        conn: &Connection,
+        conn: &Conn,
         send: &mut SendStream,
         expected: BTreeSet<MerkleHash>,
         session: &mut Session<'_>,
@@ -655,7 +652,7 @@ impl Receiver {
                             return Err(Error::Protocol(format!("unrequested or duplicate xorb {}", hash.hex())));
                         }
                         if header.len > MAX_XORB_BYTES {
-                            return Err(transport_quic::Error::FrameTooLarge { len: header.len, max: MAX_XORB_BYTES }.into());
+                            return Err(transport::Error::FrameTooLarge { len: header.len, max: MAX_XORB_BYTES }.into());
                         }
                         let _memory = budget.reserve(header.len).await;
                         let bytes = read_payload(&mut stream, header.len, MAX_XORB_BYTES).await?;
