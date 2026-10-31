@@ -6,6 +6,7 @@ members = [
     "crates/transport-quic",
     "crates/transport-tcp",
     "crates/transfer",
+    "crates/providers",
     "crates/cli",
 ]
 

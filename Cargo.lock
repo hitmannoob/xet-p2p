@@ -1647,6 +1647,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "providers"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "transport",
+ "transport-quic",
+ "transport-tcp",
+]
+
+[[package]]
 name = "quinn"
 version = "0.11.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3429,6 +3447,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "providers",
  "rand 0.9.5",
  "serde",
  "serde_json",

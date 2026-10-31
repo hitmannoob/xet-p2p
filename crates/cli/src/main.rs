@@ -9,8 +9,7 @@ use transfer::{
 };
 use transport::Listener as _;
 use transport_quic::{
-    EndpointOptions, Identity, bind_addr_for, client_endpoint, connect, fingerprint, generate,
-    load_cert, server_endpoint,
+    EndpointOptions, Identity, fingerprint, generate, load_cert, server_endpoint,
 };
 use xet_local::{LocalCas, Manifest};
 
@@ -43,6 +42,12 @@ enum Command {
         /// Also accept the TLS-over-TCP transport on this address (for paths without UDP).
         #[arg(long)]
         listen_tcp: Option<SocketAddr>,
+        /// Do not listen for QUIC (only with --listen-tcp).
+        #[arg(long, requires = "listen_tcp")]
+        no_quic: bool,
+        /// Once listening, write {"quic": ADDR|null, "tcp": ADDR|null} here (agent bootstrap).
+        #[arg(long, hide = true)]
+        ready_file: Option<PathBuf>,
         /// Directory every destination is confined to.
         #[arg(long)]
         root: PathBuf,
@@ -74,34 +79,29 @@ enum Command {
         #[arg(long, hide = true)]
         test_commit_delay_ms: Option<u64>,
     },
-    /// Push a file or directory to a receiver.
+    /// Push a file or directory to a target.
+    ///
+    /// TARGET is `quic://HOST:PORT/DEST` or `tcp://HOST:PORT/DEST` for a running `serve` (with
+    /// --cert/--key/--peer-cert), or `PROVIDER://SANDBOX_ID/abs/path` for an existing sandbox
+    /// (credentials are generated per session). `--to HOST:PORT --dest DEST` is shorthand for
+    /// `quic://HOST:PORT/DEST`.
     Push {
         src: PathBuf,
-        /// Receiver address, host:port.
-        #[arg(long)]
-        to: String,
-        /// Destination directory, relative to the receiver's --root.
-        #[arg(long)]
-        dest: String,
-        /// Sender's embedded CAS directory.
-        #[arg(long)]
-        cas_dir: PathBuf,
-        /// This sender's certificate (must be in the receiver's --allow-client list).
-        #[arg(long)]
-        cert: PathBuf,
-        #[arg(long)]
-        key: PathBuf,
-        /// The receiver's certificate, pinned: the connection fails if it presents any other.
-        #[arg(long)]
-        peer_cert: PathBuf,
+        target: Option<String>,
+        #[arg(long, conflicts_with = "target", requires = "dest")]
+        to: Option<String>,
+        #[arg(long, requires = "to")]
+        dest: Option<String>,
+        #[command(flatten)]
+        conn: ConnArgs,
         /// Xorbs in flight at once.
         #[arg(long, default_value_t = 4)]
         parallel: u32,
         /// Cap on xorb bytes held in memory, in MiB (one xorb always fits).
         #[arg(long, default_value_t = 256)]
         max_memory_mib: u64,
-        /// Mirror: delete files and directories under --dest that are not in SRC. Runs only after
-        /// every new file has been verified; never touches anything outside --dest.
+        /// Mirror: delete files and directories under the destination that are not in SRC. Runs
+        /// only after every new file has been verified; never touches anything outside it.
         #[arg(long)]
         delete: bool,
         /// Cap on payload throughput, in MiB/s (all streams together).
@@ -110,44 +110,29 @@ enum Command {
         /// Transfer mode: "chunk" (only missing chunks, default) or "xorb" (whole xorbs).
         #[arg(long, default_value = "chunk", value_parser = ["chunk", "xorb"])]
         mode: String,
-        /// Wire transport: "quic" (UDP, default) or "tcp" (TLS over TCP; not QUIC).
-        #[arg(long, default_value = "quic", value_parser = ["quic", "tcp"])]
-        transport: String,
         /// Print the transfer report as JSON on stdout.
         #[arg(long)]
         json: bool,
     },
-    /// Pull a file or directory from a server into a local directory.
+    /// Pull a file or directory from a target into a local directory.
+    ///
+    /// SOURCE takes the same forms as push's TARGET.
     Pull {
-        /// Local destination directory.
+        source: String,
         dest: PathBuf,
-        /// Server address, host:port.
-        #[arg(long)]
-        from: String,
-        /// Source path, relative to the server's --root.
-        #[arg(long)]
-        src: String,
-        /// Local CAS directory.
-        #[arg(long)]
-        cas_dir: PathBuf,
-        /// This client's certificate (must be in the server's --allow-client list).
-        #[arg(long)]
-        cert: PathBuf,
-        #[arg(long)]
-        key: PathBuf,
-        /// The server's certificate, pinned.
-        #[arg(long)]
-        peer_cert: PathBuf,
+        #[command(flatten)]
+        conn: ConnArgs,
         /// Mirror: delete local files under DEST that the source does not contain.
         #[arg(long)]
         delete: bool,
         #[arg(long, default_value = "chunk", value_parser = ["chunk", "xorb"])]
         mode: String,
-        #[arg(long, default_value = "quic", value_parser = ["quic", "tcp"])]
-        transport: String,
         #[arg(long)]
         json: bool,
     },
+    /// Inspect a provider target: capabilities, agent startup, and which transports really work.
+    /// Starts and stops a temporary agent; transfers no data.
+    Doctor { target: String },
     /// Reclaim CAS space: delete unreferenced xorbs past a grace period and, with a size cap,
     /// evict least recently used content (re-fetched from a peer when next needed). Requires that
     /// no serve/push is using the CAS.
@@ -170,6 +155,25 @@ enum Command {
     /// Offline operations against a local CAS (no network).
     #[command(subcommand)]
     Local(LocalCommand),
+}
+
+/// How to reach a target.
+#[derive(clap::Args)]
+struct ConnArgs {
+    /// Local CAS directory (default: ~/.cache/xet-p2p/cas).
+    #[arg(long)]
+    cas_dir: Option<PathBuf>,
+    /// "auto" (QUIC, else TLS over TCP; default), "quic" (fail rather than fall back), or "tcp".
+    #[arg(long, default_value = "auto", value_parser = ["auto", "quic", "tcp"])]
+    transport: String,
+    /// Direct targets: this machine's certificate (in the server's --allow-client list).
+    #[arg(long, requires_all = ["key", "peer_cert"])]
+    cert: Option<PathBuf>,
+    #[arg(long)]
+    key: Option<PathBuf>,
+    /// Direct targets: the server's certificate, pinned.
+    #[arg(long)]
+    peer_cert: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -207,6 +211,8 @@ async fn main() -> Result<()> {
         Command::Serve {
             listen,
             listen_tcp,
+            no_quic,
+            ready_file,
             root,
             cas_dir,
             cert,
@@ -241,8 +247,16 @@ async fn main() -> Result<()> {
                 max_data_streams: parallel,
                 ..Default::default()
             };
-            let endpoint =
-                server_endpoint(listen, Identity::load(&cert, &key)?, allowed.clone(), &opts)?;
+            let quic = if no_quic {
+                None
+            } else {
+                Some(server_endpoint(
+                    listen,
+                    Identity::load(&cert, &key)?,
+                    allowed.clone(),
+                    &opts,
+                )?)
+            };
             let tcp = match listen_tcp {
                 Some(addr) => Some(
                     transport_tcp::tcp_listen(addr, Identity::load(&cert, &key)?, allowed).await?,
@@ -260,72 +274,76 @@ async fn main() -> Result<()> {
             ropts.client_scopes = scopes;
             ropts.stall_timeout = std::time::Duration::from_secs(stall_timeout_secs.max(1));
             let receiver = Arc::new(Receiver::new(&root, cas, ropts)?);
-            eprintln!(
-                "listening on {} (QUIC), root {}",
-                endpoint.local_addr()?,
-                root.display()
-            );
-            let quic = receiver.clone().serve(Arc::new(endpoint));
-            match tcp {
-                Some(tcp) => {
-                    eprintln!("listening on {} (TLS over TCP)", tcp.local_addr()?);
-                    tokio::join!(quic, receiver.serve(Arc::new(tcp)));
-                }
-                None => quic.await,
+
+            let quic_addr = quic.as_ref().map(|q| q.local_addr()).transpose()?;
+            let tcp_addr = tcp.as_ref().map(|t| t.local_addr()).transpose()?;
+            if let Some(a) = quic_addr {
+                eprintln!("listening on {a} (QUIC), root {}", root.display());
             }
+            if let Some(a) = tcp_addr {
+                eprintln!("listening on {a} (TLS over TCP), root {}", root.display());
+            }
+            if let Some(path) = ready_file {
+                let json = serde_json::json!({
+                    "quic": quic_addr.map(|a| a.to_string()),
+                    "tcp": tcp_addr.map(|a| a.to_string()),
+                });
+                let tmp = path.with_extension("tmp");
+                std::fs::write(&tmp, serde_json::to_vec(&json)?)?;
+                std::fs::rename(&tmp, &path)?;
+            }
+            let serve_quic = async {
+                if let Some(q) = quic {
+                    receiver.clone().serve(Arc::new(q)).await;
+                }
+            };
+            let serve_tcp = async {
+                if let Some(t) = tcp {
+                    receiver.clone().serve(Arc::new(t)).await;
+                }
+            };
+            tokio::join!(serve_quic, serve_tcp);
             Ok(())
         }
         Command::Push {
             src,
+            target,
             to,
             dest,
-            cas_dir,
-            cert,
-            key,
-            peer_cert,
+            conn,
             parallel,
             max_memory_mib,
             delete,
             bwlimit_mib,
             mode,
-            transport,
             json,
         } => {
-            let (conn, endpoint) = dial(
-                &transport,
-                &to,
-                Identity::load(&cert, &key)?,
-                load_cert(&peer_cert)?,
-            )
-            .await?;
-
-            let cas = Arc::new(LocalCas::open(&cas_dir).await?);
+            let target = match (target, to, dest) {
+                (Some(t), _, _) => t,
+                (None, Some(to), Some(dest)) => format!("quic://{to}/{dest}"),
+                _ => bail!("give a TARGET (or --to HOST:PORT --dest DEST)"),
+            };
+            let remote = open_target(&target, &conn).await?;
+            let cas = Arc::new(LocalCas::open(cas_dir(&conn)?).await?);
             let opts = PushOptions {
-                dest,
+                dest: remote.path.clone(),
                 parallel_streams: parallel as usize,
                 max_memory_bytes: max_memory_mib.saturating_mul(1024 * 1024),
                 delete,
-                mode: if mode == "xorb" {
-                    TransferMode::Xorb
-                } else {
-                    TransferMode::Chunk
-                },
+                mode: parse_mode(&mode),
                 bandwidth_limit: bwlimit_mib
                     .filter(|m| *m > 0.0)
                     .map(|m| m * 1024.0 * 1024.0),
             };
             if delete {
                 eprintln!(
-                    "--delete: anything under the receiver's {} not in {} will be removed",
-                    opts.dest,
+                    "--delete: anything under {} not in {} will be removed",
+                    target,
                     src.display()
                 );
             }
-            let result = push(cas, &src, &conn, &opts).await;
-            conn.close(0, b"done");
-            if let Some(ep) = endpoint {
-                ep.wait_idle().await;
-            }
+            let result = push(cas, &src, &remote.conn, &opts).await;
+            remote.finish().await?;
             let report = result?;
             print_push_report(&report);
             if json {
@@ -334,38 +352,20 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Pull {
+            source,
             dest,
-            from,
-            src,
-            cas_dir,
-            cert,
-            key,
-            peer_cert,
+            conn,
             delete,
             mode,
-            transport,
             json,
         } => {
-            let (conn, endpoint) = dial(
-                &transport,
-                &from,
-                Identity::load(&cert, &key)?,
-                load_cert(&peer_cert)?,
-            )
-            .await?;
-            let cas = Arc::new(LocalCas::open(&cas_dir).await?);
-            let mut opts = PullOptions::new(src);
+            let remote = open_target(&source, &conn).await?;
+            let cas = Arc::new(LocalCas::open(cas_dir(&conn)?).await?);
+            let mut opts = PullOptions::new(remote.path.clone());
             opts.delete = delete;
-            opts.mode = if mode == "xorb" {
-                TransferMode::Xorb
-            } else {
-                TransferMode::Chunk
-            };
-            let result = pull(cas, &conn, &dest, &opts).await;
-            conn.close(0, b"done");
-            if let Some(ep) = endpoint {
-                ep.wait_idle().await;
-            }
+            opts.mode = parse_mode(&mode);
+            let result = pull(cas, &remote.conn, &dest, &opts).await;
+            remote.finish().await?;
             let r = result?;
             print_pull_report(&r);
             if json {
@@ -382,6 +382,12 @@ async fn main() -> Result<()> {
                     }))?
                 );
             }
+            Ok(())
+        }
+        Command::Doctor { target } => {
+            let target = providers::Target::parse(&target)?;
+            let r = providers::doctor(&registry()?, &target).await?;
+            print_doctor(&r);
             Ok(())
         }
         Command::Gc {
@@ -493,44 +499,104 @@ fn parse_allow_client(spec: &str) -> Result<(PathBuf, PathBuf)> {
     Ok((cert.into(), scope))
 }
 
-/// Connects to `to` over the chosen transport with pinned mutual TLS. Returns the QUIC endpoint
-/// too, so the caller can wait for the connection to close cleanly.
-async fn dial(
-    transport: &str,
-    to: &str,
-    identity: Identity,
-    pinned: transport::rustls::pki_types::CertificateDer<'static>,
-) -> Result<(transport::Conn, Option<transport_quic::QuicClient>)> {
-    let addr = tokio::net::lookup_host(to)
-        .await
-        .with_context(|| format!("resolving {to}"))?
-        .next()
-        .with_context(|| format!("{to} resolved to no addresses"))?;
-    let (conn, ep) = match transport {
-        "tcp" => (
-            transport_tcp::tcp_connect(addr, identity, vec![pinned])
-                .await
-                .with_context(|| format!("connecting to {addr} (TLS over TCP)"))?,
-            None,
+fn registry() -> Result<providers::Registry> {
+    Ok(providers::Registry::new(vec![Box::new(
+        providers::local::LocalProvider::new(
+            providers::local::LocalProvider::default_base(),
+            std::env::current_exe()?,
         ),
-        _ => {
-            let ep = client_endpoint(
-                identity,
-                vec![pinned],
-                &EndpointOptions::default(),
-                bind_addr_for(addr),
-            )?;
-            let conn = connect(&ep, addr)
-                .await
-                .with_context(|| format!("connecting to {addr} (QUIC)"))?;
-            (conn, Some(ep))
+    )]))
+}
+
+fn cas_dir(conn: &ConnArgs) -> Result<PathBuf> {
+    match &conn.cas_dir {
+        Some(d) => Ok(d.clone()),
+        None => {
+            let home = std::env::var_os("HOME").context("HOME is not set; pass --cas-dir")?;
+            Ok(PathBuf::from(home).join(".cache/xet-p2p/cas"))
         }
+    }
+}
+
+fn parse_mode(mode: &str) -> TransferMode {
+    if mode == "xorb" {
+        TransferMode::Xorb
+    } else {
+        TransferMode::Chunk
+    }
+}
+
+/// Parses `target`, connects under the --transport policy, and reports what was chosen.
+async fn open_target(target: &str, args: &ConnArgs) -> Result<providers::Connected> {
+    let parsed = providers::Target::parse(target)?;
+    let policy: providers::TransportPolicy = args.transport.parse()?;
+    let direct = match (&args.cert, &args.key, &args.peer_cert) {
+        (Some(c), Some(k), Some(p)) => Some(providers::DirectCredentials {
+            identity: Identity::load(c, k)?,
+            pinned_server: load_cert(p)?,
+        }),
+        _ => None,
     };
+    let remote = providers::connect_target(&registry()?, &parsed, policy, direct).await?;
     eprintln!(
-        "connected to {addr} via {} (peer certificate pinned)",
-        conn.kind()
+        "connected to {} via {}{} (peer certificate pinned)",
+        target,
+        remote.transport,
+        if remote.relayed {
+            ", relayed by the provider"
+        } else {
+            ""
+        }
     );
-    Ok((conn, ep))
+    for note in &remote.notes {
+        eprintln!("  note: {note}");
+    }
+    Ok(remote)
+}
+
+fn print_doctor(r: &providers::DoctorReport) {
+    eprintln!("provider:   {}", r.provider);
+    eprintln!("sandbox:    {}", r.sandbox);
+    match &r.capabilities {
+        Some(c) => {
+            eprintln!("platform:   {} / {}", c.os, c.arch);
+            eprintln!("workspace:  {}", c.workspace_root);
+            eprintln!(
+                "storage:    {}",
+                if c.persistent_storage {
+                    "persistent (CAS survives the sandbox)"
+                } else {
+                    "ephemeral (CAS is lost with the sandbox)"
+                }
+            );
+            for n in &c.notes {
+                eprintln!("note:       {n}");
+            }
+        }
+        None => eprintln!("platform:   unknown"),
+    }
+    match &r.agent {
+        Ok(()) => eprintln!("agent:      started and stopped"),
+        Err(e) => eprintln!("agent:      FAILED: {e}"),
+    }
+    for (name, p) in [("QUIC (UDP)", &r.quic), ("TLS over TCP", &r.tcp)] {
+        match p {
+            providers::Probe::Ok(d) => eprintln!("{name:<13} ok      {d}"),
+            providers::Probe::Failed(e) => eprintln!("{name:<13} FAILED  {e}"),
+            providers::Probe::NotOffered(why) => eprintln!("{name:<13} n/a     {why}"),
+        }
+    }
+    match r.auto_choice {
+        Some(k) => eprintln!(
+            "auto picks: {k}{}",
+            if r.relayed {
+                " (relayed by the provider)"
+            } else {
+                ""
+            }
+        ),
+        None => eprintln!("auto picks: nothing works; see the failures above"),
+    }
 }
 
 fn print_pull_report(r: &transfer::PullReport) {
