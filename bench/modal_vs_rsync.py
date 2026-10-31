@@ -231,6 +231,19 @@ def baseline(sb, ip, port):
         time.sleep(0.5)
 
 
+def with_retries(fn, what, attempts=3):
+    """Network paths drop connections now and then. Retry a failed run (after a pause) instead of
+    aborting the whole benchmark; how many retries each result needed is recorded."""
+    for i in range(attempts):
+        try:
+            return fn(), i
+        except Exception as e:
+            if i + 1 == attempts:
+                raise
+            print(f"  retrying {what} after: {str(e)[:160]}", flush=True)
+            time.sleep(10)
+
+
 # ---------- report ----------
 
 def fmt_bytes(b):
@@ -339,10 +352,13 @@ def main():
                         cas = os.path.join(work, f"cas-{tag}")
                         run = lambda: run_xet(xet, src, target, cas, keep)
                         remote = f"{root.split(sb.object_id)[1]}/{tag}"
+                    retries = 0
                     if edit:
-                        run()
+                        _, r0 = with_retries(run, f"{tool} {name} (setup sync)")
+                        retries += r0
                         edit(src, seed)
-                    m = run()
+                    m, r1 = with_retries(run, f"{tool} {name}")
+                    m["retries"] = retries + r1
                     assert remote_digests(sb, remote) == digest_tree(src), f"{tool} {name} rep {rep}: tree differs"
                     m.update({"tool": tool, "scenario": name, "rep": rep})
                     runs.append(m)
@@ -350,8 +366,8 @@ def main():
                           f"(transfer {m['transfer']:.1f}s, bootstrap {m['bootstrap']:.1f}s)", flush=True)
                     shutil.rmtree(src)
                     shutil.rmtree(os.path.join(work, f"cas-{tag}"), ignore_errors=True)
-            os.makedirs(os.path.dirname(os.path.abspath(args.raw)), exist_ok=True)
-            json.dump({"meta": meta, "runs": runs}, open(args.raw, "w"), indent=1)
+                    os.makedirs(os.path.dirname(os.path.abspath(args.raw)), exist_ok=True)
+                    json.dump({"meta": meta, "runs": runs}, open(args.raw, "w"), indent=1)
             report(meta, runs, args.out)
     finally:
         if sb is not None:
