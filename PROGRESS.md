@@ -164,7 +164,7 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
     itself (≈0.055% of file size). Not worth a second fetch path.
   - *Streaming xorb I/O*: memory is already bounded by the byte budget; true streaming means
     writing xorbs ourselves instead of through upstream `upload_xorb`. Deferred.
-- Tests: 97 (stall + slow-but-steady sender, bandwidth limiter unit, 4 GC/locking, manifest
+- Tests: 96 (stall + slow-but-steady sender, bandwidth limiter unit, 4 GC/locking, manifest
   encoding round trip). Note: the suite needs ~2–3 GiB of temp space; on a full disk use
   `-- --test-threads=4`.
 
