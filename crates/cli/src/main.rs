@@ -500,12 +500,15 @@ fn parse_allow_client(spec: &str) -> Result<(PathBuf, PathBuf)> {
 }
 
 fn registry() -> Result<providers::Registry> {
-    Ok(providers::Registry::new(vec![Box::new(
-        providers::local::LocalProvider::new(
+    let mut list: Vec<Box<dyn providers::SandboxProvider>> =
+        vec![Box::new(providers::local::LocalProvider::new(
             providers::local::LocalProvider::default_base(),
             std::env::current_exe()?,
-        ),
-    )]))
+        ))];
+    if let Some(modal) = providers::modal::ModalProvider::from_env() {
+        list.push(Box::new(modal));
+    }
+    Ok(providers::Registry::new(list))
 }
 
 fn cas_dir(conn: &ConnArgs) -> Result<PathBuf> {

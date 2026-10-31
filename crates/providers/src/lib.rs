@@ -6,6 +6,7 @@
 
 mod error;
 pub mod local;
+pub mod modal;
 pub mod provider;
 mod session;
 pub mod uri;
