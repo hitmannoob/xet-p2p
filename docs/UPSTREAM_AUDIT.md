@@ -28,6 +28,11 @@ natively via a `local://` endpoint. No upstream code needs to be forked or reimp
 | Xorb verification | `xet_core_structures::xorb_object::XorbObject::validate_xorb_object(reader, &hash)` | Re-hashes every chunk and the xorb; returns `Ok(None)` on mismatch/malformed. |
 | Shard ingest | `Client::upload_shard(bytes, ..)` | Parses with `MDBMinimalShard::from_reader`, re-serializes, stores under its own hash, updates redb file→shard and chunk→shard tables. |
 | `has_chunk` / `locate_chunk` | `Client::query_for_global_dedup_shard(prefix, &chunk_hash)` + `ShardFileManager` | Needed for M3; not required for M1. |
+| Chunk list of a file | `XorbObject::chunk_hash_sizes(start, end)` over the file's segments; `merklehash::file_hash(&[(hash, size)])` to verify | Used for chunk mode (M3). |
+| Native chunk byte ranges | `XorbObject::get_byte_offset(start, end)` + `get_xorb_raw_bytes(hash, Some(FileRange))` | Exact native serialized chunks, unchanged on the wire. |
+| Chunk parsing / verification | `xorb_object::parse_chunk_header`, `CompressionScheme::decompress_from_slice`, `merklehash::compute_data_hash` | Sizes bounded by `constants::MAX_CHUNK_SIZE` before decompression. |
+| Repacking into a native xorb | `xorb_object::reconstruct_xorb_with_footer(&mut out, &native_chunks)` | Builds footer + xorb hash from already-compressed chunks; no recompression. |
+| Building a reconstruction | `FileDataSequenceHeader/Entry`, `FileVerificationEntry::new(chunk_verification::range_hash_from_chunks(..))`, `FileMetadataExt::new(Sha256)`, `MDBInMemoryShard` | Receiver writes native entries against its own xorbs. |
 | Reconstruction | `FileDownloadSession::from_client(ctx, client, None)` → `download_file(&XetFileInfo, path)` / `download_to_writer` | Reads only from the local CAS. |
 
 ## Divergences / adapters required
@@ -56,5 +61,8 @@ natively via a `local://` endpoint. No upstream code needs to be forked or reimp
    parallel; two new files in the same batch do not dedup against each other (each stores its own copy of
    shared chunks). Later ingests do dedup against everything already stored. Acceptable for M0–M2; note
    for M3 wire-byte measurements.
+
+8. **No full chunk index upstream.** `LocalClient` indexes only global-dedup-eligible chunks. M3 adds
+   its own redb index (chunk → xorb, index) alongside upstream's state; same redb version (=3.1.3).
 
 None of these require a custom chunk, xorb, or shard format.

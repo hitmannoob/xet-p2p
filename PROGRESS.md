@@ -9,7 +9,7 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
 | M0 — Upstream audit + offline Xet round trip | **Done** (exit gate met) |
 | M1 — Direct QUIC push, full-xorb transport | **Done** (exit gate met) |
 | M2 — Incremental transfer + durable resume | **Done** (exit gate met) |
-| M3 — Chunk-level transfer optimization | Not started |
+| M3 — Chunk-level transfer optimization | **Done** (exit gate met; [benchmark](docs/BENCHMARK_M3.md)) |
 | M4 — Performance and reliability | Not started |
 | M5 — Provider-agnostic sandbox integration | Not started |
 
@@ -101,33 +101,44 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
     mid-transfer (hidden `--test-commit-delay-ms` makes timing deterministic), restarts it, and
     verifies the resumed push re-sends no committed xorb and no shard.
 
-## Next: M3 — chunk-level transfer
 
-1. Receiver resolves needed chunks per xorb range, not whole xorbs: skip chunks it already holds in
-   *other* xorbs (cross-xorb dedup), using the global-dedup chunk index.
-2. Choose between partial-range caching (with explicit completeness metadata) and repacking missing
-   chunks into new native xorbs with rewritten reconstruction terms; measure both.
-3. Benchmark wire bytes vs whole-xorb transfer on overlapping edits (insertions at start/middle,
-   checkpoint-like binaries). Report exact conditions.
+### 2026-10-31 — M3
 
-### 2026-10-31 — closing the recorded gaps
+- Strategy chosen: **receiver-side repacking** (not partial-range caching). Rationale: partial xorbs
+  are not valid content-addressed objects; repacking keeps every stored object a complete native
+  xorb and every reconstruction a native, verifiable shard entry, with no completeness metadata.
+- Chunk index (`xet-local`, redb `chunk_index.redb`): chunk hash → (xorb, index) for every xorb;
+  maintained on commit, reconciled at open and after ingest. Upstream's own index covers only
+  global-dedup-eligible chunks (~1/1024), so it cannot answer "do I hold this chunk?".
+- Chunk exchange: chunk lists (36 B/chunk, verified by recomputing the file hash), sender serves
+  requested ranges as native chunk bytes straight from its xorbs (`get_byte_offset` + raw read),
+  receiver decompresses + hashes each chunk (bounded by `MAX_CHUNK_SIZE` before decompression),
+  concatenates native bytes into new xorbs with upstream `reconstruct_xorb_with_footer` (no
+  recompression), commits every 16 MiB, and writes fresh native reconstructions (segments +
+  verification range hashes + SHA-256 ext) that pass `commit_shard`'s full verification.
+- Protocol v2 (ALPN `xet-p2p/2`): `HELLO.mode` (chunk default, `--mode xorb` retained),
+  `NEED_CHUNK_LISTS`, `NEED_CHUNKS`, objects `CHUNK_LISTS`, `CHUNK_RUN`. Files whose stored
+  reconstruction lost a xorb are re-described and re-registered in chunk mode.
+- Resume in chunk mode: chunk lists pooled per file (`pending/<hash>.chunks`), packed xorbs are
+  durable and indexed, so a retry requests only chunks not yet packed.
+- Tests: 8 in-process chunk tests (cold, multi-xorb repack, shared-xorb single file, content in
+  different xorbs + edit from a fresh sender, repeated chunks once, forged chunk list, tampered
+  chunk bytes, index persistence); 6 chunk-mode QUIC tests (cold tree, zero-payload repeat,
+  90 MiB repack, shared-xorb cold receiver, cross-sender reuse vs xorb mode, interrupted push
+  resumes); crash test now exercises chunk mode. Workspace: 88 tests.
+- **Exit gate (benchmark, [docs/BENCHMARK_M3.md](docs/BENCHMARK_M3.md))**: warm-receiver edits of a
+  64 MiB file move 0.05–0.17 MiB (0.08–0.27% of a naive upload). Chunk mode beats whole-xorb by
+  64× when content sits in shared or foreign xorbs (1.00 vs 64.05 MiB; 0.17 vs 64.05 MiB). For
+  same-sender edits whole-xorb is already near-optimal and chunk mode costs +0.03 MiB of chunk
+  lists. Conditions: Apple M4, localhost UDP (no latency/loss), incompressible data, release.
 
-Every gap recorded after M2 was addressed (6 commits after `7eb64fe`):
+## Next: M4 — performance and reliability
 
-| Gap | Resolution |
-|---|---|
-| Upstream does not fsync xorb/shard commits | `commit_xorb`/`commit_shard` fsync file + directory after upstream's rename (paths follow the pinned `LocalClient` layout; a mismatch fails the commit). Installed files are fsynced before rename, their directories after. |
-| Edit during ingest undetected (beyond size) | Each file is re-stat'ed after reading; a size or mtime change rejects it ("file changed during ingest; retry"). Racing-writer test. |
-| Upstream assert on inconsistent `MDBFileInfo` | `check_consistent` validates every parsed shard entry (segment/verification counts, ext flag) before use; unit-tested. |
-| Each xorb fully in memory × `--parallel` | Byte budget on both sides (`--max-memory-mib`, default 256), independent of `--parallel`; receiver budget spans all transfers; budgets below one xorb clamp to one at a time (tested at 1 byte, 90 MiB push). Whole-object buffering itself remains (upstream `upload_xorb` takes a `Vec`); streaming is M4. |
-| Resume requires an identical manifest | Received shard entries are pooled per file hash (`sessions/pending/<hash>.shard`), so an edited source re-requests metadata only for new/changed files; xorbs were already reused. |
-| Any sender may write anywhere under `--root` | `--allow-client CERT=SCOPE` confines a sender (by certificate fingerprint) to `<root>/SCOPE`, component-wise; repeatable; senders without an entry are refused once scopes exist. |
-| No mirroring | Opt-in `push --delete`: prunes what the manifest does not describe (incl. type conflicts) only after every file verifies; symlinks removed, never followed; never outside `--dest`. |
-| Session dir could overlap a destination | Destinations are now rejected if they overlap the session directory, as for the CAS. |
-
-Tests: workspace total now 74 (5 transport, 4+10+28 xet-local, 2+24 transfer, 1 CLI crash test).
-CLI smoke: scoped sender in-scope push OK, out-of-scope refused; `--delete` removed exactly the
-deleted file and its directory, left the unchanged file untouched.
+1. Benchmark vs `rsync` over SSH and a plain copy, with latency/loss shaping and compressible data.
+2. Hybrid mode: request whole sender xorbs when every chunk in them is needed (saves chunk-list
+   bytes for same-sender edits), chunk ranges otherwise.
+3. Streaming xorb I/O (own file reads/writes) to drop whole-object buffering; bandwidth limits.
+4. CAS garbage collection (xorbs, index entries, stale pending state); `xet-p2p gc`.
 
 ## Known gaps / risks
 
@@ -140,6 +151,13 @@ deleted file and its directory, left the unchanged file untouched.
   corrupt its own CAS; the receiver rejects any bad xorb, so the result is a failed push, never
   corrupt data on the receiver. Recovery: delete the sender's `--cas-dir`.
 - Ingest change detection relies on mtime/size; an edit that restores both exactly is not seen.
+- Chunk mode sends a chunk list (36 B/chunk) for every new file before knowing what is missing;
+  for same-sender edits this is slightly more than whole-xorb (+0.03 MiB per 64 MiB file).
+- The receiver's repacked xorbs differ from the sender's; content identity is per chunk and per
+  file hash, so this is invisible to reconstruction, but receiver-side dedup ratios depend on
+  arrival order of chunks within a pack.
+- A sender that stops sending while keeping the connection alive stalls its transfer (and holds
+  its destination lock) until it disconnects; no per-transfer inactivity timeout yet.
 - No `transport` trait yet: `transfer` uses Quinn types directly. Abstract when M5 adds a fallback.
 - `LocalClient` lives in upstream's `simulation` module — no stability promise; pinned `=1.8.0` and
   wrapped behind `xet-local`, with durability paths coupled to its on-disk layout.

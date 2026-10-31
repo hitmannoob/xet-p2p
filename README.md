@@ -10,15 +10,19 @@ Xet (chunks + xorbs + shards + local CAS)  ↔  QUIC (pinned mutual TLS)  ↔  X
   [`xet-core`](https://github.com/huggingface/xet-core) (pinned `=1.8.0`). No custom formats.
 - Each peer keeps an **embedded, on-disk CAS**. There is no CAS server, no cloud storage, no Hugging
   Face account. The receiver runs a QUIC listener that is part of this tool, not a CAS API.
-- Only content the receiver lacks is sent. A repeat push of unchanged files sends zero payload bytes
+- Only content the receiver lacks is sent — at **chunk** granularity: chunks the receiver already
+  holds in any xorb (from any sender) are never re-sent, and received chunks are repacked into
+  native xorbs on the receiver ([benchmark](docs/BENCHMARK_M3.md)). `--mode xorb` sends whole
+  sender xorbs instead.
+- A repeat push of unchanged files sends zero payload bytes
   and leaves the destination files untouched.
 - Interrupted pushes resume: re-run the same command and only what is still missing is sent, even if
   the receiver process was killed.
 - Every received object is verified before it is stored; every file is verified (size + SHA-256)
   before it is installed, and installation is atomic per file. A failed transfer installs nothing.
 
-Status: **M0–M2 complete, post-M2 gaps closed** (offline round trip; authenticated QUIC push with whole-xorb
-transfer; incremental install, durable resume, concurrent pushes). See [PROGRESS.md](PROGRESS.md) for details and what is next, and
+Status: **M0–M3 complete** (offline round trip; authenticated QUIC push; incremental install,
+durable resume, concurrent pushes, scopes, `--delete`; chunk-level transfer with native repacking). See [PROGRESS.md](PROGRESS.md) for details and what is next, and
 [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md) for the full design brief.
 
 ## Build
@@ -136,6 +140,17 @@ stored is still reused, and so is the reconstruction metadata of every file that
 
 Pushes into disjoint destinations run concurrently; pushes into overlapping destinations (one inside
 the other) wait for each other.
+
+## Transfer modes
+
+| Mode | What moves | Best for |
+|---|---|---|
+| `chunk` (default) | Only chunks the receiver holds nowhere, as native compressed chunk bytes; the receiver repacks them into its own native xorbs | Everything; decisively better when content sits in shared or foreign xorbs |
+| `xorb` | Whole native xorbs the receiver lacks, exactly as the sender stored them | Same-sender incremental edits (marginally smaller: no chunk lists) |
+
+On a warm receiver, a 4 KiB insert into a 64 MiB file moves ~0.05–0.17 MiB in chunk mode
+(0.08–0.27% of the file). See [docs/BENCHMARK_M3.md](docs/BENCHMARK_M3.md) for all scenarios and
+exact conditions.
 
 ## Metrics
 
