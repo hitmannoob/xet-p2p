@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/xet-local", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.95"
+
+[workspace.dependencies]
+# Upstream Xet, pinned together (see docs/UPSTREAM_AUDIT.md).
+xet-runtime = "=1.8.0"
+xet-core-structures = "=1.8.0"
+xet-client = "=1.8.0"
+xet-data = "=1.8.0"
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
+
+xet-local = { path = "crates/xet-local" }
+
+# Chunking/hashing/compression are slow unoptimised; keep tests on large inputs fast.
+[profile.dev.package."*"]
+opt-level = 2

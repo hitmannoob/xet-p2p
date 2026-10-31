@@ -1,0 +1,23 @@
+[package]
+name = "xet-local"
+description = "Offline Xet storage: native chunks/xorbs/shards in an embedded local CAS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xet-runtime.workspace = true
+xet-core-structures.workspace = true
+xet-client.workspace = true
+xet-data.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+tempfile.workspace = true

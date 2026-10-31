@@ -1,0 +1,18 @@
+[package]
+name = "xet-p2p"
+description = "Direct peer-to-peer file transfer over native Xet storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "xet-p2p"
+path = "src/main.rs"
+
+[dependencies]
+xet-local.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
