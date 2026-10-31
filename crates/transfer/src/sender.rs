@@ -17,8 +17,8 @@ use xet_local::{IngestReport, LocalCas, Manifest, MerkleHash};
 use crate::budget::MemoryBudget;
 use crate::error::{Error, Result};
 use crate::protocol::{
-    ChunkRequest, MAX_CONTROL_FRAME, Message, ObjectHeader, ObjectKind, PROTOCOL_VERSION,
-    ReceiverReport, TransferMode, parse_hash,
+    ChunkRequest, MAX_CONTROL_FRAME, Message, ObjectHeader, ObjectKind, Operation,
+    PROTOCOL_VERSION, ReceiverReport, TransferMode, parse_hash,
 };
 use crate::rate::{RateLimiter, SLICE};
 
@@ -114,9 +114,11 @@ pub async fn push(
         &Message::Hello {
             protocol_version: PROTOCOL_VERSION,
             session_id: session_id(),
-            dest: opts.dest.clone(),
-            delete: opts.delete,
-            mode: opts.mode,
+            op: Operation::Push {
+                dest: opts.dest.clone(),
+                delete: opts.delete,
+                mode: opts.mode,
+            },
         },
     )
     .await?;
@@ -132,49 +134,24 @@ pub async fn push(
 
     write_frame(&mut send, &Message::manifest(&manifest)?).await?;
 
-    loop {
-        match next(&mut recv).await? {
-            Message::Need {
-                reconstructions,
-                xorbs,
-            } => {
-                let reconstructions = parse_subset(&reconstructions, &files, "file")?;
-                let xorbs = parse_subset(&xorbs, &referenced, "xorb")?;
-                debug!(
-                    shard_files = reconstructions.len(),
-                    xorbs = xorbs.len(),
-                    "NEED"
-                );
-                if !reconstructions.is_empty() {
-                    let shard = cas.export_shard(&reconstructions).await?;
-                    report.shard_bytes_sent +=
-                        send_object(conn, &limiter, ObjectKind::Shard, None, shard).await?;
-                }
-                report.xorb_bytes_sent += send_xorbs(&cas, conn, &xorbs, opts, &limiter).await?;
-                report.xorbs_sent += xorbs.len();
-            }
-            Message::NeedChunkLists { files: wanted } => {
-                let wanted = parse_subset(&wanted, &files, "file")?;
-                debug!(files = wanted.len(), "NEED_CHUNK_LISTS");
-                let lists = encode_chunk_lists(&cas.chunk_lists(&wanted).await?);
-                report.chunk_list_bytes_sent +=
-                    send_object(conn, &limiter, ObjectKind::ChunkLists, None, lists).await?;
-            }
-            Message::NeedChunks { requests } => {
-                debug!(files = requests.len(), "NEED_CHUNKS");
-                let (bytes, runs) =
-                    send_chunk_runs(&cas, conn, &requests, &files, opts, &limiter).await?;
-                report.chunk_bytes_sent += bytes;
-                report.chunk_runs_sent += runs;
-            }
-            Message::Ack { .. } => {}
-            Message::Result { report: r } => {
-                report.receiver = r;
-                break;
-            }
-            other => return Err(unexpected(other)),
-        }
-    }
+    let mut stats = SendStats::default();
+    report.receiver = serve_requests(
+        &cas,
+        conn,
+        &mut recv,
+        &files,
+        &referenced,
+        &opts.tuning(),
+        &limiter,
+        &mut stats,
+    )
+    .await?;
+    report.xorbs_sent = stats.xorbs_sent;
+    report.xorb_bytes_sent = stats.xorb_bytes_sent;
+    report.shard_bytes_sent = stats.shard_bytes_sent;
+    report.chunk_bytes_sent = stats.chunk_bytes_sent;
+    report.chunk_runs_sent = stats.chunk_runs_sent;
+    report.chunk_list_bytes_sent = stats.chunk_list_bytes_sent;
 
     let _ = send.shutdown().await;
     let stats = conn.wire_stats();
@@ -183,6 +160,88 @@ pub async fn push(
     report.transport = conn.kind();
     report.elapsed = start.elapsed();
     Ok(report)
+}
+
+/// What the sending side of a transfer sent.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SendStats {
+    pub xorbs_sent: usize,
+    pub xorb_bytes_sent: u64,
+    pub shard_bytes_sent: u64,
+    pub chunk_bytes_sent: u64,
+    pub chunk_runs_sent: usize,
+    pub chunk_list_bytes_sent: u64,
+}
+
+/// Concurrency and memory limits for the sending side.
+#[derive(Debug, Clone)]
+pub(crate) struct SendTuning {
+    pub parallel_streams: usize,
+    pub max_memory_bytes: u64,
+}
+
+impl PushOptions {
+    fn tuning(&self) -> SendTuning {
+        SendTuning {
+            parallel_streams: self.parallel_streams,
+            max_memory_bytes: self.max_memory_bytes,
+        }
+    }
+}
+
+/// Answers the fetching peer's requests for objects of this manifest until it reports a result.
+/// Used by the client of a push and by the server of a pull.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_requests(
+    cas: &Arc<LocalCas>,
+    conn: &Conn,
+    recv: &mut RecvStream,
+    files: &BTreeSet<MerkleHash>,
+    referenced: &BTreeSet<MerkleHash>,
+    tuning: &SendTuning,
+    limiter: &Limiter,
+    stats: &mut SendStats,
+) -> Result<ReceiverReport> {
+    loop {
+        match next(recv).await? {
+            Message::Need {
+                reconstructions,
+                xorbs,
+            } => {
+                let reconstructions = parse_subset(&reconstructions, files, "file")?;
+                let xorbs = parse_subset(&xorbs, referenced, "xorb")?;
+                debug!(
+                    shard_files = reconstructions.len(),
+                    xorbs = xorbs.len(),
+                    "NEED"
+                );
+                if !reconstructions.is_empty() {
+                    let shard = cas.export_shard(&reconstructions).await?;
+                    stats.shard_bytes_sent +=
+                        send_object(conn, limiter, ObjectKind::Shard, None, shard).await?;
+                }
+                stats.xorb_bytes_sent += send_xorbs(cas, conn, &xorbs, tuning, limiter).await?;
+                stats.xorbs_sent += xorbs.len();
+            }
+            Message::NeedChunkLists { files: wanted } => {
+                let wanted = parse_subset(&wanted, files, "file")?;
+                debug!(files = wanted.len(), "NEED_CHUNK_LISTS");
+                let lists = encode_chunk_lists(&cas.chunk_lists(&wanted).await?);
+                stats.chunk_list_bytes_sent +=
+                    send_object(conn, limiter, ObjectKind::ChunkLists, None, lists).await?;
+            }
+            Message::NeedChunks { requests } => {
+                debug!(files = requests.len(), "NEED_CHUNKS");
+                let (bytes, runs) =
+                    send_chunk_runs(cas, conn, &requests, files, tuning, limiter).await?;
+                stats.chunk_bytes_sent += bytes;
+                stats.chunk_runs_sent += runs;
+            }
+            Message::Ack { .. } => {}
+            Message::Result { report } => return Ok(report),
+            other => return Err(unexpected(other)),
+        }
+    }
 }
 
 /// The receiver may only request objects this manifest actually references.
@@ -208,7 +267,7 @@ async fn send_xorbs(
     cas: &Arc<LocalCas>,
     conn: &Conn,
     xorbs: &BTreeSet<MerkleHash>,
-    opts: &PushOptions,
+    opts: &SendTuning,
     limiter: &Limiter,
 ) -> Result<u64> {
     let permits = Arc::new(Semaphore::new(opts.parallel_streams.max(1)));
@@ -242,7 +301,7 @@ async fn send_chunk_runs(
     conn: &Conn,
     requests: &[ChunkRequest],
     files: &BTreeSet<MerkleHash>,
-    opts: &PushOptions,
+    opts: &SendTuning,
     limiter: &Limiter,
 ) -> Result<(u64, usize)> {
     let permits = Arc::new(Semaphore::new(opts.parallel_streams.max(1)));
@@ -312,7 +371,7 @@ async fn send_chunk_runs(
     Ok((total, streams))
 }
 
-type Limiter = Option<Arc<RateLimiter>>;
+pub(crate) type Limiter = Option<Arc<RateLimiter>>;
 
 async fn send_object(
     conn: &Conn,
@@ -345,7 +404,7 @@ async fn send_object(
     Ok(len)
 }
 
-async fn next(recv: &mut RecvStream) -> Result<Message> {
+pub(crate) async fn next(recv: &mut RecvStream) -> Result<Message> {
     match read_frame::<Message>(recv, MAX_CONTROL_FRAME).await? {
         Some(Message::Error { message }) => Err(Error::Remote(message)),
         Some(m) => Ok(m),
@@ -353,17 +412,17 @@ async fn next(recv: &mut RecvStream) -> Result<Message> {
     }
 }
 
-fn unexpected(m: Message) -> Error {
+pub(crate) fn unexpected(m: Message) -> Error {
     Error::Protocol(format!("unexpected {} from receiver", m.name()))
 }
 
-fn file_hashes(m: &Manifest) -> Result<BTreeSet<MerkleHash>> {
+pub(crate) fn file_hashes(m: &Manifest) -> Result<BTreeSet<MerkleHash>> {
     m.files()
         .filter(|(_, size, ..)| *size > 0)
         .map(|(_, _, h, ..)| parse_hash(h))
         .collect()
 }
 
-fn session_id() -> String {
+pub(crate) fn session_id() -> String {
     hex::encode(rand::random::<[u8; 16]>())
 }

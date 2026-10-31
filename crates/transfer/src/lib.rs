@@ -7,6 +7,7 @@ mod error;
 mod fetch;
 mod locks;
 pub mod protocol;
+mod pull;
 mod rate;
 mod receiver;
 mod sender;
@@ -14,6 +15,7 @@ pub mod session;
 
 pub use error::{Error, Result};
 pub use protocol::{ReceiverReport, TransferMode};
+pub use pull::{PullOptions, PullReport, pull};
 pub use receiver::{Receiver, ReceiverOptions};
 pub use sender::{DEFAULT_MAX_MEMORY_BYTES, PushOptions, PushReport, push};
 pub use session::SessionRecord;

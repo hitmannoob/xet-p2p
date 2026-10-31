@@ -17,7 +17,7 @@ mod walk;
 
 pub use cas::{
     IngestReport, LocalCas, MissingContent, ReconstructOptions, ReconstructReport,
-    create_confined_dir,
+    create_confined_dir, resolve_confined,
 };
 pub use error::{Error, Result};
 pub use exchange::PendingShard;

@@ -15,6 +15,7 @@ xet-local.workspace = true
 transfer.workspace = true
 transport.workspace = true
 transport-quic.workspace = true
+transport-tcp.workspace = true
 serde.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true

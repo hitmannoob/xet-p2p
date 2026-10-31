@@ -15,7 +15,7 @@ use transport::{
 };
 
 /// ALPN protocol identifier; bumped with incompatible wire changes.
-pub const ALPN: &[u8] = b"xet-p2p/2";
+pub const ALPN: &[u8] = b"xet-p2p/3";
 
 /// Tunables shared by both endpoints.
 #[derive(Debug, Clone)]

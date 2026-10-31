@@ -10,15 +10,17 @@ use tracing::{info, warn};
 use transport::{Conn, Listener, RecvStream, SendStream};
 use transport::{fingerprint, read_frame, write_frame};
 use xet_local::manifest::validate_rel_path;
-use xet_local::{LocalCas, create_confined_dir};
+use xet_local::{LocalCas, create_confined_dir, resolve_confined};
 
 use crate::budget::MemoryBudget;
 use crate::error::{Error, Result};
 use crate::fetch::{FetchOptions, Fetcher};
 use crate::locks::DestLocks;
 use crate::protocol::{
-    MAX_CONTROL_FRAME, Message, PROTOCOL_VERSION, ReceiverReport, decode_manifest,
+    MAX_CONTROL_FRAME, Message, Operation, PROTOCOL_VERSION, ReceiverReport, TransferMode,
+    decode_manifest,
 };
+use crate::sender::{SendStats, SendTuning, file_hashes, serve_requests};
 use crate::session::SessionStore;
 
 const CLOSE_GRACE: Duration = Duration::from_secs(5);
@@ -148,30 +150,47 @@ impl Receiver {
         send: &mut SendStream,
         recv: &mut RecvStream,
     ) -> Result<ReceiverReport> {
-        let (dest, delete, mode) = match self.fetcher.stall(conn, next(recv)).await? {
+        let op = match self.fetcher.stall(conn, next(recv)).await? {
             Message::Hello {
                 protocol_version,
                 session_id,
-                dest,
-                delete,
-                mode,
+                op,
             } => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(Error::Protocol(format!(
                         "unsupported protocol version {protocol_version} (receiver speaks {PROTOCOL_VERSION})"
                     )));
                 }
-                info!(connection = %session_id, %dest, delete, ?mode, "HELLO");
-                self.check_dest(&dest)?;
-                self.check_scope(conn, &dest)?;
-                (dest, delete, mode)
+                info!(connection = %session_id, ?op, "HELLO");
+                op
             }
             other => return Err(unexpected(other)),
         };
+        match op {
+            Operation::Push { dest, delete, mode } => {
+                self.receive_push(conn, send, recv, &dest, delete, mode)
+                    .await
+            }
+            Operation::Pull { src, mode } => self.serve_pull(conn, send, recv, &src, mode).await,
+        }
+    }
+
+    /// The client pushes a tree into `dest`.
+    async fn receive_push(
+        &self,
+        conn: &Conn,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        dest: &str,
+        delete: bool,
+        mode: TransferMode,
+    ) -> Result<ReceiverReport> {
+        self.check_dest(dest)?;
+        self.check_scope(conn, dest)?;
         // Held until this transfer ends; overlapping destinations wait their turn.
         let _dest_guard = self
             .locks
-            .acquire(&validate_rel_path(&dest)?, self.opts.dest_lock_wait)
+            .acquire(&validate_rel_path(dest)?, self.opts.dest_lock_wait)
             .await?;
         write_frame(
             send,
@@ -187,10 +206,69 @@ impl Receiver {
         };
         manifest.validate()?;
 
-        let dest_dir = create_confined_dir(&self.root, &dest)?;
+        let dest_dir = create_confined_dir(&self.root, dest)?;
         self.fetcher
-            .fetch_and_install(conn, send, &manifest, &dest, &dest_dir, mode, delete)
+            .fetch_and_install(conn, send, &manifest, dest, &dest_dir, mode, delete)
             .await
+    }
+
+    /// The client pulls the tree at `src`: this side ingests it and serves the client's requests.
+    /// Returns the client's report of what it installed.
+    async fn serve_pull(
+        &self,
+        conn: &Conn,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        src: &str,
+        mode: TransferMode,
+    ) -> Result<ReceiverReport> {
+        self.check_dest(src)?;
+        self.check_scope(conn, src)?;
+        // Serialize with pushes into the same tree, so the client sees one consistent version.
+        let _guard = self
+            .locks
+            .acquire(&validate_rel_path(src)?, self.opts.dest_lock_wait)
+            .await?;
+        let path = resolve_confined(&self.root, src)?;
+        write_frame(
+            send,
+            &Message::HelloOk {
+                protocol_version: PROTOCOL_VERSION,
+            },
+        )
+        .await?;
+
+        let cas = &self.fetcher.cas;
+        let (manifest, _) = cas.ingest(&path).await?;
+        let files = file_hashes(&manifest)?;
+        let referenced = cas.referenced_xorbs(&files).await?;
+        cas.touch_xorbs(&referenced);
+        info!(%src, files = manifest.files().count(), ?mode, "serving pull");
+        write_frame(send, &Message::manifest(&manifest)?).await?;
+
+        let tuning = SendTuning {
+            parallel_streams: self.opts.parallel_objects,
+            max_memory_bytes: self.opts.max_memory_bytes,
+        };
+        let mut stats = SendStats::default();
+        let report = self
+            .fetcher
+            .stall(
+                conn,
+                serve_requests(
+                    cas,
+                    conn,
+                    recv,
+                    &files,
+                    &referenced,
+                    &tuning,
+                    &None,
+                    &mut stats,
+                ),
+            )
+            .await?;
+        info!(%src, ?stats, "pull served");
+        Ok(report)
     }
 
     /// Rejects destinations that escape the root or overlap the CAS or session directories.

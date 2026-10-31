@@ -9,8 +9,12 @@ use std::sync::Arc;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
-use transfer::protocol::{MAX_CONTROL_FRAME, Message, ObjectHeader, ObjectKind, PROTOCOL_VERSION};
-use transfer::{Error, PushOptions, Receiver, ReceiverOptions, TransferMode, push};
+use transfer::protocol::{
+    MAX_CONTROL_FRAME, Message, ObjectHeader, ObjectKind, Operation, PROTOCOL_VERSION,
+};
+use transfer::{
+    Error, PullOptions, PushOptions, Receiver, ReceiverOptions, TransferMode, pull, push,
+};
 use transport::{Conn as Connection, Listener, TransportKind};
 type Endpoint = Arc<dyn Listener>;
 use transport_quic::{
@@ -156,6 +160,22 @@ impl Harness {
         };
         assert_eq!(conn.kind(), TRANSPORT);
         Ok(conn)
+    }
+
+    /// Pulls `src` (relative to the server's root) into the local directory `dest`, using the
+    /// client's CAS.
+    async fn pull_with(
+        &self,
+        src: &str,
+        dest: &Path,
+        configure: impl FnOnce(&mut PullOptions),
+    ) -> transfer::Result<transfer::PullReport> {
+        let conn = self.connect_as(&self.client_id).await?;
+        let mut opts = PullOptions::new(src);
+        configure(&mut opts);
+        let result = pull(self.sender_cas.clone(), &conn, dest, &opts).await;
+        conn.close(0, b"done");
+        result
     }
 
     async fn push(&self, dest: &str) -> transfer::Result<transfer::PushReport> {
@@ -351,9 +371,11 @@ where
         &Message::Hello {
             protocol_version: PROTOCOL_VERSION,
             session_id: "test".into(),
-            dest: "p".into(),
-            delete: false,
-            mode: TransferMode::Xorb,
+            op: Operation::Push {
+                dest: "p".into(),
+                delete: false,
+                mode: TransferMode::Xorb,
+            },
         },
     )
     .await
@@ -496,9 +518,11 @@ async fn interrupted_push(h: &Harness, dest: &str, commit: usize) -> usize {
         &Message::Hello {
             protocol_version: PROTOCOL_VERSION,
             session_id: "interrupted".into(),
-            dest: dest.into(),
-            delete: false,
-            mode: TransferMode::Xorb,
+            op: Operation::Push {
+                dest: dest.into(),
+                delete: false,
+                mode: TransferMode::Xorb,
+            },
         },
     )
     .await
@@ -952,9 +976,11 @@ async fn stalled_sender_is_dropped_and_releases_destination() {
         &Message::Hello {
             protocol_version: PROTOCOL_VERSION,
             session_id: "silent".into(),
-            dest: "p".into(),
-            delete: false,
-            mode: TransferMode::Chunk,
+            op: Operation::Push {
+                dest: "p".into(),
+                delete: false,
+                mode: TransferMode::Chunk,
+            },
         },
     )
     .await
@@ -1013,4 +1039,113 @@ async fn slow_but_steady_sender_is_not_a_stall() {
         r.payload_bytes_sent()
     );
     assert_trees_equal(&h.src(), &h.root().join("p"));
+}
+
+// ---- M5: pull ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_tree_from_server() {
+    let h = Harness::new().await;
+    let data = h.root().join("results");
+    write(&data, "model.bin", &random_bytes(60, 6 * MIB));
+    write(&data, "logs/run.txt", b"epoch 1 done\n");
+    fs::create_dir_all(data.join("empty")).unwrap();
+    let local = h.tmp.path().join("local");
+
+    let r = h.pull_with("results", &local, |_| {}).await.unwrap();
+    assert_trees_equal(&data, &local);
+    assert_eq!(r.transport, TRANSPORT);
+    assert_eq!(r.local.mode, TransferMode::Chunk);
+    assert_eq!(r.local.files_installed, 2);
+    assert!(r.local.chunk_bytes_received > 6 * MIB as u64);
+
+    // Pulling again moves no payload and rewrites nothing.
+    let again = h.pull_with("results", &local, |_| {}).await.unwrap();
+    assert_eq!(again.local.payload_bytes_received, 0, "{:?}", again.local);
+    assert_eq!(again.local.files_unchanged, 2);
+
+    // An edit on the server comes back incrementally.
+    let mut v2 = random_bytes(60, 6 * MIB);
+    v2.splice(3 * MIB..3 * MIB, random_bytes(61, 2000));
+    write(&data, "model.bin", &v2);
+    let edit = h.pull_with("results", &local, |_| {}).await.unwrap();
+    assert!(edit.local.chunks_present > 50, "{:?}", edit.local);
+    assert!(edit.local.chunk_bytes_received < 600 * 1024, "{:?}", edit.local);
+    assert_eq!(fs::read(local.join("model.bin")).unwrap(), v2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_in_xorb_mode_and_with_delete() {
+    let h = Harness::new().await;
+    let data = h.root().join("out");
+    write(&data, "a.bin", &random_bytes(62, 2 * MIB));
+    let local = h.tmp.path().join("local");
+    write(&local, "stale.txt", b"not on the server");
+
+    let r = h
+        .pull_with("out", &local, |o| {
+            o.mode = TransferMode::Xorb;
+            o.delete = true;
+        })
+        .await
+        .unwrap();
+    assert_eq!(r.local.mode, TransferMode::Xorb);
+    assert!(r.local.xorbs_received >= 1);
+    assert_eq!(r.local.files_deleted, 1);
+    assert_trees_equal(&data, &local);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_single_file() {
+    let h = Harness::new().await;
+    write(&h.root(), "one.bin", &random_bytes(63, 100_000));
+    let local = h.tmp.path().join("local");
+    h.pull_with("one.bin", &local, |_| {}).await.unwrap();
+    assert_eq!(fs::read(local.join("one.bin")).unwrap(), random_bytes(63, 100_000));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_paths_are_confined() {
+    let h = Harness::new().await;
+    write(&h.tmp.path().join("outside"), "secret.txt", b"not yours");
+    let local = h.tmp.path().join("local");
+    for src in ["../outside", "/etc", "", "missing", ".xet-p2p/cas", ".xet-p2p"] {
+        let err = h.pull_with(src, &local, |_| {}).await.unwrap_err();
+        assert!(matches!(err, Error::Remote(_)), "{src:?}: {err:?}");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(h.tmp.path().join("outside"), h.root().join("link")).unwrap();
+        assert!(h.pull_with("link", &local, |_| {}).await.is_err());
+        assert!(h.pull_with("link/secret.txt", &local, |_| {}).await.is_err());
+    }
+    assert!(!local.join("secret.txt").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_respects_sender_scope() {
+    let h = Harness::with_receiver_for(|o, fp| {
+        o.client_scopes
+            .insert(fp.to_owned(), vec![PathBuf::from("projects/alice")]);
+    })
+    .await;
+    write(&h.root().join("projects/alice"), "mine.txt", b"ok");
+    write(&h.root().join("projects/bob"), "theirs.txt", b"no");
+    let local = h.tmp.path().join("local");
+    h.pull_with("projects/alice", &local, |_| {}).await.unwrap();
+    let err = h.pull_with("projects/bob", &local, |_| {}).await.unwrap_err();
+    assert!(matches!(err, Error::Remote(ref m) if m.contains("allowed")), "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_then_pull_round_trip_through_server() {
+    let h = Harness::new().await;
+    write(&h.src(), "a.bin", &random_bytes(64, 3 * MIB));
+    write(&h.src(), "b/c.txt", b"round trip");
+    h.push("work").await.unwrap();
+    let back = h.tmp.path().join("back");
+    let r = h.pull_with("work", &back, |_| {}).await.unwrap();
+    assert_trees_equal(&h.src(), &back);
+    // The client already holds every chunk (it pushed them): nothing but metadata moves.
+    assert_eq!(r.local.chunks_received, 0, "{:?}", r.local);
 }

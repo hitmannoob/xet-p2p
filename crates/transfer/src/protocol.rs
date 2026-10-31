@@ -4,6 +4,8 @@
 //! Objects travel on unidirectional streams opened by the sender: an [`ObjectHeader`] frame
 //! followed by the object's bytes. Xorbs, shards, and chunk runs are native Xet bytes, unchanged.
 //!
+//! A `pull` (HELLO with `op: pull`) runs the same exchange with roles swapped after HELLO_OK.
+//!
 //! Chunk mode (default):
 //! ```text
 //! sender                                  receiver
@@ -28,7 +30,7 @@ use xet_local::{Manifest, MerkleHash};
 
 use crate::error::{Error, Result};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -57,6 +59,28 @@ pub enum TransferMode {
     Xorb,
 }
 
+/// What the connecting peer asks the server to do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Operation {
+    /// The client sends `dest` (relative to the server's root) its file tree.
+    Push {
+        dest: String,
+        /// Mirror: remove anything under `dest` the manifest does not describe (opt-in).
+        #[serde(default)]
+        delete: bool,
+        #[serde(default)]
+        mode: TransferMode,
+    },
+    /// The server sends the client the file tree at `src` (relative to its root). Roles swap:
+    /// the server sends MANIFEST and objects; the client sends NEEDs, ACKs, and the RESULT.
+    Pull {
+        src: String,
+        #[serde(default)]
+        mode: TransferMode,
+    },
+}
+
 /// Chunk index ranges `[start, end)` into one file's chunk list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkRequest {
@@ -70,13 +94,7 @@ pub enum Message {
     Hello {
         protocol_version: u32,
         session_id: String,
-        /// Destination directory, relative to the receiver's root.
-        dest: String,
-        /// Mirror: remove anything under `dest` the manifest does not describe (opt-in).
-        #[serde(default)]
-        delete: bool,
-        #[serde(default)]
-        mode: TransferMode,
+        op: Operation,
     },
     HelloOk {
         protocol_version: u32,

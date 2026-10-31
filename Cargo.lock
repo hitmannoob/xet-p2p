@@ -3438,6 +3438,7 @@ dependencies = [
  "transfer",
  "transport",
  "transport-quic",
+ "transport-tcp",
  "xet-local",
 ]
 

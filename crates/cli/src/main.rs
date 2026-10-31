@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use transfer::{PushOptions, PushReport, Receiver, ReceiverOptions, TransferMode, push};
+use transfer::{
+    PullOptions, PushOptions, PushReport, Receiver, ReceiverOptions, TransferMode, pull, push,
+};
 use transport::Listener as _;
 use transport_quic::{
     EndpointOptions, Identity, bind_addr_for, client_endpoint, connect, fingerprint, generate,
@@ -38,6 +40,9 @@ enum Command {
     Serve {
         #[arg(long, default_value = "0.0.0.0:4433")]
         listen: SocketAddr,
+        /// Also accept the TLS-over-TCP transport on this address (for paths without UDP).
+        #[arg(long)]
+        listen_tcp: Option<SocketAddr>,
         /// Directory every destination is confined to.
         #[arg(long)]
         root: PathBuf,
@@ -105,7 +110,41 @@ enum Command {
         /// Transfer mode: "chunk" (only missing chunks, default) or "xorb" (whole xorbs).
         #[arg(long, default_value = "chunk", value_parser = ["chunk", "xorb"])]
         mode: String,
+        /// Wire transport: "quic" (UDP, default) or "tcp" (TLS over TCP; not QUIC).
+        #[arg(long, default_value = "quic", value_parser = ["quic", "tcp"])]
+        transport: String,
         /// Print the transfer report as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pull a file or directory from a server into a local directory.
+    Pull {
+        /// Local destination directory.
+        dest: PathBuf,
+        /// Server address, host:port.
+        #[arg(long)]
+        from: String,
+        /// Source path, relative to the server's --root.
+        #[arg(long)]
+        src: String,
+        /// Local CAS directory.
+        #[arg(long)]
+        cas_dir: PathBuf,
+        /// This client's certificate (must be in the server's --allow-client list).
+        #[arg(long)]
+        cert: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+        /// The server's certificate, pinned.
+        #[arg(long)]
+        peer_cert: PathBuf,
+        /// Mirror: delete local files under DEST that the source does not contain.
+        #[arg(long)]
+        delete: bool,
+        #[arg(long, default_value = "chunk", value_parser = ["chunk", "xorb"])]
+        mode: String,
+        #[arg(long, default_value = "quic", value_parser = ["quic", "tcp"])]
+        transport: String,
         #[arg(long)]
         json: bool,
     },
@@ -167,6 +206,7 @@ async fn main() -> Result<()> {
         Command::Keygen { out, name } => keygen(&out, &name),
         Command::Serve {
             listen,
+            listen_tcp,
             root,
             cas_dir,
             cert,
@@ -201,7 +241,14 @@ async fn main() -> Result<()> {
                 max_data_streams: parallel,
                 ..Default::default()
             };
-            let endpoint = server_endpoint(listen, Identity::load(&cert, &key)?, allowed, &opts)?;
+            let endpoint =
+                server_endpoint(listen, Identity::load(&cert, &key)?, allowed.clone(), &opts)?;
+            let tcp = match listen_tcp {
+                Some(addr) => Some(
+                    transport_tcp::tcp_listen(addr, Identity::load(&cert, &key)?, allowed).await?,
+                ),
+                None => None,
+            };
             let cas = Arc::new(LocalCas::open(&cas_dir).await?);
             let mut ropts = ReceiverOptions::new(&cas);
             ropts.parallel_objects = parallel as usize;
@@ -218,7 +265,14 @@ async fn main() -> Result<()> {
                 endpoint.local_addr()?,
                 root.display()
             );
-            receiver.serve(Arc::new(endpoint)).await;
+            let quic = receiver.clone().serve(Arc::new(endpoint));
+            match tcp {
+                Some(tcp) => {
+                    eprintln!("listening on {} (TLS over TCP)", tcp.local_addr()?);
+                    tokio::join!(quic, receiver.serve(Arc::new(tcp)));
+                }
+                None => quic.await,
+            }
             Ok(())
         }
         Command::Push {
@@ -234,26 +288,16 @@ async fn main() -> Result<()> {
             delete,
             bwlimit_mib,
             mode,
+            transport,
             json,
         } => {
-            let addr = tokio::net::lookup_host(&to)
-                .await
-                .with_context(|| format!("resolving {to}"))?
-                .next()
-                .with_context(|| format!("{to} resolved to no addresses"))?;
-            let endpoint = client_endpoint(
+            let (conn, endpoint) = dial(
+                &transport,
+                &to,
                 Identity::load(&cert, &key)?,
-                vec![load_cert(&peer_cert)?],
-                &EndpointOptions::default(),
-                bind_addr_for(addr),
-            )?;
-            let conn = connect(&endpoint, addr)
-                .await
-                .with_context(|| format!("connecting to {addr}"))?;
-            eprintln!(
-                "connected to {addr} via {} (direct; receiver certificate pinned)",
-                conn.kind()
-            );
+                load_cert(&peer_cert)?,
+            )
+            .await?;
 
             let cas = Arc::new(LocalCas::open(&cas_dir).await?);
             let opts = PushOptions {
@@ -279,11 +323,64 @@ async fn main() -> Result<()> {
             }
             let result = push(cas, &src, &conn, &opts).await;
             conn.close(0, b"done");
-            endpoint.wait_idle().await;
+            if let Some(ep) = endpoint {
+                ep.wait_idle().await;
+            }
             let report = result?;
             print_push_report(&report);
             if json {
                 println!("{}", serde_json::to_string_pretty(&report_json(&report))?);
+            }
+            Ok(())
+        }
+        Command::Pull {
+            dest,
+            from,
+            src,
+            cas_dir,
+            cert,
+            key,
+            peer_cert,
+            delete,
+            mode,
+            transport,
+            json,
+        } => {
+            let (conn, endpoint) = dial(
+                &transport,
+                &from,
+                Identity::load(&cert, &key)?,
+                load_cert(&peer_cert)?,
+            )
+            .await?;
+            let cas = Arc::new(LocalCas::open(&cas_dir).await?);
+            let mut opts = PullOptions::new(src);
+            opts.delete = delete;
+            opts.mode = if mode == "xorb" {
+                TransferMode::Xorb
+            } else {
+                TransferMode::Chunk
+            };
+            let result = pull(cas, &conn, &dest, &opts).await;
+            conn.close(0, b"done");
+            if let Some(ep) = endpoint {
+                ep.wait_idle().await;
+            }
+            let r = result?;
+            print_pull_report(&r);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "files": r.files,
+                        "logical_bytes": r.logical_bytes,
+                        "transport": r.transport.to_string(),
+                        "wire_bytes_sent": r.wire_bytes_sent,
+                        "wire_bytes_received": r.wire_bytes_received,
+                        "elapsed_secs": r.elapsed.as_secs_f64(),
+                        "local": r.local,
+                    }))?
+                );
             }
             Ok(())
         }
@@ -396,6 +493,68 @@ fn parse_allow_client(spec: &str) -> Result<(PathBuf, PathBuf)> {
     Ok((cert.into(), scope))
 }
 
+/// Connects to `to` over the chosen transport with pinned mutual TLS. Returns the QUIC endpoint
+/// too, so the caller can wait for the connection to close cleanly.
+async fn dial(
+    transport: &str,
+    to: &str,
+    identity: Identity,
+    pinned: transport::rustls::pki_types::CertificateDer<'static>,
+) -> Result<(transport::Conn, Option<transport_quic::QuicClient>)> {
+    let addr = tokio::net::lookup_host(to)
+        .await
+        .with_context(|| format!("resolving {to}"))?
+        .next()
+        .with_context(|| format!("{to} resolved to no addresses"))?;
+    let (conn, ep) = match transport {
+        "tcp" => (
+            transport_tcp::tcp_connect(addr, identity, vec![pinned])
+                .await
+                .with_context(|| format!("connecting to {addr} (TLS over TCP)"))?,
+            None,
+        ),
+        _ => {
+            let ep = client_endpoint(
+                identity,
+                vec![pinned],
+                &EndpointOptions::default(),
+                bind_addr_for(addr),
+            )?;
+            let conn = connect(&ep, addr)
+                .await
+                .with_context(|| format!("connecting to {addr} (QUIC)"))?;
+            (conn, Some(ep))
+        }
+    };
+    eprintln!(
+        "connected to {addr} via {} (peer certificate pinned)",
+        conn.kind()
+    );
+    Ok((conn, ep))
+}
+
+fn print_pull_report(r: &transfer::PullReport) {
+    let l = &r.local;
+    let secs = r.elapsed.as_secs_f64();
+    eprintln!(
+        "pulled {} files ({} logical bytes) in {secs:.2}s via {}",
+        r.files, r.logical_bytes, r.transport
+    );
+    eprintln!(
+        "  received {} payload bytes ({} chunk, {} chunk-list, {} xorb); wire: {} in / {} out",
+        l.payload_bytes_received,
+        l.chunk_bytes_received,
+        l.chunk_list_bytes_received,
+        l.payload_bytes_received - l.chunk_bytes_received - l.chunk_list_bytes_received,
+        r.wire_bytes_received,
+        r.wire_bytes_sent
+    );
+    eprintln!(
+        "  local: {} files installed, {} unchanged, {} deleted; {} chunks already held",
+        l.files_installed, l.files_unchanged, l.files_deleted, l.chunks_present
+    );
+}
+
 fn keygen(out: &Path, name: &str) -> Result<()> {
     let cert_path = out.join(format!("{name}.crt"));
     let key_path = out.join(format!("{name}.key"));
@@ -457,13 +616,14 @@ fn print_push_report(r: &PushReport) {
         ),
     }
     eprintln!(
-        "  payload sent: {} bytes ({} xorb, {} shard, {} chunk, {} chunk-list); UDP sent: {} bytes",
+        "  payload sent: {} bytes ({} xorb, {} shard, {} chunk, {} chunk-list); wire sent: {} bytes via {}",
         r.payload_bytes_sent(),
         r.xorb_bytes_sent,
         r.shard_bytes_sent,
         r.chunk_bytes_sent,
         r.chunk_list_bytes_sent,
-        r.udp_bytes_sent
+        r.udp_bytes_sent,
+        r.transport
     );
     if secs > 0.0 {
         eprintln!(
@@ -519,6 +679,7 @@ fn report_json(r: &PushReport) -> serde_json::Value {
         "payload_bytes_sent": r.payload_bytes_sent(),
         "udp_bytes_sent": r.udp_bytes_sent,
         "udp_bytes_received": r.udp_bytes_received,
+        "transport": r.transport.to_string(),
         "elapsed_secs": r.elapsed.as_secs_f64(),
         "receiver": r.receiver,
     })

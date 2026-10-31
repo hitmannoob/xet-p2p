@@ -29,7 +29,7 @@ use transport::{
 };
 
 /// ALPN for the TCP transport; distinct from QUIC's so the two can never be confused.
-pub const ALPN: &[u8] = b"xet-p2p-tcp/2";
+pub const ALPN: &[u8] = b"xet-p2p-tcp/3";
 
 const TAG_BI: u8 = b'B';
 const TAG_UNI: u8 = b'U';

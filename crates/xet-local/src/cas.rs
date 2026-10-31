@@ -696,6 +696,33 @@ pub fn create_confined_dir(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Resolves an existing `rel` under `root` without following symlinks: every component must
+/// exist, every ancestor must be a real directory, and the final entry a real file or directory.
+pub fn resolve_confined(root: &Path, rel: &str) -> Result<PathBuf> {
+    let rel = validate_rel_path(rel)?;
+    let mut cur = fs::canonicalize(root)?;
+    let n = rel.components().count();
+    for (i, component) in rel.components().enumerate() {
+        cur.push(component);
+        let m = fs::symlink_metadata(&cur).map_err(|_| Error::UnsafePath {
+            path: rel.to_string_lossy().into_owned(),
+            reason: "does not exist",
+        })?;
+        let ok = if i + 1 == n {
+            m.is_dir() || m.is_file()
+        } else {
+            m.is_dir()
+        };
+        if !ok {
+            return Err(Error::UnsafePath {
+                path: rel.to_string_lossy().into_owned(),
+                reason: "a symlink or special file is in the path",
+            });
+        }
+    }
+    Ok(cur)
+}
+
 /// Creates `rel` under `dest` one component at a time, refusing to traverse symlinks or files.
 fn ensure_dir(dest: &Path, rel: &Path) -> Result<()> {
     let mut cur = dest.to_path_buf();
