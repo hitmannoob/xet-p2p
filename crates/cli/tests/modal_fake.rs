@@ -212,6 +212,17 @@ fn keep_agent_through_fake_modal() {
     let second = push(&[]);
     assert_eq!(second["reused_agent"], true);
     assert_eq!(second["payload_bytes_sent"], 0);
+    // The client lost its cached session (or could not reach the agent) while the kept agent
+    // still holds the sandbox port: the next command replaces that agent instead of failing.
+    std::fs::remove_dir_all(e.tmp.path().join(".cache/xet-p2p/agents")).unwrap();
+    let third = push(&[]);
+    assert_eq!(third["reused_agent"], false);
+    let sessions = std::fs::read_dir(e.tmp.path().join("state"))
+        .unwrap()
+        .flatten()
+        .filter(|d| d.file_name().to_string_lossy().starts_with("session-"))
+        .count();
+    assert_eq!(sessions, 1, "the replaced agent's credentials were not removed");
     std::thread::sleep(std::time::Duration::from_secs(6));
     e.no_session_state();
 }

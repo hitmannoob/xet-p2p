@@ -5,8 +5,9 @@
 # once. Every remote step is batched to keep round trips to Modal's API to a minimum:
 #
 #   attach     Sandbox.from_id + tunnels()                      (no remote command)
-#   bootstrap  one remote shell script: CPU check, agent binary check, credentials (from stdin,
-#              written under umask 077), launch, wait for readiness *inside the sandbox*
+#   bootstrap  one remote shell script: CPU check, agent binary check, replace a stale kept agent
+#              on the port, credentials (from stdin, written under umask 077), launch, wait for
+#              readiness *inside the sandbox*
 #              (+ one upload the first time this agent build is used)
 #   stop       one remote command: kill the agent, delete its session directory
 #
@@ -29,12 +30,36 @@ set -u
 # Read the credentials first: Modal rejects stdin writes once the process has exited, and the
 # checks below may exit early.
 IFS= read -r K; IFS= read -r C; IFS= read -r CL
-BIN=$1 SHA=$2 ARCH=$3 ROOT=$4 CAS=$5 SESSION=$6 PORT=$7 IDLE=$8
+BIN=$1 SHA=$2 ARCH=$3 ROOT=$4 CAS=$5 SESSION=$6 PORT=$7 IDLE=$8 STATE=$9
+KEPT="$STATE/port-$PORT.kept"
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 M=$(uname -m)
 if [ "$ARCH" != any ] && [ "$M" != "$ARCH" ]; then echo "sandbox CPU is $M but the agent is built for $ARCH" >&2; exit 11; fi
 if [ ! -f "$BIN" ] || [ "$(sha "$BIN" 2>/dev/null)" != "$SHA" ]; then echo '{"need_binary": true}'; exit 0; fi
 chmod 755 "$BIN"
+# Is $1 a live xet-p2p agent listening on this port? (Not a zombie, not a recycled pid.)
+ours() {
+  if [ -r "/proc/$1/cmdline" ]; then
+    [ "$(cut -d' ' -f3 "/proc/$1/stat" 2>/dev/null)" != Z ] || return 1
+    CMD=$(tr '\0' ' ' < "/proc/$1/cmdline")
+  else
+    CMD=$(ps -p "$1" -o args= 2>/dev/null) || return 1
+  fi
+  case "$CMD" in *" serve "*"--listen-tcp 0.0.0.0:$PORT "*) return 0;; esac
+  return 1
+}
+# A kept agent from an earlier command still holds the port, but its client could not reach it
+# or no longer has its credentials. Replace it: stop it and delete its credentials.
+if [ -f "$KEPT" ]; then
+  read -r OPID OSESSION < "$KEPT" || true
+  if [ -n "${OPID:-}" ] && ours "$OPID"; then
+    kill "$OPID" 2>/dev/null; J=0
+    while ours "$OPID" && [ "$J" -lt 50 ]; do J=$((J + 1)); sleep 0.1; done
+    ours "$OPID" && kill -9 "$OPID" 2>/dev/null && sleep 0.2
+  fi
+  [ -n "${OSESSION:-}" ] && rm -rf "$OSESSION"
+  rm -f "$KEPT"
+fi
 umask 077
 mkdir -p "$SESSION" && mkdir -p "$ROOT" || exit 14
 printf %s "$K" | base64 -d > "$SESSION/server.key" && printf %s "$C" | base64 -d > "$SESSION/server.crt" \
@@ -47,10 +72,18 @@ nohup "$@" > "$SESSION/agent.log" 2>&1 < /dev/null &
 PID=$!
 I=0
 while [ ! -s "$SESSION/ready.json" ]; do
-  if ! kill -0 "$PID" 2>/dev/null; then echo "agent exited: $(tail -c 1500 "$SESSION/agent.log")" >&2; rm -rf "$SESSION"; exit 12; fi
+  if ! kill -0 "$PID" 2>/dev/null; then
+    if grep -q "Address.*in use" "$SESSION/agent.log"; then
+      echo "port $PORT is already in use in the sandbox (another xet-p2p command or another program is listening on it)" >&2
+    else
+      echo "agent exited: $(tail -c 1500 "$SESSION/agent.log")" >&2
+    fi
+    rm -rf "$SESSION"; exit 12
+  fi
   I=$((I + 1)); if [ "$I" -gt 300 ]; then kill "$PID"; rm -rf "$SESSION"; echo "agent not ready in 30 s" >&2; exit 13; fi
   sleep 0.1
 done
+if [ "$IDLE" != 0 ]; then echo "$PID $SESSION" > "$KEPT"; fi
 echo "{\"pid\": $PID, \"uname\": \"$(uname -sm)\"}"
 """
 
@@ -102,7 +135,7 @@ def cmd_bootstrap(req):
     secrets = "\n".join(base64.b64encode(req[k].encode()).decode()
                         for k in ("server_key_pem", "server_cert_pem", "client_cert_pem")) + "\n"
     args = [remote_bin, digest, elf_arch(req["agent"]), req["root"], req["cas_dir"],
-            req["session_dir"], str(req["port"]), str(req.get("idle_exit_secs") or 0)]
+            req["session_dir"], str(req["port"]), str(req.get("idle_exit_secs") or 0), req["state_dir"]]
     for attempt in range(2):
         code, out, err = run(sb, BOOTSTRAP, args, stdin=secrets, timeout=180)
         if code != 0:

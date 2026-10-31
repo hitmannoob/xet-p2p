@@ -309,7 +309,7 @@ def main():
         app = modal.App.lookup("xet-p2p-test", create_if_missing=True)
         image = modal.Image.debian_slim().apt_install("rsync")
         sb = modal.Sandbox.create("sleep", "infinity", app=app, image=image, cpu=1.0,
-                                  unencrypted_ports=[XET_PORT, RSYNC_PORT, KEEP_PORT], timeout=3600)
+                                  unencrypted_ports=[XET_PORT, RSYNC_PORT, KEEP_PORT], timeout=3 * 3600)
         print(f"sandbox {sb.object_id} up", flush=True)
         tunnels = sb.tunnels(timeout=60)
         addr = {}
