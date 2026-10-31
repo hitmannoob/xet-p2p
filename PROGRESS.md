@@ -11,7 +11,7 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
 | M2 — Incremental transfer + durable resume | **Done** (exit gate met) |
 | M3 — Chunk-level transfer optimization | **Done** (exit gate met; [benchmark](docs/BENCHMARK_M3.md)) |
 | M4 — Performance and reliability | **Done** ([benchmark vs rsync](docs/BENCHMARK_M4.md)) |
-| M5 — Provider-agnostic sandbox integration | Not started |
+| M5 — Provider-agnostic sandbox integration | **Local parts done**; real Modal run pending |
 
 ## Pins
 
@@ -168,11 +168,36 @@ Living log for `xet-p2p`. Spec: [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md)
   encoding round trip). Note: the suite needs ~2–3 GiB of temp space; on a full disk use
   `-- --test-threads=4`.
 
-## Next: M5 — provider-agnostic sandbox integration
+### 2026-10-31 — M5 (local parts)
 
-Per the brief: `SandboxProvider` adapters (attach, capabilities, bootstrap agent, session) with a
-fake provider and generic host first, then E2B and Modal; provider URIs; `doctor`; optional
-authenticated TLS/WebSocket fallback behind a transport trait; opt-in billable tests only.
+- **Transport abstraction** (`transport` crate): `Connection`/`Listener` traits with boxed tokio
+  streams; identities, pinning, and framing moved here. `transfer` no longer depends on QUIC.
+- **TLS-over-TCP fallback** (`transport-tcp`): same pinned mTLS, yamux for streams, always reported
+  as "TLS over TCP (not QUIC)". Found and fixed: a graceful yamux close waits to flush and hangs when
+  the peer stops reading, leaving destination locks held — close is now abrupt, like QUIC. The full
+  push suite runs over both transports.
+- **Pull**: HELLO carries an operation (protocol v3). Fetch and send halves extracted (`Fetcher`,
+  `serve_requests`) so the client of a pull and the receiver of a push share verification,
+  repacking, resume, atomic install, and `--delete`. Pull sources are confined, scoped, and locked
+  like destinations.
+- **Providers** (`providers` crate): strict target URIs; `SandboxProvider`/`Sandbox` traits
+  (attach existing only, capabilities, start agent, close); per-session credentials (fresh key
+  pair each side, 0600, removed on close); transport policy auto/quic/tcp with honest reporting;
+  `doctor` with real handshakes on each transport. Fake `local://` provider with `?udp=off` to
+  simulate restricted networks. `e2b://`, `daytona://` recognised, not implemented.
+- **Modal adapter**: verified against Modal docs + SDK 1.5.5 (tunnels declared at creation, TCP
+  only). Agent reached via `unencrypted_ports` raw TCP tunnel over TLS-over-TCP, reported relayed.
+  Embedded Python helper drives the user's SDK; tested end to end against a fake Modal SDK.
+- Agent Linux build: `cargo zigbuild --release --target x86_64-unknown-linux-musl -p xet-p2p`.
+- Tests: 38 push/pull tests × 2 transports, 5 TCP transport tests, URI parsing, 4 local-provider
+  CLI tests, 2 fake-Modal CLI tests.
+
+### Blocked: real Modal run
+
+From this environment, Modal API calls (`modal.Sandbox.list()`) time out after 60 s, sandboxed or
+not, and running outside the shell sandbox was declined. Needed from the user: confirm `modal app
+list` works from their shell, and allow the run (it creates one small test sandbox — 1 CPU,
+30-minute timeout, `unencrypted_ports=[4434]` — and terminates it afterwards).
 
 ## Known gaps / risks
 

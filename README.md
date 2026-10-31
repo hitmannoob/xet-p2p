@@ -21,8 +21,8 @@ Xet (chunks + xorbs + shards + local CAS)  ↔  QUIC (pinned mutual TLS)  ↔  X
 - Every received object is verified before it is stored; every file is verified (size + SHA-256)
   before it is installed, and installation is atomic per file. A failed transfer installs nothing.
 
-Status: **M0–M4 complete** (offline round trip; authenticated QUIC push; incremental install,
-durable resume, concurrent pushes, scopes, `--delete`; chunk-level transfer with native repacking). See [PROGRESS.md](PROGRESS.md) for details and what is next, and
+Status: **M0–M4 complete; M5 local parts complete** (sandbox providers, `pull`, TLS-over-TCP
+fallback, `doctor`; Modal adapter tested against a fake SDK, real-Modal run pending). See [PROGRESS.md](PROGRESS.md) for details and what is next, and
 [XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md) for the full design brief.
 
 ## Build
@@ -109,13 +109,69 @@ pushed 26 files (124868 logical bytes) in 0.03s
 
 Not yet covered: certificate rotation/revocation (replace the pinned file and restart).
 
+## Sandboxes and targets
+
+`push` and `pull` take a target URI:
+
+| Target | What it is | Credentials |
+|---|---|---|
+| `quic://HOST:PORT/DEST` | A `serve` you run yourself (QUIC) | `--cert --key --peer-cert` from `keygen` |
+| `tcp://HOST:PORT/DEST` | The same, over TLS on TCP (`serve --listen-tcp`) | same |
+| `modal://SANDBOX_ID/abs/path` | An existing Modal sandbox | generated per session |
+| `local://NAME/abs/path` | A fake sandbox (a local directory) for testing | generated per session |
+
+```bash
+xet-p2p push ./project modal://sb-abc123/workspace/project
+xet-p2p pull modal://sb-abc123/workspace/results ./results
+xet-p2p doctor modal://sb-abc123        # what works, what doesn't, what auto would use
+xet-p2p push ./project modal://sb-abc123/workspace/project --transport quic   # fail, don't fall back
+```
+
+For sandbox targets, `xet-p2p` attaches to the **existing** sandbox (it never creates or destroys
+one), uploads and starts a per-session agent, and generates a fresh key pair for each side: the
+agent accepts only this client, and the client pins only this agent. The session's keys, agent
+process and files are removed when the command ends; your files and the sandbox's CAS are kept.
+
+**Transports.** `--transport auto` (default) uses QUIC when the sandbox can accept UDP, otherwise
+the TLS-over-TCP fallback, and prints which one it chose and whether a provider relay is in the
+path. `--transport quic` fails instead of falling back. Both use the same pinned mutual TLS and
+the same Xet objects; only the wire protocol differs.
+
+**Modal.** Modal exposes sandbox ports only through tunnels declared when the sandbox is created,
+and none carry UDP, so Modal transfers use TLS over TCP through a raw TCP tunnel (relayed by
+Modal). Create the sandbox with the port exposed (default 4434):
+
+```python
+sb = modal.Sandbox.create("sleep", "infinity", app=app, image=modal.Image.debian_slim(),
+                          unencrypted_ports=[4434], timeout=3600)
+```
+
+The agent must be a Linux build. Cross-compile one and point at it:
+
+```bash
+pip install ziglang && cargo install cargo-zigbuild
+rustup target add x86_64-unknown-linux-musl
+cargo zigbuild --release --target x86_64-unknown-linux-musl -p xet-p2p
+export XET_P2P_AGENT_LINUX_BIN=target/x86_64-unknown-linux-musl/release/xet-p2p
+```
+
+The adapter uses your installed Modal SDK and credentials (`XET_P2P_MODAL_PYTHON` overrides the
+Python it uses). URI options: `?port=N` (default 4434), `?root=/abs` (workspace, default
+`/workspace`), `?state=/abs` (agent binary and session files, default `/tmp/xet-p2p`). Modal raw
+TCP tunnels accept connections from any address; the pinned mutual TLS is what protects them.
+Sandbox storage is ephemeral unless you mount a Volume, so its CAS does not outlive the sandbox.
+
+`e2b://` and `daytona://` are recognised but not implemented yet.
+
 ## Commands
 
 | Command | Purpose |
 |---|---|
 | `xet-p2p keygen --out DIR --name NAME` | Create a self-signed identity |
-| `xet-p2p serve ...` | Receive pushes into `--root` |
-| `xet-p2p push SRC --to HOST:PORT --dest REL ...` | Push a file or directory |
+| `xet-p2p serve ... [--listen-tcp ADDR]` | Receive pushes / serve pulls under `--root` (QUIC, optionally also TLS over TCP) |
+| `xet-p2p push SRC TARGET` | Push a file or directory (`--to HOST:PORT --dest REL` = `quic://HOST:PORT/REL`) |
+| `xet-p2p pull SOURCE DEST` | Pull a file or directory into a local directory |
+| `xet-p2p doctor TARGET` | Inspect a sandbox: capabilities, agent, which transports work |
 | `xet-p2p gc --cas-dir DIR [--max-size-mib N] [--dry-run]` | Reclaim CAS space (orphans; LRU eviction to a cap) |
 | `xet-p2p local ingest SRC --cas-dir DIR [-o manifest.json]` | Offline: store into a CAS, write manifest |
 | `xet-p2p local restore MANIFEST DEST --cas-dir DIR` | Offline: reconstruct from a CAS |
@@ -204,8 +260,11 @@ numbers here are whole-xorb.
 crates/
   xet-local/        Offline Xet storage: wraps upstream LocalClient; ingest, manifest,
                     verified object exchange, verified atomic reconstruction
-  transport-quic/   Quinn endpoints, pinned mTLS, bounded framing (knows nothing of Xet)
-  transfer/         Control protocol, push (sender) and Receiver
+  transport/        Connection/stream traits, identities, certificate pinning, framing
+  transport-quic/   QUIC transport (Quinn), pinned mTLS
+  transport-tcp/    TLS-over-TCP fallback transport, yamux-multiplexed streams
+  transfer/         Control protocol; push, pull, Receiver; fetch and send cores
+  providers/        Target URIs, SandboxProvider adapters (local, modal), transport policy, doctor
   cli/              xet-p2p binary
 docs/UPSTREAM_AUDIT.md   What is reused from xet-core, and every divergence
 ```
