@@ -229,9 +229,30 @@ Setup to reproduce: `cargo zigbuild --release --target x86_64-unknown-linux-musl
 `XET_P2P_AGENT_LINUX_BIN=…`, a sandbox with `unencrypted_ports=[4434]`, then
 `xet-p2p push SRC modal://SANDBOX_ID/workspace/project`.
 
+### 2026-11-01 — M5: bootstrap cost, `--keep-agent`, repeated real-network benchmark
+
+- **Bootstrap batched** (dcb1bff): one long-lived Modal helper per command and one remote shell
+  script for the whole agent start (checks, credentials over stdin, launch, readiness wait inside
+  the sandbox). ~33 s per command → ~3.5 s at ~145 ms RTT.
+- **`--keep-agent MINUTES`** (dcb1bff): the agent stays up until idle that long, then exits and
+  deletes its credentials; the client caches the session (0600) and later commands reuse it with
+  no bootstrap. Fresh Modal stdin rule (no writes after exit) fixed in 21640a1.
+- **Bug found by the benchmark, fixed** (e341118): if a command could not reach its kept agent, it
+  started a new one on the same fixed sandbox port and failed with "Address in use" until the old
+  agent idled out. The bootstrap now records kept agents per port and replaces a live one
+  (stopping it and deleting its credentials). Regression test in `modal_fake.rs`.
+- **Repeated benchmark** ([docs/BENCHMARK_M5_MODAL.md](docs/BENCHMARK_M5_MODAL.md)): 5 repetitions
+  × 8 scenarios × 4 tools, new data per repetition, shuffled order, SHA-256 verified, 160/160 runs
+  clean. With `--keep-agent`, xet-p2p is 0.3–0.6 s behind rsync per command (1.3 s on 500 cold
+  small files); the transfer itself is faster than rsync's whole command in 7 of 8 scenarios, and
+  ~1 s per command is spent outside it.
+
 ## Next
 
 - E2B and Daytona adapters (same `Sandbox` trait; verify their exec/file/port APIs first).
+- Break down and cut the ~1 s per-command overhead outside the transfer (process start, CAS open,
+  TLS connect through the relay); it is what puts `--keep-agent` behind rsync on Modal.
+- Fix the benchmark's raw-upload baseline probe (fails through Modal tunnels).
 - Tune the TCP fallback for long-RTT links (multiple TCP connections or larger windows); measure.
 - Opt-in automated real-provider test (`XET_P2P_TEST_MODAL=1`), off by default since it bills.
 

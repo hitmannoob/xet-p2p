@@ -231,8 +231,19 @@ against the same path, so it has no equivalent.
 
 Over a **real network** (this Mac → a Modal sandbox, same tunnel for both tools,
 [docs/BENCHMARK_M5_MODAL.md](docs/BENCHMARK_M5_MODAL.md)), bytes follow the same pattern, xet-p2p's
-transfer time was at least as fast as rsync's in 7 of 8 scenarios (TLS included), but each command
-currently spends ~33 s attaching to the sandbox and starting the agent through Modal's API.
+transfer is faster than rsync's whole command in 7 of 8 scenarios (TLS included), and end to end
+(5 repetitions, medians):
+
+| Scenario (Mac → Modal, ~145 ms RTT) | rsync -az | xet-p2p `--keep-agent` | xet-p2p (agent per command) |
+|---|---:|---:|---:|
+| warm, 2 of 32 checkpoint tensors rewritten (16 MiB) | 3.0 s | 3.3 s | 6.4 s |
+| warm, 256 KiB appended to 8 MiB log | 2.3 s | 2.6 s | 5.8 s |
+| warm, 10 of 500 small files edited | 2.1 s | 2.7 s | 6.0 s |
+| cold, 500 small files | 2.7 s | 4.0 s | 7.6 s |
+
+With `--keep-agent`, xet-p2p is 0.3–0.6 s behind rsync per command (1.3 s on cold small files):
+~1 s per command goes to process start, opening the CAS and the TLS connection, not to the data.
+Starting a fresh agent through Modal's API adds ~3.5 s per command.
 
 - **xet-p2p wins** on large-file edits (3–5× faster at similar bytes) and never resends content the
   receiver holds anywhere — in other files, other destinations, or from other senders.

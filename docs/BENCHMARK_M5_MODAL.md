@@ -1,82 +1,111 @@
 # Real-network benchmark: xet-p2p vs rsync, Mac → Modal sandbox
 
-**Date:** 2026-11-01 · **Reproduce:** `bench/modal_vs_rsync.py` (see its docstring)
+**Date:** 2026-11-01 · **Commit:** e341118 · **Reproduce:** `bench/modal_vs_rsync.py` (method in
+its docstring) · **Raw data:** [bench/results/modal_vs_rsync.json](../bench/results/modal_vs_rsync.json)
+(every run), [bench/results/modal_vs_rsync.md](../bench/results/modal_vs_rsync.md) (generated tables)
 
-## Conditions
+## Method
 
-- **Path:** this Mac (home network, India; DNS64 with broken NAT64, so IPv4 was used) → a Modal
-  sandbox (Linux x86_64, `debian_slim` + rsync, 1 CPU) through **one Modal raw TCP tunnel**
-  (`unencrypted_ports=[4434]`). Modal tunnels carry no UDP, so xet-p2p used its **TLS-over-TCP**
-  transport, relayed by Modal — not QUIC.
-- **Same path for both tools.** rsync ran as a daemon in the sandbox on the tunnelled port
-  (`rsync://`, delta transfer on, `-a` and `-az`); then the daemon was stopped and xet-p2p's agent
-  used the same port. rsync's daemon protocol is **unencrypted**; xet-p2p's numbers include TLS.
-- Raw tunnel throughput measured earlier from this machine: ~1.9 MB/s up, ~0.12 MB/s down.
+- **Path:** this Mac (home network, India; IPv4) → one Modal sandbox (Linux x86_64,
+  `debian_slim` + rsync, 1 CPU) through **Modal raw TCP tunnels**. Modal tunnels carry no UDP, so
+  xet-p2p used its **TLS-over-TCP** transport, relayed by Modal — not QUIC.
+- **Same path for every tool**, one tunnel per server so nothing is switched mid-run: an rsync
+  daemon (started once; `rsync://`, delta transfer on, **unencrypted**), an xet-p2p agent started
+  and stopped **per command**, and an xet-p2p agent kept between commands (`--keep-agent 15`).
+- **5 repetitions × 8 scenarios × 4 tools = 160 measured runs.** Every repetition uses new data
+  (seeded by scenario and repetition, identical for every tool within it), so no run benefits from
+  content left by an earlier one. Tool order is shuffled per scenario, so network drift does not
+  favour one tool. The two xet-p2p variants use separate CASes in the sandbox.
+- "Warm" = the first version was synced (unmeasured), then edited (mtime +10 s so rsync's quick
+  check notices). **Every measured tree was verified by SHA-256 inside the sandbox.** All 160 runs
+  verified; none needed a retry.
+- Baseline: TCP connect RTT through the tunnel was **141–148 ms** at the start of every
+  repetition (stable). The raw-upload probe failed in every repetition, so there is no raw
+  throughput baseline for this run.
 - Local rsync: macOS `openrsync` (protocol 29); sandbox: Debian GNU rsync. xet-p2p: chunk mode,
   defaults, a fresh local CAS per scenario.
-- Each scenario has its own seeded data (no sharing between scenarios). "Warm" = the first version
-  was synced (unmeasured), then edited (mtime moved +10 s so rsync's quick check notices).
-- **Every final tree was verified by SHA-256 inside the sandbox** for every tool and scenario.
-- **Single run per cell.** Across three runs the same rsync cold 16 MiB transfer took 12.2 s,
-  18.3 s and 24.2 s, so times on this path vary by ~2×; bytes are exact and repeatable.
+- Cells are **median [min–max]** over the 5 repetitions. One value means all 5 were equal.
+
+## Wall-clock seconds (whole command)
+
+rsync's time is its whole command against the already-running daemon. xet-p2p's is its whole
+command, including attaching to the sandbox and, for `xet-p2p`, starting and stopping the agent.
+
+| Scenario | rsync -a | rsync -az | xet-p2p | xet-p2p --keep-agent |
+|---|---:|---:|---:|---:|
+| cold, 8 MiB random file | 3.8 [3.6–11.3] | 3.7 [3.4–3.8] | 7.7 [6.9–12.0] | 4.2 [4.0–6.4] |
+| warm, 4 KiB inserted mid 8 MiB file | 2.2 [2.1–2.2] | 2.1 [2.1–2.2] | 5.8 [5.4–6.0] | 2.5 [2.3–2.8] |
+| warm, checkpoint: 2 of 32 tensors rewritten (16 MiB) | 3.0 [2.8–3.3] | 3.0 [2.8–3.1] | 6.4 [6.1–7.0] | 3.3 [3.0–3.5] |
+| cold, 8 MiB compressible log | 3.9 [3.5–4.0] | 3.1 [2.9–3.3] | 6.6 [6.4–7.1] | 3.6 [3.6–3.8] |
+| warm, 256 KiB appended to 8 MiB log | 2.6 [2.5–2.6] | 2.3 [2.2–2.4] | 5.8 [5.4–6.2] | 2.6 [2.4–2.9] |
+| cold, 500 small files (1–16 KiB) | 3.0 [2.8–3.3] | 2.7 [2.7–3.1] | 7.6 [7.1–13.9] | 4.0 [3.5–4.1] |
+| warm, 10 of 500 small files edited | 2.1 [2.0–2.2] | 2.1 [2.0–2.2] | 6.0 [5.6–6.5] | 2.7 [2.6–3.2] |
+| warm, 500 small files unchanged | 1.8 [1.7–1.9] | 1.8 [1.7–1.8] | 5.3 [5.2–5.7] | 2.1 [2.0–2.3] |
+
+## Where xet-p2p's time goes (seconds)
+
+"Transfer" is xet-p2p's own push (ingest → verified install). "Bootstrap" is attaching to the
+sandbox and starting the agent through Modal's API. The kept agent's first command in the run
+started it (the 3.3 s max); every later command reused it.
+
+| Scenario | xet-p2p transfer | xet-p2p bootstrap | --keep-agent transfer | --keep-agent bootstrap |
+|---|---:|---:|---:|---:|
+| cold, 8 MiB random file | 2.9 [2.8–3.4] | 3.7 [3.4–7.7] | 3.1 [3.0–3.4] | 0.0 [0.0–3.3] |
+| warm, 4 KiB inserted mid 8 MiB file | 1.6 [1.3–1.9] | 3.5 [3.4–3.7] | 1.6 [1.3–1.7] | 0.0 |
+| warm, checkpoint: 2 of 32 tensors rewritten (16 MiB) | 2.3 [2.0–2.3] | 3.5 [3.4–4.1] | 2.3 [2.0–2.5] | 0.0 |
+| cold, 8 MiB compressible log | 2.5 [2.5–2.8] | 3.4 [3.3–3.9] | 2.6 [2.5–2.8] | 0.0 |
+| warm, 256 KiB appended to 8 MiB log | 1.6 [1.4–1.7] | 3.6 [3.3–3.9] | 1.6 [1.5–1.9] | 0.0 |
+| cold, 500 small files (1–16 KiB) | 3.0 [2.9–9.4] | 3.7 [3.6–4.0] | 3.0 [2.6–3.1] | 0.0 |
+| warm, 10 of 500 small files edited | 1.7 [1.6–2.1] | 3.6 [3.4–3.7] | 1.8 [1.6–2.2] | 0.0 |
+| warm, 500 small files unchanged | 1.1 [1.0–1.3] | 3.6 [3.6–3.8] | 1.1 [1.0–1.2] | 0.0 |
 
 ## Bytes sent from the Mac
 
-| Scenario | rsync -a | rsync -az | xet-p2p |
+rsync's counts are its own (unencrypted daemon protocol); xet-p2p's include TLS and all framing.
+
+| Scenario | rsync -a | rsync -az | xet-p2p (both variants) |
 |---|---:|---:|---:|
-| cold, 16 MiB random file | 16.0 MiB | 16.0 MiB | 16.1 MiB |
-| warm, 4 KiB inserted mid 16 MiB random file | 20 KiB | 24 KiB | 153 KiB |
-| warm, checkpoint: 2 of 32 x 1 MiB tensors rewritten | 2081 KiB | 2087 KiB | 2175 KiB |
-| cold, 16 MiB compressible log | 16.0 MiB | 3319 KiB | 6308 KiB |
-| warm, 512 KiB appended to 16 MiB log | 528 KiB | 124 KiB | 211 KiB |
-| cold, 1000 small files (1-16 KiB text) | 8324 KiB | 2177 KiB | 3615 KiB |
-| warm, 10 of 1000 small files edited | 43 KiB | 40 KiB | 114 KiB |
-| warm, 1000 small files unchanged | 38 KiB | 38 KiB | 76 KiB |
+| cold, 8 MiB random file | 8193 KiB | 8196 KiB | 8228 KiB |
+| warm, 4 KiB inserted mid 8 MiB file | 18 KiB | 21 KiB | 106 KiB [42–172] |
+| warm, checkpoint: 2 of 32 tensors rewritten (16 MiB) | 1039 KiB | 1043 KiB | 1281 KiB [1165–1387] |
+| cold, 8 MiB compressible log | 8193 KiB | 1661 KiB | 3149 KiB [3143–3160] |
+| warm, 256 KiB appended to 8 MiB log | 269 KiB | 67 KiB | 124 KiB [108–146] |
+| cold, 500 small files (1–16 KiB) | 4294 KiB [4201–4400] | 1117 KiB [1098–1143] | 1861 KiB [1825–1904] |
+| warm, 10 of 500 small files edited | 24 KiB [23–25] | 21 KiB [21–22] | 77 KiB [65–84] |
+| warm, 500 small files unchanged | 19 KiB | 19 KiB | 39 KiB |
 
-## Bytes in both directions
-
-| Scenario | rsync -a | rsync -az | xet-p2p |
-|---|---:|---:|---:|
-| cold, 16 MiB random file | 16.0 MiB | 16.0 MiB | 16.1 MiB |
-| warm, 4 KiB inserted mid 16 MiB random file | 44 KiB | 48 KiB | 156 KiB |
-| warm, checkpoint: 2 of 32 x 1 MiB tensors rewritten | 2120 KiB | 2126 KiB | 2178 KiB |
-| cold, 16 MiB compressible log | 16.0 MiB | 3319 KiB | 6311 KiB |
-| warm, 512 KiB appended to 16 MiB log | 552 KiB | 148 KiB | 213 KiB |
-| cold, 1000 small files (1-16 KiB text) | 8346 KiB | 2199 KiB | 3764 KiB |
-| warm, 10 of 1000 small files edited | 44 KiB | 41 KiB | 118 KiB |
-| warm, 1000 small files unchanged | 38 KiB | 38 KiB | 78 KiB |
-
-## Seconds
-
-"Transfer" is xet-p2p's own push time (ingest → verified install). "End to end" adds attaching to
-the sandbox through Modal's API and starting and stopping the per-session agent (the first run also
-uploads the 19 MB agent once). rsync's time is its whole command against an already-running daemon.
-
-| Scenario | rsync -a | rsync -az | xet-p2p (transfer) | xet-p2p (end to end) |
-|---|---:|---:|---:|---:|
-| cold, 16 MiB random file | 24.2 | 23.1 | 11.8 | 73.8 |
-| warm, 4 KiB inserted mid 16 MiB random file | 4.4 | 4.4 | 3.5 | 36.9 |
-| warm, checkpoint: 2 of 32 x 1 MiB tensors rewritten | 6.7 | 8.4 | 5.8 | 39.8 |
-| cold, 16 MiB compressible log | 13.0 | 7.4 | 6.9 | 41.1 |
-| warm, 512 KiB appended to 16 MiB log | 5.6 | 5.0 | 3.8 | 38.1 |
-| cold, 1000 small files (1-16 KiB text) | 8.4 | 6.5 | 7.3 | 41.5 |
-| warm, 10 of 1000 small files edited | 4.2 | 4.6 | 3.9 | 37.4 |
-| warm, 1000 small files unchanged | 3.6 | 3.5 | 2.6 | 38.2 |
+Bytes in both directions follow the same pattern (in the generated tables).
 
 ## Reading the results
 
-- **Transfer time: xet-p2p was faster in 7 of 8 scenarios** despite TLS, from 1.1× to 2× (cold
-  random file 11.8 s vs 23–24 s; checkpoint 5.8 s vs 6.7–8.4 s; log append 3.8 s vs 5.0–5.6 s).
-  Given the ~2× run-to-run variance, treat this as "at least as fast", not a precise ratio.
-- **End-to-end time is dominated by provider bootstrap: ~33 s per command.** The Modal adapter
-  makes many separate Modal API calls (uname, mkdir, sha256 check, three file writes, chmods,
-  launch, ready polling, stop, cleanup), each a round trip from India to Modal's API. A
-  long-running agent (like the rsync daemon here) or a single-call bootstrap would remove most of
-  it. **This is the biggest practical gap and the next thing to fix.**
-- **Bytes: same pattern as on localhost.** Large changed data costs about the same (checkpoint
-  2175 vs 2081 KiB). rsync -az sends less for compressible data (log 3.3 vs 6.2 MiB: zlib stream
-  vs Xet's per-chunk lz4) and for tiny edits (literal bytes vs whole ~64 KiB chunks plus chunk
-  lists and the TLS handshake).
-- Not exercised here, and where xet-p2p does something rsync cannot: content already present on
-  the receiver from other files, destinations or senders is never re-sent
+- **With `--keep-agent`, xet-p2p is close to rsync but not faster: 0.3–0.6 s slower** per command
+  in 7 of 8 scenarios (2.1 vs 1.8 s for an unchanged tree, 3.3 vs 3.0 s for the checkpoint), and
+  1.3 s slower for 500 cold small files (4.0 vs 2.7 s). The ranges barely overlap, so the gap is
+  real, not noise.
+- **The transfer itself is faster than rsync's whole command in 7 of 8 scenarios** (e.g. 2.3 vs
+  3.0 s checkpoint, 1.6 vs 2.3 s log append, 1.1 vs 1.8 s unchanged tree). The rest of a
+  kept-agent command, **~1.0 s** (0.9–1.1 s in every scenario), is spent outside the transfer: process start, opening the local
+  CAS, and the TLS connection through the tunnel (~145 ms RTT). That fixed cost, not data
+  movement, is what puts xet-p2p behind rsync on this path. It has not been broken down further.
+- **A fresh agent per command costs 3.5 s** (median, every scenario 3.3–4.1 s, plus 7.7 s once
+  when the agent binary is uploaded). That makes plain `xet-p2p` about 2–3× slower than rsync
+  end to end here. Use `--keep-agent` for repeated pushes to the same sandbox.
+- **Bytes: same pattern as on localhost.** Large changed data costs about the same (the
+  checkpoint: 1.2 vs 1.0 MiB). rsync -az sends less for compressible data (log 1.6 vs 3.1 MiB:
+  zlib stream vs Xet's per-chunk lz4) and for tiny edits (literal bytes vs whole ~64 KiB chunks
+  plus chunk lists and the TLS handshake). The 4 KiB insert varies from 42 to 172 KiB with where
+  the insert lands relative to chunk boundaries.
+- **Variance:** three runs stalled (rsync -a 11.3 s, xet-p2p 12.0 and 13.9 s), consistent with
+  occasional network stalls. Medians are stable.
+- Not exercised here, and where xet-p2p does something rsync cannot: content already on the
+  receiver from other files, destinations or senders is never re-sent
   ([BENCHMARK_M3](BENCHMARK_M3.md)); resume after interruption; TLS with pinned peers.
+
+## Earlier single-run result (superseded)
+
+The first single-run benchmark on this path (commit 15ee1fc, 16 MiB / 1000-file scenarios, RTT
+then ~350–380 ms) measured **~33 s of bootstrap per command**, because the Modal adapter made a
+separate Modal API call for every step. Batching them into one remote script (dcb1bff) brought
+that to ~7 s at that RTT and 3.5 s here, and `--keep-agent` removes it for later commands. While
+running this benchmark, a kept agent that its client could not reach blocked the port for new
+agents; fixed in e341118 (the new agent replaces it).
