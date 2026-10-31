@@ -22,4 +22,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 transport-quic.workspace = true
+transport-tcp.workspace = true
 tempfile.workspace = true

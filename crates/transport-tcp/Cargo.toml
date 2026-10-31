@@ -1,0 +1,21 @@
+[package]
+name = "transport-tcp"
+description = "TLS-over-TCP fallback transport for xet-p2p: pinned mutual TLS, yamux-multiplexed streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+transport.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+rustls.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+yamux.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
