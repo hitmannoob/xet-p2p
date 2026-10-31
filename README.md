@@ -229,6 +229,11 @@ xet-p2p counts every UDP byte (QUIC + TLS included); rsync's counts exclude SSH 
 encryption. The last row is from [docs/BENCHMARK_M3.md](docs/BENCHMARK_M3.md): rsync only compares
 against the same path, so it has no equivalent.
 
+Over a **real network** (this Mac → a Modal sandbox, same tunnel for both tools,
+[docs/BENCHMARK_M5_MODAL.md](docs/BENCHMARK_M5_MODAL.md)), bytes follow the same pattern, xet-p2p's
+transfer time was at least as fast as rsync's in 7 of 8 scenarios (TLS included), but each command
+currently spends ~33 s attaching to the sandbox and starting the agent through Modal's API.
+
 - **xet-p2p wins** on large-file edits (3–5× faster at similar bytes) and never resends content the
   receiver holds anywhere — in other files, other destinations, or from other senders.
 - **rsync wins** on compressible data (zlib vs Xet's lz4, ~2×), on tiny edits (literal bytes vs
