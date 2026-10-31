@@ -10,7 +10,8 @@ mod error;
 pub mod manifest;
 mod walk;
 
-pub use cas::{IngestReport, LocalCas, ReconstructReport};
+pub use cas::{IngestReport, LocalCas, MissingContent, ReconstructReport};
 pub use error::{Error, Result};
 pub use manifest::{Entry, EntryKind, Manifest};
+pub use xet_core_structures::merklehash::MerkleHash;
 pub use xet_data::deduplication::DeduplicationMetrics;

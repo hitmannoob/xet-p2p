@@ -20,6 +20,9 @@ pub enum Error {
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
 
+    #[error("local CAS is missing content: {files} file reconstruction(s), {xorbs} xorb(s)")]
+    MissingContent { files: usize, xorbs: usize },
+
     #[error("verification failed for {path:?}: {reason}")]
     Verification { path: String, reason: String },
 }

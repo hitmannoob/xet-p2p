@@ -45,4 +45,16 @@ natively via a `local://` endpoint. No upstream code needs to be forked or reimp
 4. **Global dedup query** is shaped like the remote API (returns whole shard bytes). Acceptable locally;
    revisit for M3.
 
+5. **Empty-file SHA-256 is wrong upstream.** `Sha256Generator::finalize` returns all zeros when no data
+   was hashed, so `XetFileInfo.sha256` for a 0-byte file is `000…0`. `xet-local` substitutes the real
+   empty digest (`e3b0c442…b855`).
+6. **Missing content trips an upstream debug assertion.** Reconstructing a file whose shard is absent
+   panics in debug builds (`progress_types.rs:521`, `update_item_size`); in release it surfaces as a size
+   mismatch. `xet-local` checks availability first (`LocalCas::missing_content`) and never calls the
+   download session for content it does not hold.
+7. **No cross-file dedup within one upload batch.** `FileUploadSession::upload_files` chunks files in
+   parallel; two new files in the same batch do not dedup against each other (each stores its own copy of
+   shared chunks). Later ingests do dedup against everything already stored. Acceptable for M0–M2; note
+   for M3 wire-byte measurements.
+
 None of these require a custom chunk, xorb, or shard format.

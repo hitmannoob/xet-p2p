@@ -60,9 +60,15 @@ impl Manifest {
         for entry in &self.entries {
             validate_rel_path(&entry.path)?;
             if !seen.insert(entry.path.as_str()) {
-                return Err(Error::InvalidManifest(format!("duplicate path {:?}", entry.path)));
+                return Err(Error::InvalidManifest(format!(
+                    "duplicate path {:?}",
+                    entry.path
+                )));
             }
-            if let EntryKind::File { xet_hash, sha256, .. } = &entry.kind {
+            if let EntryKind::File {
+                xet_hash, sha256, ..
+            } = &entry.kind
+            {
                 check_hex(&entry.path, "xet_hash", xet_hash)?;
                 check_hex(&entry.path, "sha256", sha256)?;
                 files.insert(entry.path.as_str());
@@ -103,7 +109,9 @@ impl Manifest {
 
 fn check_hex(path: &str, field: &str, value: &str) -> Result<()> {
     if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Error::InvalidManifest(format!("{path:?}: {field} is not a 32-byte hex hash")));
+        return Err(Error::InvalidManifest(format!(
+            "{path:?}: {field} is not a 32-byte hex hash"
+        )));
     }
     Ok(())
 }
@@ -139,7 +147,9 @@ pub fn validate_rel_path(path: &str) -> Result<PathBuf> {
         match component {
             "" => return Err(unsafe_path("empty path component")),
             "." | ".." => return Err(unsafe_path("relative traversal component")),
-            c if i == 0 && c.starts_with(STAGING_PREFIX) => return Err(unsafe_path("reserved name")),
+            c if i == 0 && c.starts_with(STAGING_PREFIX) => {
+                return Err(unsafe_path("reserved name"));
+            }
             c => out.push(c),
         }
     }
@@ -160,7 +170,15 @@ mod tests {
     #[test]
     fn rejects_unsafe_paths() {
         for p in [
-            "", "/etc/passwd", "../x", "a/../../x", "a/./b", "a//b", "a/", "a\\b", "a\0b",
+            "",
+            "/etc/passwd",
+            "../x",
+            "a/../../x",
+            "a/./b",
+            "a//b",
+            "a/",
+            "a\\b",
+            "a\0b",
             ".xet-p2p-staging-1/x",
         ] {
             assert!(validate_rel_path(p).is_err(), "{p:?}");

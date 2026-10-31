@@ -5,7 +5,11 @@ use clap::{Parser, Subcommand};
 use xet_local::{LocalCas, Manifest};
 
 #[derive(Parser)]
-#[command(name = "xet-p2p", version, about = "Direct peer-to-peer file transfer over native Xet storage")]
+#[command(
+    name = "xet-p2p",
+    version,
+    about = "Direct peer-to-peer file transfer over native Xet storage"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -41,12 +45,17 @@ enum LocalCommand {
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Local(LocalCommand::Ingest { src, cas_dir, output }) => {
-            let cas = LocalCas::open(&cas_dir)?;
+        Command::Local(LocalCommand::Ingest {
+            src,
+            cas_dir,
+            output,
+        }) => {
+            let cas = LocalCas::open(&cas_dir).await?;
             let (manifest, report) = cas.ingest(&src).await?;
             let json = serde_json::to_string_pretty(&manifest)?;
             match output {
-                Some(path) => std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?,
+                Some(path) => std::fs::write(&path, json)
+                    .with_context(|| format!("writing {}", path.display()))?,
                 None => println!("{json}"),
             }
             let d = &report.dedup;
@@ -61,19 +70,24 @@ async fn main() -> Result<()> {
                 d.new_chunks,
                 d.xorb_bytes_uploaded,
             );
-        },
-        Command::Local(LocalCommand::Restore { manifest, dest, cas_dir }) => {
+        }
+        Command::Local(LocalCommand::Restore {
+            manifest,
+            dest,
+            cas_dir,
+        }) => {
             let manifest: Manifest = serde_json::from_slice(
-                &std::fs::read(&manifest).with_context(|| format!("reading {}", manifest.display()))?,
+                &std::fs::read(&manifest)
+                    .with_context(|| format!("reading {}", manifest.display()))?,
             )
             .context("parsing manifest")?;
-            let cas = LocalCas::open(&cas_dir)?;
+            let cas = LocalCas::open(&cas_dir).await?;
             let report = cas.reconstruct(&manifest, &dest).await?;
             eprintln!(
                 "restored {} files, {} dirs, {} bytes (verified)",
                 report.files, report.dirs, report.bytes
             );
-        },
+        }
     }
     Ok(())
 }
