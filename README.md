@@ -154,10 +154,30 @@ the other) wait for each other.
 
 ## Compared with rsync
 
-See [docs/BENCHMARK_M4.md](docs/BENCHMARK_M4.md). In short: large-file edits sync 3–5× faster than
-rsync with comparable bytes, and content the receiver holds anywhere is never resent; rsync sends
-less for compressible data (zlib vs Xet's lz4), for tiny edits (literal bytes vs ~64 KiB chunks),
-and for big trees of tiny files (mtimes vs content hashes in the file list).
+Bytes sent by the source and wall-clock time, from [docs/BENCHMARK_M4.md](docs/BENCHMARK_M4.md)
+(Apple M4, localhost, no network shaping, so times reflect CPU and disk work):
+
+| Scenario | Plain copy | rsync -a | rsync -az | **xet-p2p** | xet time | rsync -az time |
+|---|---:|---:|---:|---:|---:|---:|
+| Cold: 64 MiB random file | 64.0 MiB | 64.0 MiB | 64.0 MiB | **65.5 MiB** | 0.98 s | 1.38 s |
+| 4 KiB inserted mid 64 MiB file | 64.0 MiB | 36 KiB | 44 KiB | **162 KiB** | **0.35 s** | 1.55 s |
+| Checkpoint: 4 of 64 tensors rewritten (128 MiB) | 128.0 MiB | 8.1 MiB | 8.1 MiB | **8.7 MiB** | **0.95 s** | 3.21 s |
+| Cold: 64 MiB compressible log | 64.0 MiB | 64.0 MiB | 13.0 MiB | **25.1 MiB** | 1.00 s | 1.60 s |
+| 1 MiB appended to 64 MiB log | 65.0 MiB | 1056 KiB | 247 KiB | **458 KiB** | **0.72 s** | 2.06 s |
+| Cold: 2000 small files | 16.7 MiB | 16.9 MiB | 4.4 MiB | **7.5 MiB** | 1.12 s | 0.65 s |
+| 20 of 2000 small files edited | 16.7 MiB | 85 KiB | 80 KiB | **221 KiB** | 0.32 s | 0.16 s |
+| 2000 small files, unchanged | 16.7 MiB | 75 KiB | 75 KiB | **161 KiB** | 0.27 s | 0.10 s |
+| Edit pushed from a **different sender** (receiver already holds the content) | 64 MiB | n/a | n/a | **0.17 MiB** | 0.56 s | n/a |
+
+xet-p2p counts every UDP byte (QUIC + TLS included); rsync's counts exclude SSH framing and
+encryption. The last row is from [docs/BENCHMARK_M3.md](docs/BENCHMARK_M3.md): rsync only compares
+against the same path, so it has no equivalent.
+
+- **xet-p2p wins** on large-file edits (3–5× faster at similar bytes) and never resends content the
+  receiver holds anywhere — in other files, other destinations, or from other senders.
+- **rsync wins** on compressible data (zlib vs Xet's lz4, ~2×), on tiny edits (literal bytes vs
+  whole ~64 KiB chunks plus a ~10 KiB handshake), and on big trees of tiny files (mtimes vs content
+  hashes in the file list).
 
 ## Transfer modes
 
