@@ -449,3 +449,90 @@ async fn file_modified_during_ingest_is_rejected() {
         "{result:?}"
     );
 }
+
+// ---- opt-in delete ----
+
+use xet_local::ReconstructOptions;
+
+const DELETE: ReconstructOptions = ReconstructOptions {
+    delete_extraneous: true,
+};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_delete_extra_files_are_kept() {
+    let f = fixture().await;
+    write(&f.src, "a.txt", b"a");
+    let (m, _) = f.cas.ingest(&f.src).await.unwrap();
+    write(&f.dest, "extra.txt", b"keep me");
+    f.cas.reconstruct(&m, &f.dest).await.unwrap();
+    assert!(f.dest.join("extra.txt").exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_mirrors_the_manifest() {
+    let f = fixture().await;
+    write(&f.src, "keep/a.txt", b"a");
+    write(&f.src, "b.txt", b"b");
+    fs::create_dir_all(f.src.join("empty-kept")).unwrap();
+    let (m, _) = f.cas.ingest(&f.src).await.unwrap();
+
+    write(&f.dest, "keep/stale.txt", b"old");
+    write(&f.dest, "gone/deep/x.txt", b"old");
+    write(&f.dest, "b.txt", b"old version");
+    // Type conflicts: a file where a directory belongs.
+    write(&f.dest, "empty-kept", b"i am a file");
+
+    let r = f.cas.reconstruct_with(&m, &f.dest, DELETE).await.unwrap();
+    assert_eq!(snapshot(&f.src), snapshot(&f.dest));
+    assert_eq!(r.files_deleted, 3, "{r:?}"); // keep/stale.txt, gone/deep/x.txt, empty-kept file
+    assert_eq!(r.dirs_deleted, 2, "{r:?}"); // gone/deep, gone
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_removes_symlinks_without_following() {
+    let f = fixture().await;
+    write(&f.src, "a.txt", b"a");
+    let (m, _) = f.cas.ingest(&f.src).await.unwrap();
+    let outside = f._tmp.path().join("outside");
+    write(&outside, "precious.txt", b"must survive");
+    fs::create_dir_all(&f.dest).unwrap();
+    std::os::unix::fs::symlink(&outside, f.dest.join("link-dir")).unwrap();
+    std::os::unix::fs::symlink(outside.join("precious.txt"), f.dest.join("link-file")).unwrap();
+
+    f.cas.reconstruct_with(&m, &f.dest, DELETE).await.unwrap();
+    assert!(fs::symlink_metadata(f.dest.join("link-dir")).is_err());
+    assert!(fs::symlink_metadata(f.dest.join("link-file")).is_err());
+    assert_eq!(
+        fs::read(outside.join("precious.txt")).unwrap(),
+        b"must survive"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_replaces_a_directory_where_a_file_belongs() {
+    let f = fixture().await;
+    write(&f.src, "thing", b"now a file");
+    let (m, _) = f.cas.ingest(&f.src).await.unwrap();
+    write(&f.dest, "thing/inner.txt", b"was a dir");
+    let r = f.cas.reconstruct_with(&m, &f.dest, DELETE).await.unwrap();
+    assert_eq!(snapshot(&f.src), snapshot(&f.dest));
+    assert_eq!((r.files_deleted, r.dirs_deleted), (1, 1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_reconstruction_deletes_nothing() {
+    let f = fixture().await;
+    write(&f.src, "a.txt", b"a");
+    let (mut m, _) = f.cas.ingest(&f.src).await.unwrap();
+    let EntryKind::File { sha256, .. } = &mut m.entries[0].kind else {
+        panic!()
+    };
+    *sha256 = "0".repeat(64);
+    write(&f.dest, "extra.txt", b"keep me");
+    assert!(f.cas.reconstruct_with(&m, &f.dest, DELETE).await.is_err());
+    assert!(
+        f.dest.join("extra.txt").exists(),
+        "a failed run must not delete"
+    );
+}

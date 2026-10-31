@@ -46,6 +46,9 @@ pub enum Message {
         session_id: String,
         /// Destination directory, relative to the receiver's root.
         dest: String,
+        /// Mirror: remove anything under `dest` the manifest does not describe (opt-in).
+        #[serde(default)]
+        delete: bool,
     },
     HelloOk {
         protocol_version: u32,
@@ -124,6 +127,9 @@ pub struct ReceiverReport {
     /// Xorbs committed by earlier, interrupted attempts (resume savings).
     pub prior_xorbs_committed: u64,
     pub prior_xorb_bytes_committed: u64,
+    /// With `delete`: entries removed from the destination.
+    pub files_deleted: usize,
+    pub dirs_deleted: usize,
     /// Reconstruction entries received by an earlier, interrupted attempt and reused instead of
     /// being requested again.
     pub reconstructions_reused: usize,

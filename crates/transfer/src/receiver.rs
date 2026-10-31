@@ -11,7 +11,7 @@ use tracing::{info, warn};
 use transport_quic::quinn::{Connection, Endpoint, RecvStream, SendStream};
 use transport_quic::{fingerprint, peer_certificate, read_frame, read_payload, write_frame};
 use xet_local::manifest::validate_rel_path;
-use xet_local::{LocalCas, MerkleHash, PendingShard, create_confined_dir};
+use xet_local::{LocalCas, MerkleHash, PendingShard, ReconstructOptions, create_confined_dir};
 
 use crate::budget::MemoryBudget;
 use crate::error::{Error, Result};
@@ -139,21 +139,22 @@ impl Receiver {
         send: &mut SendStream,
         recv: &mut RecvStream,
     ) -> Result<ReceiverReport> {
-        let dest = match next(recv).await? {
+        let (dest, delete) = match next(recv).await? {
             Message::Hello {
                 protocol_version,
                 session_id,
                 dest,
+                delete,
             } => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(Error::Protocol(format!(
                         "unsupported protocol version {protocol_version} (receiver speaks {PROTOCOL_VERSION})"
                     )));
                 }
-                info!(connection = %session_id, %dest, "HELLO");
+                info!(connection = %session_id, %dest, delete, "HELLO");
                 self.check_dest(&dest)?;
                 self.check_scope(conn, &dest)?;
-                dest
+                (dest, delete)
             }
             other => return Err(unexpected(other)),
         };
@@ -258,7 +259,18 @@ impl Receiver {
         }
 
         let dest_dir = create_confined_dir(&self.root, &dest)?;
-        let r = self.cas.reconstruct(&manifest, &dest_dir).await?;
+        let r = self
+            .cas
+            .reconstruct_with(
+                &manifest,
+                &dest_dir,
+                ReconstructOptions {
+                    delete_extraneous: delete,
+                },
+            )
+            .await?;
+        report.files_deleted = r.files_deleted;
+        report.dirs_deleted = r.dirs_deleted;
         report.files_installed = r.files;
         report.files_unchanged = r.files_unchanged;
         report.dirs_created = r.dirs;

@@ -91,6 +91,10 @@ enum Command {
         /// Cap on xorb bytes held in memory, in MiB (one xorb always fits).
         #[arg(long, default_value_t = 256)]
         max_memory_mib: u64,
+        /// Mirror: delete files and directories under --dest that are not in SRC. Runs only after
+        /// every new file has been verified; never touches anything outside --dest.
+        #[arg(long)]
+        delete: bool,
         /// Print the transfer report as JSON on stdout.
         #[arg(long)]
         json: bool,
@@ -196,6 +200,7 @@ async fn main() -> Result<()> {
             peer_cert,
             parallel,
             max_memory_mib,
+            delete,
             json,
         } => {
             let addr = tokio::net::lookup_host(&to)
@@ -219,7 +224,15 @@ async fn main() -> Result<()> {
                 dest,
                 parallel_streams: parallel as usize,
                 max_memory_bytes: max_memory_mib.saturating_mul(1024 * 1024),
+                delete,
             };
+            if delete {
+                eprintln!(
+                    "--delete: anything under the receiver's {} not in {} will be removed",
+                    opts.dest,
+                    src.display()
+                );
+            }
             let result = push(cas, &src, &conn, &opts).await;
             conn.close(0u32.into(), b"done");
             endpoint.wait_idle().await;
@@ -358,6 +371,12 @@ fn print_push_report(r: &PushReport) {
         "  receiver: {} files installed, {} unchanged; {} bytes reconstructed and verified",
         rr.files_installed, rr.files_unchanged, rr.bytes_reconstructed
     );
+    if rr.files_deleted + rr.dirs_deleted > 0 {
+        eprintln!(
+            "  deleted on receiver: {} files, {} directories (--delete)",
+            rr.files_deleted, rr.dirs_deleted
+        );
+    }
     if rr.resumed {
         eprintln!(
             "  resumed interrupted session (attempt {}): {} xorbs / {} bytes already committed",

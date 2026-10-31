@@ -68,6 +68,18 @@ pub struct ReconstructReport {
     pub dirs: usize,
     /// Bytes reconstructed (excludes unchanged files).
     pub bytes: u64,
+    /// With [`ReconstructOptions::delete_extraneous`]: non-directory entries removed (regular
+    /// files, symlinks, special files) and directories removed.
+    pub files_deleted: usize,
+    pub dirs_deleted: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconstructOptions {
+    /// Make `dest` mirror the manifest: after every file is verified and before any is installed,
+    /// remove whatever under `dest` the manifest does not describe, including entries whose type
+    /// conflicts with it. Symlinks are removed, never followed. Off by default.
+    pub delete_extraneous: bool,
 }
 
 impl LocalCas {
@@ -258,6 +270,17 @@ impl LocalCas {
         manifest: &Manifest,
         dest: impl AsRef<Path>,
     ) -> Result<ReconstructReport> {
+        self.reconstruct_with(manifest, dest, ReconstructOptions::default())
+            .await
+    }
+
+    /// [`Self::reconstruct`] with options.
+    pub async fn reconstruct_with(
+        &self,
+        manifest: &Manifest,
+        dest: impl AsRef<Path>,
+        opts: ReconstructOptions,
+    ) -> Result<ReconstructReport> {
         manifest.validate()?;
         let missing = self.missing_content(manifest).await?;
         if !missing.is_empty() {
@@ -274,7 +297,7 @@ impl LocalCas {
 
         let staging = dest.join(staging_name());
         fs::create_dir(&staging)?;
-        let result = self.reconstruct_via(manifest, &dest, &staging).await;
+        let result = self.reconstruct_via(manifest, &dest, &staging, opts).await;
         let _ = fs::remove_dir_all(&staging);
         result
     }
@@ -284,6 +307,7 @@ impl LocalCas {
         manifest: &Manifest,
         dest: &Path,
         staging: &Path,
+        opts: ReconstructOptions,
     ) -> Result<ReconstructReport> {
         let mut report = ReconstructReport::default();
         let mut staged = Vec::new();
@@ -313,6 +337,20 @@ impl LocalCas {
             report.bytes += size;
         }
         session.finalize().await?;
+
+        // Everything is verified; only now may anything at the destination be removed.
+        if opts.delete_extraneous {
+            let wanted = wanted_paths(manifest)?;
+            let staging_name = staging.file_name().map(|n| n.to_owned());
+            prune(
+                dest,
+                Path::new(""),
+                &wanted,
+                staging_name.as_deref(),
+                &mut report,
+            )?;
+            touched_dirs.insert(dest.to_owned());
+        }
 
         for entry in &manifest.entries {
             if matches!(entry.kind, EntryKind::Dir) {
@@ -388,6 +426,77 @@ fn staging_name() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{STAGING_PREFIX}{}-{nanos}", std::process::id())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wanted {
+    File,
+    Dir,
+}
+
+/// Every manifest path with its kind, plus every ancestor directory.
+fn wanted_paths(manifest: &Manifest) -> Result<std::collections::HashMap<PathBuf, Wanted>> {
+    let mut wanted = std::collections::HashMap::new();
+    for entry in &manifest.entries {
+        let rel = validate_rel_path(&entry.path)?;
+        for ancestor in rel.ancestors().skip(1) {
+            if !ancestor.as_os_str().is_empty() {
+                wanted.insert(ancestor.to_owned(), Wanted::Dir);
+            }
+        }
+        let kind = match entry.kind {
+            EntryKind::Dir => Wanted::Dir,
+            EntryKind::File { .. } => Wanted::File,
+        };
+        wanted.insert(rel, kind);
+    }
+    Ok(wanted)
+}
+
+/// Removes entries under `dest/rel` not in `wanted` (or of the wrong type). Never follows symlinks.
+fn prune(
+    dest: &Path,
+    rel: &Path,
+    wanted: &std::collections::HashMap<PathBuf, Wanted>,
+    staging: Option<&std::ffi::OsStr>,
+    report: &mut ReconstructReport,
+) -> Result<()> {
+    for entry in fs::read_dir(dest.join(rel))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if rel.as_os_str().is_empty() && Some(name.as_os_str()) == staging {
+            continue;
+        }
+        let child = rel.join(&name);
+        let meta = fs::symlink_metadata(entry.path())?;
+        match wanted.get(&child) {
+            Some(Wanted::Dir) if meta.is_dir() => prune(dest, &child, wanted, staging, report)?,
+            Some(Wanted::File) if meta.is_file() => {}
+            _ if meta.is_dir() => remove_tree(&entry.path(), report)?,
+            _ => {
+                fs::remove_file(entry.path())?;
+                report.files_deleted += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Deletes a real directory tree bottom-up, counting what it removes. Symlinks inside are
+/// removed as links.
+fn remove_tree(dir: &Path, report: &mut ReconstructReport) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if fs::symlink_metadata(entry.path())?.is_dir() {
+            remove_tree(&entry.path(), report)?;
+        } else {
+            fs::remove_file(entry.path())?;
+            report.files_deleted += 1;
+        }
+    }
+    fs::remove_dir(dir)?;
+    report.dirs_deleted += 1;
+    Ok(())
 }
 
 /// Removes `<dest>/.xet-p2p-staging-*` directories left by an interrupted reconstruction.

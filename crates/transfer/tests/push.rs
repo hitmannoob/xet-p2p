@@ -146,6 +146,7 @@ impl Harness {
             dest: dest.into(),
             parallel_streams: 4,
             max_memory_bytes: transfer::DEFAULT_MAX_MEMORY_BYTES,
+            delete: false,
         };
         configure(&mut opts);
         let result = push(self.sender_cas.clone(), &self.src(), &conn, &opts).await;
@@ -275,6 +276,7 @@ async fn unauthorized_client_cannot_push() {
             dest: "p".into(),
             parallel_streams: 1,
             max_memory_bytes: transfer::DEFAULT_MAX_MEMORY_BYTES,
+            delete: false,
         };
         push(h.sender_cas.clone(), &h.src(), &conn, &opts).await
     }
@@ -307,6 +309,7 @@ where
             protocol_version: PROTOCOL_VERSION,
             session_id: "test".into(),
             dest: "p".into(),
+            delete: false,
         },
     )
     .await
@@ -450,6 +453,7 @@ async fn interrupted_push(h: &Harness, dest: &str, commit: usize) -> usize {
             protocol_version: PROTOCOL_VERSION,
             session_id: "interrupted".into(),
             dest: dest.into(),
+            delete: false,
         },
     )
     .await
@@ -698,4 +702,39 @@ async fn sender_without_scope_entry_rejected_when_scopes_configured() {
         matches!(err, Error::Remote(ref m) if m.contains("no destination scope")),
         "{err:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn push_with_delete_mirrors_source() {
+    let h = Harness::new().await;
+    write(&h.src(), "keep.txt", b"keep");
+    write(&h.src(), "remove-later.txt", b"soon gone");
+    write(&h.src(), "dir/inner.txt", b"inner");
+    h.push("p").await.unwrap();
+
+    fs::remove_file(h.src().join("remove-later.txt")).unwrap();
+    fs::remove_dir_all(h.src().join("dir")).unwrap();
+    // Without --delete the receiver keeps them.
+    let r = h.push("p").await.unwrap();
+    assert_eq!(r.receiver.files_deleted, 0);
+    assert!(h.root().join("p/remove-later.txt").exists());
+
+    let r = h.push_with("p", |o| o.delete = true).await.unwrap();
+    assert_eq!(
+        (r.receiver.files_deleted, r.receiver.dirs_deleted),
+        (2, 1),
+        "{:?}",
+        r.receiver
+    );
+    assert_trees_equal(&h.src(), &h.root().join("p"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_never_reaches_outside_destination() {
+    let h = Harness::new().await;
+    write(&h.root(), "sibling/precious.txt", b"not part of the push");
+    write(&h.src(), "a.txt", b"a");
+    h.push_with("p", |o| o.delete = true).await.unwrap();
+    assert!(h.root().join("sibling/precious.txt").exists());
+    assert!(h.root().join(".xet-p2p/cas").exists());
 }

@@ -27,6 +27,8 @@ pub struct PushOptions {
     pub parallel_streams: usize,
     /// Upper bound on xorb bytes held in memory at once (at least one xorb always fits).
     pub max_memory_bytes: u64,
+    /// Ask the receiver to remove anything under `dest` that the source does not contain.
+    pub delete: bool,
 }
 
 /// Default for [`PushOptions::max_memory_bytes`] and the receiver's equivalent.
@@ -86,6 +88,7 @@ pub async fn push(
             protocol_version: PROTOCOL_VERSION,
             session_id: session_id(),
             dest: opts.dest.clone(),
+            delete: opts.delete,
         },
     )
     .await?;
