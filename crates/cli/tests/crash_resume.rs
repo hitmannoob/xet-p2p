@@ -191,7 +191,10 @@ fn receiver_killed_mid_transfer_resumes_after_restart() {
 
     assert_eq!(rr["resumed"], true, "{report:#}");
     assert_eq!(rr["prior_xorbs_committed"].as_u64().unwrap(), committed);
-    assert_eq!(rr["shard_from_session"], true);
+    assert!(
+        rr["reconstructions_reused"].as_u64().unwrap() >= 1,
+        "{report:#}"
+    );
     assert_eq!(report["shard_bytes_sent"], 0);
     let referenced = report["xorbs_referenced"].as_u64().unwrap();
     let sent = report["xorbs_sent"].as_u64().unwrap();

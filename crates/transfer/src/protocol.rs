@@ -124,8 +124,9 @@ pub struct ReceiverReport {
     /// Xorbs committed by earlier, interrupted attempts (resume savings).
     pub prior_xorbs_committed: u64,
     pub prior_xorb_bytes_committed: u64,
-    /// The reconstruction shard came from the saved session instead of the wire.
-    pub shard_from_session: bool,
+    /// Reconstruction entries received by an earlier, interrupted attempt and reused instead of
+    /// being requested again.
+    pub reconstructions_reused: usize,
 }
 
 pub(crate) fn to_hex(hashes: impl IntoIterator<Item = MerkleHash>) -> Vec<String> {

@@ -186,44 +186,40 @@ impl Receiver {
         let mut xorbs = missing.xorbs.clone();
         let mut present = missing.present_xorbs.clone();
 
-        // Round 1: reconstruction metadata for files this CAS has never seen, unless an earlier
-        // attempt of this session already received it.
+        // Round 1: reconstruction metadata for files this CAS has never seen. Entries received by
+        // an earlier, interrupted attempt (any session) are reused; only the rest are requested.
         let mut pending = None;
         if !missing.reconstructions.is_empty() {
-            let saved = session
-                .saved_shard
-                .take()
-                .and_then(|b| PendingShard::parse_containing(&b, &missing.reconstructions).ok());
-            let p = match saved {
-                Some(p) => {
-                    report.shard_from_session = true;
-                    p
-                }
-                None => {
-                    write_frame(
-                        send,
-                        &Message::Need {
-                            reconstructions: to_hex(missing.reconstructions.iter().copied()),
-                            xorbs: vec![],
-                        },
-                    )
-                    .await?;
-                    let shard = self.receive_shard(conn).await?;
-                    report.shards_received += 1;
-                    report.payload_bytes_received += shard.len() as u64;
-                    let p = PendingShard::parse(&shard, &missing.reconstructions)?;
-                    session.save_shard(&shard)?;
-                    write_frame(
-                        send,
-                        &Message::Ack {
-                            kind: ObjectKind::Shard,
-                            hash: None,
-                        },
-                    )
-                    .await?;
-                    p
-                }
-            };
+            let (saved, have) = self.sessions.take_pending(&missing.reconstructions);
+            report.reconstructions_reused = have.len();
+            let need: BTreeSet<MerkleHash> =
+                missing.reconstructions.difference(&have).copied().collect();
+            let mut parts = vec![saved];
+            if !need.is_empty() {
+                write_frame(
+                    send,
+                    &Message::Need {
+                        reconstructions: to_hex(need.iter().copied()),
+                        xorbs: vec![],
+                    },
+                )
+                .await?;
+                let shard = self.receive_shard(conn).await?;
+                report.shards_received += 1;
+                report.payload_bytes_received += shard.len() as u64;
+                let p = PendingShard::parse(&shard, &need)?;
+                self.sessions.put_pending(&p)?;
+                write_frame(
+                    send,
+                    &Message::Ack {
+                        kind: ObjectKind::Shard,
+                        hash: None,
+                    },
+                )
+                .await?;
+                parts.push(p);
+            }
+            let p = PendingShard::merge(parts);
             let referenced = p.referenced_xorbs();
             let absent = self.cas.absent_xorbs(&referenced).await?;
             present.extend(referenced.difference(&absent));
@@ -250,7 +246,9 @@ impl Receiver {
 
         // Only now, with every xorb verified locally, are the new file entries checked and kept.
         if let Some(p) = pending {
+            let files = p.file_hashes();
             self.cas.commit_shard(p).await?;
+            self.sessions.remove_pending(&files);
         }
 
         let dest_dir = create_confined_dir(&self.root, &dest)?;
@@ -263,16 +261,26 @@ impl Receiver {
         Ok(report)
     }
 
-    /// Rejects destinations that escape the root or overlap the CAS directory.
+    /// Rejects destinations that escape the root or overlap the CAS or session directories.
     fn check_dest(&self, dest: &str) -> Result<()> {
         let rel = validate_rel_path(dest)?;
         let lexical = self.root.join(rel);
-        let cas = self.cas.root();
-        if lexical.starts_with(cas) || cas.starts_with(&lexical) {
-            return Err(Error::Local(xet_local::Error::UnsafePath {
-                path: dest.to_owned(),
-                reason: "destination overlaps the receiver's CAS directory",
-            }));
+        for (dir, what) in [
+            (
+                self.cas.root(),
+                "destination overlaps the receiver's CAS directory",
+            ),
+            (
+                self.sessions.dir(),
+                "destination overlaps the receiver's session directory",
+            ),
+        ] {
+            if lexical.starts_with(dir) || dir.starts_with(&lexical) {
+                return Err(Error::Local(xet_local::Error::UnsafePath {
+                    path: dest.to_owned(),
+                    reason: what,
+                }));
+            }
         }
         Ok(())
     }

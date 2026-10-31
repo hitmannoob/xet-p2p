@@ -333,15 +333,14 @@ fn print_push_report(r: &PushReport) {
     );
     if rr.resumed {
         eprintln!(
-            "  resumed interrupted session (attempt {}): {} xorbs / {} bytes already committed{}",
-            rr.attempts,
-            rr.prior_xorbs_committed,
-            rr.prior_xorb_bytes_committed,
-            if rr.shard_from_session {
-                "; shard reused"
-            } else {
-                ""
-            }
+            "  resumed interrupted session (attempt {}): {} xorbs / {} bytes already committed",
+            rr.attempts, rr.prior_xorbs_committed, rr.prior_xorb_bytes_committed,
+        );
+    }
+    if rr.reconstructions_reused > 0 {
+        eprintln!(
+            "  reused {} file reconstruction entries saved by an interrupted attempt",
+            rr.reconstructions_reused
         );
     }
 }

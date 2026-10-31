@@ -82,6 +82,32 @@ impl PendingShard {
         self.files.len()
     }
 
+    /// Xet file hashes this shard describes.
+    pub fn file_hashes(&self) -> BTreeSet<MerkleHash> {
+        self.files.iter().map(|f| f.metadata.file_hash).collect()
+    }
+
+    /// One native single-entry shard per file, for storing entries independently.
+    pub fn split(&self) -> Result<Vec<(MerkleHash, Vec<u8>)>> {
+        self.files
+            .iter()
+            .map(|info| {
+                let mut shard = MDBInMemoryShard::default();
+                shard
+                    .add_file_reconstruction_info(info.clone())
+                    .map_err(xet_err)?;
+                Ok((info.metadata.file_hash, shard.to_bytes().map_err(xet_err)?))
+            })
+            .collect()
+    }
+
+    /// Combines parts describing disjoint files.
+    pub fn merge(parts: impl IntoIterator<Item = PendingShard>) -> Self {
+        Self {
+            files: parts.into_iter().flat_map(|p| p.files).collect(),
+        }
+    }
+
     /// Every xorb any file in this shard references.
     pub fn referenced_xorbs(&self) -> BTreeSet<MerkleHash> {
         self.files

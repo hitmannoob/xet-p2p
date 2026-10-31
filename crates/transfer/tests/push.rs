@@ -522,9 +522,9 @@ async fn interrupted_push_resumes_without_resending_committed_content() {
     assert!(rr.resumed, "{rr:?}");
     assert_eq!(rr.attempts, 2);
     assert_eq!(rr.prior_xorbs_committed, 2);
-    assert!(
-        rr.shard_from_session,
-        "shard must come from the saved session"
+    assert_eq!(
+        rr.reconstructions_reused, 2,
+        "entries must come from saved state"
     );
     assert_eq!(r.shard_bytes_sent, 0);
     assert_eq!(
@@ -542,7 +542,7 @@ async fn interrupted_before_any_xorb_still_reuses_shard() {
     write(&h.src(), "a.bin", &random_bytes(31, 3 * MIB));
     let needed = interrupted_push(&h, "p", 0).await;
     let r = h.push("p").await.unwrap();
-    assert!(r.receiver.resumed && r.receiver.shard_from_session);
+    assert!(r.receiver.resumed && r.receiver.reconstructions_reused == 1);
     assert_eq!(r.shard_bytes_sent, 0);
     assert_eq!(r.xorbs_sent, needed);
     assert_trees_equal(&h.src(), &h.root().join("p"));
@@ -555,10 +555,16 @@ async fn completed_session_is_removed() {
     let r1 = h.push("p").await.unwrap();
     assert!(!r1.receiver.resumed);
     let sessions = h.root().join(".xet-p2p/cas/sessions");
+    let leftovers: Vec<_> = fs::read_dir(&sessions)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n != "pending")
+        .collect();
+    assert!(leftovers.is_empty(), "session left behind: {leftovers:?}");
     assert_eq!(
-        fs::read_dir(&sessions).unwrap().count(),
+        fs::read_dir(sessions.join("pending")).unwrap().count(),
         0,
-        "session left behind"
+        "pending entries left behind"
     );
     let r2 = h.push("p").await.unwrap();
     assert!(!r2.receiver.resumed);
@@ -571,9 +577,12 @@ async fn changed_source_after_interruption_starts_fresh_but_reuses_xorbs() {
     interrupted_push(&h, "p", 2).await;
     write(&h.src(), "new.txt", b"added after the interruption");
     let r = h.push("p").await.unwrap();
-    // Different manifest, so a different session; the committed xorbs are still found in the CAS.
+    // Different manifest, so a different session; the committed xorbs are still found in the CAS,
+    // and the unchanged file's entry is reused, so only new.txt's metadata is requested.
     assert!(!r.receiver.resumed);
     assert!(r.receiver.xorbs_already_present >= 2, "{:?}", r.receiver);
+    assert_eq!(r.receiver.reconstructions_reused, 1, "{:?}", r.receiver);
+    assert_eq!(r.receiver.shards_received, 1);
     assert_trees_equal(&h.src(), &h.root().join("p"));
 }
 
@@ -620,4 +629,30 @@ async fn tiny_memory_budgets_still_complete_one_xorb_at_a_time() {
         .unwrap();
     assert!(r.xorbs_sent >= 2);
     assert_trees_equal(&h.src(), &h.root().join("p"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn destination_overlapping_session_dir_rejected() {
+    let tmp_sessions = std::sync::Mutex::new(None);
+    let h = Harness::with_receiver(|o| {
+        let dir = o
+            .session_dir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("state");
+        *tmp_sessions.lock().unwrap() = Some(dir.clone());
+        o.session_dir = dir; // <root>/state
+    })
+    .await;
+    write(&h.src(), "a.txt", b"x");
+    let err = h.push("state").await.unwrap_err();
+    assert!(
+        matches!(err, Error::Remote(ref m) if m.contains("session")),
+        "{err:?}"
+    );
+    assert!(h.push("elsewhere").await.is_ok());
 }
