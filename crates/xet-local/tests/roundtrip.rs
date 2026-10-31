@@ -330,3 +330,93 @@ async fn missing_content_fails_without_partial_files() {
     ));
     assert!(snapshot(&f.dest).is_empty());
 }
+
+// ---- M2: incremental install ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unchanged_files_are_not_rewritten() {
+    let f = fixture().await;
+    write(&f.src, "keep.bin", &random_bytes(20, MIB));
+    write(&f.src, "edit.txt", b"version 1");
+    let (m1, _) = f.cas.ingest(&f.src).await.unwrap();
+    let r1 = f.cas.reconstruct(&m1, &f.dest).await.unwrap();
+    assert_eq!((r1.files, r1.files_unchanged), (2, 0));
+
+    // Mark the installed copy so a rewrite would be detectable (a new inode from rename).
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(f.dest.join("keep.bin")).unwrap().ino()
+    };
+
+    write(&f.src, "edit.txt", b"version 2");
+    let (m2, _) = f.cas.ingest(&f.src).await.unwrap();
+    let r2 = f.cas.reconstruct(&m2, &f.dest).await.unwrap();
+    assert_eq!((r2.files, r2.files_unchanged), (1, 1));
+    assert_eq!(r2.bytes, 9);
+    assert_eq!(snapshot(&f.src), snapshot(&f.dest));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(fs::metadata(f.dest.join("keep.bin")).unwrap().ino(), inode);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn locally_modified_destination_file_is_restored() {
+    let f = fixture().await;
+    write(&f.src, "a.txt", b"original");
+    let (m, _) = f.cas.ingest(&f.src).await.unwrap();
+    f.cas.reconstruct(&m, &f.dest).await.unwrap();
+    fs::write(f.dest.join("a.txt"), b"tampered").unwrap();
+    let r = f.cas.reconstruct(&m, &f.dest).await.unwrap();
+    assert_eq!((r.files, r.files_unchanged), (1, 0));
+    assert_eq!(fs::read(f.dest.join("a.txt")).unwrap(), b"original");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn executable_bit_change_alone_is_applied() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture().await;
+    write(&f.src, "run.sh", b"#!/bin/sh\n");
+    let (m1, _) = f.cas.ingest(&f.src).await.unwrap();
+    f.cas.reconstruct(&m1, &f.dest).await.unwrap();
+    fs::set_permissions(f.src.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let (m2, _) = f.cas.ingest(&f.src).await.unwrap();
+    let r = f.cas.reconstruct(&m2, &f.dest).await.unwrap();
+    assert_eq!(r.files_unchanged, 1);
+    let mode = fs::metadata(f.dest.join("run.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_ne!(mode & 0o111, 0);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn identical_file_behind_symlink_is_not_trusted() {
+    let f = fixture().await;
+    write(&f.src, "sub/a.txt", b"same");
+    let (m, _) = f.cas.ingest(&f.src).await.unwrap();
+    // An identical file reachable only through a symlinked directory must not count as present.
+    let outside = f._tmp.path().join("outside");
+    write(&outside, "a.txt", b"same");
+    fs::create_dir(&f.dest).unwrap();
+    std::os::unix::fs::symlink(&outside, f.dest.join("sub")).unwrap();
+    assert!(matches!(
+        f.cas.reconstruct(&m, &f.dest).await,
+        Err(Error::UnsafePath { .. })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_staging_directory_is_cleaned_up() {
+    let f = fixture().await;
+    write(&f.src, "a.txt", b"x");
+    let (m, _) = f.cas.ingest(&f.src).await.unwrap();
+    // As if a previous reconstruction was killed mid-way.
+    write(&f.dest, ".xet-p2p-staging-123-456/0", b"partial");
+    f.cas.reconstruct(&m, &f.dest).await.unwrap();
+    assert_eq!(snapshot(&f.src), snapshot(&f.dest));
+}

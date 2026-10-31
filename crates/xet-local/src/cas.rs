@@ -42,6 +42,8 @@ pub struct MissingContent {
     pub reconstructions: BTreeSet<MerkleHash>,
     /// Xorbs referenced by known reconstructions but not present locally.
     pub xorbs: BTreeSet<MerkleHash>,
+    /// Xorbs referenced by known reconstructions and already present locally.
+    pub present_xorbs: BTreeSet<MerkleHash>,
 }
 
 impl MissingContent {
@@ -59,8 +61,12 @@ pub struct IngestReport {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconstructReport {
+    /// Files written (reconstructed, verified, installed).
     pub files: usize,
+    /// Files already present at the destination with identical content; left untouched.
+    pub files_unchanged: usize,
     pub dirs: usize,
+    /// Bytes reconstructed (excludes unchanged files).
     pub bytes: u64,
 }
 
@@ -186,14 +192,19 @@ impl LocalCas {
                 continue;
             };
             for segment in &info.segments {
-                if !missing.xorbs.contains(&segment.xorb_hash)
-                    && !self
-                        .client
-                        .xorb_exists(&segment.xorb_hash)
-                        .await
-                        .map_err(|e| Error::Xet(e.to_string()))?
+                let h = segment.xorb_hash;
+                if missing.xorbs.contains(&h) || missing.present_xorbs.contains(&h) {
+                    continue;
+                }
+                if self
+                    .client
+                    .xorb_exists(&h)
+                    .await
+                    .map_err(|e| Error::Xet(e.to_string()))?
                 {
-                    missing.xorbs.insert(segment.xorb_hash);
+                    missing.present_xorbs.insert(h);
+                } else {
+                    missing.xorbs.insert(h);
                 }
             }
         }
@@ -206,6 +217,10 @@ impl LocalCas {
     /// any is moved into place, so a failure never exposes a partial or unverified file. Each file
     /// is installed with an atomic rename. Existing symlinks or non-directories in the way are
     /// rejected rather than followed.
+    ///
+    /// A file already present with identical size and SHA-256 is left untouched. Staging
+    /// directories left by an interrupted earlier run in `dest` are removed; callers must not run
+    /// two reconstructions into the same `dest` concurrently.
     pub async fn reconstruct(
         &self,
         manifest: &Manifest,
@@ -223,6 +238,7 @@ impl LocalCas {
         let dest = dest.as_ref();
         fs::create_dir_all(dest)?;
         let dest = fs::canonicalize(dest)?;
+        remove_stale_staging(&dest)?;
 
         let staging = dest.join(staging_name());
         fs::create_dir(&staging)?;
@@ -242,6 +258,14 @@ impl LocalCas {
 
         let session = FileDownloadSession::from_client(&self.ctx, self.client.clone(), None);
         for (i, (entry, size, xet_hash, sha256, executable)) in manifest.files().enumerate() {
+            let rel = validate_rel_path(&entry.path)?;
+            if let Some(existing) = existing_regular_file(dest, &rel)
+                && verify_file(&existing, size, sha256).is_ok()
+            {
+                set_executable(&existing, executable)?;
+                report.files_unchanged += 1;
+                continue;
+            }
             let tmp = staging.join(i.to_string());
             session
                 .download_file(&XetFileInfo::new(xet_hash.to_owned(), size), &tmp)
@@ -299,6 +323,37 @@ fn staging_name() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{STAGING_PREFIX}{}-{nanos}", std::process::id())
+}
+
+/// Removes `<dest>/.xet-p2p-staging-*` directories left by an interrupted reconstruction.
+/// Manifests can never name such paths, so nothing a user transferred is touched.
+fn remove_stale_staging(dest: &Path) -> Result<()> {
+    for entry in fs::read_dir(dest)? {
+        let entry = entry?;
+        let is_staging = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with(STAGING_PREFIX));
+        if is_staging && entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// `dest/rel` if it is a regular file reached without traversing any symlink; otherwise `None`.
+fn existing_regular_file(dest: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut cur = dest.to_path_buf();
+    let n = rel.components().count();
+    for (i, component) in rel.components().enumerate() {
+        cur.push(component);
+        let m = fs::symlink_metadata(&cur).ok()?;
+        let ok = if i + 1 == n { m.is_file() } else { m.is_dir() };
+        if !ok {
+            return None;
+        }
+    }
+    Some(cur)
 }
 
 /// Creates `rel` (a manifest-style relative path) under `root` without following symlinks, and
@@ -360,15 +415,22 @@ fn verify_file(path: &Path, size: u64, sha256: &str) -> std::result::Result<(), 
     Ok(())
 }
 
+/// Grants execute wherever read is granted, or clears all execute bits.
 fn set_executable(path: &Path, executable: bool) -> Result<()> {
     #[cfg(unix)]
-    if executable {
+    {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = fs::metadata(path)?.permissions();
         let mode = perms.mode();
-        // Grant execute wherever read is granted.
-        perms.set_mode(mode | ((mode & 0o444) >> 2));
-        fs::set_permissions(path, perms)?;
+        let new = if executable {
+            mode | ((mode & 0o444) >> 2)
+        } else {
+            mode & !0o111
+        };
+        if new != mode {
+            perms.set_mode(new);
+            fs::set_permissions(path, perms)?;
+        }
     }
     #[cfg(not(unix))]
     let _ = (path, executable);
