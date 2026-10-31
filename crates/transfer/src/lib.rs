@@ -4,6 +4,7 @@
 
 mod budget;
 mod error;
+mod fetch;
 mod locks;
 pub mod protocol;
 mod rate;
