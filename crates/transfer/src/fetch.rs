@@ -12,10 +12,10 @@ use tracing::{Instrument, debug, info};
 use transport::{Conn, RecvStream, SendStream};
 use transport::{read_frame, read_payload, write_frame};
 use xet_local::chunks::ChunkList;
-use xet_local::chunks::{VerifiedChunk, XorbPacker, decode_chunk_lists, parse_chunk_run};
+use xet_local::chunks::{VerifiedChunk, XorbPacker, decode_chunk_lists, parse_chunk_run_keeping};
 use xet_local::{
     LocalCas, Manifest, MerkleHash, MissingContent, PendingShard, ReconstructOptions,
-    Reconstruction,
+    Reconstruction, StreamedFile,
 };
 
 use crate::budget::MemoryBudget;
@@ -69,9 +69,28 @@ struct Readiness<'a> {
     /// Per missing chunk, the files waiting for it.
     needed_by: HashMap<MerkleHash, Vec<MerkleHash>>,
     recon: &'a mut Reconstruction,
+    /// Files written straight from their arriving chunks (all of their content is new).
+    streams: HashMap<MerkleHash, StreamedFile>,
+    /// For each chunk of a streamed file, the (file, position) pairs it fills.
+    positions: HashMap<MerkleHash, Vec<(MerkleHash, u32)>>,
+    /// The chunk hashes in `positions`, for the verify tasks.
+    streamed: Arc<std::collections::HashSet<MerkleHash>>,
 }
 
 impl Readiness<'_> {
+    /// Hands a verified chunk's uncompressed bytes to every streamed file position it fills.
+    async fn feed(&self, hash: &MerkleHash, plain: Vec<u8>) -> Result<()> {
+        if let Some(at) = self.positions.get(hash) {
+            let data = Arc::new(plain);
+            for (file, index) in at {
+                if let Some(s) = self.streams.get(file) {
+                    s.put(*index, data.clone()).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn chunks_committed(&mut self, cas: &LocalCas, hashes: &[MerkleHash]) -> Result<()> {
         let mut ready = Vec::new();
         for h in hashes {
@@ -346,6 +365,9 @@ impl Fetcher {
             waiting: HashMap::new(),
             needed_by: HashMap::new(),
             recon,
+            streams: HashMap::new(),
+            positions: HashMap::new(),
+            streamed: Arc::default(),
         };
         for (f, l) in lists {
             let sha = sha.get(&f).cloned().ok_or_else(|| {
@@ -360,6 +382,25 @@ impl Fetcher {
             ready.waiting.insert(f, distinct.len());
             ready.lists.insert(f, (l, sha));
         }
+        // Files whose content is entirely new are written as their chunks arrive; the rest are
+        // rebuilt from the CAS as soon as they are complete.
+        let mut streamed = std::collections::HashSet::new();
+        for (f, (l, _)) in &ready.lists {
+            let distinct: std::collections::HashSet<&MerkleHash> =
+                l.iter().map(|(h, _)| h).collect();
+            if ready.waiting.get(f) == Some(&distinct.len())
+                && let Some(s) = ready
+                    .recon
+                    .stream_file(f, l.iter().map(|(_, n)| *n).collect())
+            {
+                for (i, (h, _)) in l.iter().enumerate() {
+                    ready.positions.entry(*h).or_default().push((*f, i as u32));
+                    streamed.insert(*h);
+                }
+                ready.streams.insert(*f, s);
+            }
+        }
+        ready.streamed = Arc::new(streamed);
         // Files whose every chunk is already here can start now.
         let complete: Vec<MerkleHash> = ready
             .waiting
@@ -413,7 +454,7 @@ impl Fetcher {
     ) -> Result<()> {
         type Received = (
             Vec<u8>,
-            Vec<VerifiedChunk>,
+            Vec<(VerifiedChunk, Option<Vec<u8>>)>,
             tokio::sync::OwnedSemaphorePermit,
         );
         let permits = Arc::new(Semaphore::new(self.opts.parallel_objects));
@@ -434,6 +475,7 @@ impl Fetcher {
                 stream = conn.accept_uni(), if !outstanding.is_empty() => {
                     let mut stream = stream?;
                     let (permits, budget) = (permits.clone(), self.budget.clone());
+                    let keep = ready.streamed.clone();
                     tasks.spawn(async move {
                         let _permit = permits.acquire_owned().await.expect("semaphore never closed");
                         let header = read_header(&mut stream).await?;
@@ -451,7 +493,7 @@ impl Fetcher {
                         let (bytes, chunks) = tokio::task::spawn_blocking(move || {
                             let _g = span.entered();
                             let t = std::time::Instant::now();
-                            let chunks = parse_chunk_run(&bytes);
+                            let chunks = parse_chunk_run_keeping(&bytes, |h| keep.contains(h));
                             debug!(ms = t.elapsed().as_millis() as u64, bytes = bytes.len(), "chunk run verified");
                             (bytes, chunks)
                         })
@@ -463,12 +505,15 @@ impl Fetcher {
                 Some(done) = tasks.join_next(), if !tasks.is_empty() => {
                     let (bytes, chunks, _memory) =
                         done.map_err(|e| Error::Protocol(format!("receive task failed: {e}")))??;
-                    for c in chunks {
+                    for (c, plain) in chunks {
                         if outstanding.remove(&c.hash).is_none() {
                             return Err(Error::Protocol(format!("unrequested or duplicate chunk {}", c.hash.hex())));
                         }
                         packer.push(&bytes[c.span.clone()], c.size);
                         pack.push(c.hash);
+                        if let Some(plain) = plain {
+                            ready.feed(&c.hash, plain).await?;
+                        }
                         report.chunks_received += 1;
                         if packer.is_full() {
                             self.commit_pack(&mut commits, &mut packer, &mut pack, session, report, ready)

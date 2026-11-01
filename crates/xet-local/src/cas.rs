@@ -907,6 +907,104 @@ impl Reconstruction {
     }
 }
 
+/// A file the caller stages itself, from its chunks as they arrive ([`Reconstruction::stream_file`]).
+/// Every chunk position must be [`put`](Self::put), in any order.
+pub struct StreamedFile {
+    tx: tokio::sync::mpsc::Sender<(u32, Arc<Vec<u8>>)>,
+}
+
+impl StreamedFile {
+    /// Supplies the uncompressed chunk at position `index` of the file's chunk list.
+    pub async fn put(&self, index: u32, data: Arc<Vec<u8>>) -> Result<()> {
+        self.tx
+            .send((index, data))
+            .await
+            .map_err(|_| Error::Xet("streamed file writer stopped".into()))
+    }
+}
+
+impl Reconstruction {
+    /// Takes `file` (whose chunk sizes, in order, are `sizes`) out of the plan and returns a
+    /// writer that stages it from its chunks as they arrive, instead of rebuilding it from the
+    /// CAS once complete. The writer puts chunks in order (holding early ones), hashes as it
+    /// goes and, after the last, syncs the file and checks its size and SHA-256 against the
+    /// manifest, like any staged file. `None` unless exactly one path needs `file`'s content.
+    pub fn stream_file(&mut self, file: &MerkleHash, sizes: Vec<u64>) -> Option<StreamedFile> {
+        let key = file.hex();
+        if self.pending.get(&key).map(Vec::len) != Some(1) || sizes.is_empty() {
+            return None;
+        }
+        let w = self.pending.remove(&key)?.pop()?;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u32, Arc<Vec<u8>>)>(64);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let r = assemble(&w, &sizes, &mut rx);
+            let _ = done_tx.send(r.map(|()| w));
+        });
+        self.running.spawn(
+            async move {
+                let w = done_rx
+                    .await
+                    .map_err(|_| Error::Xet("streamed file writer stopped".into()))??;
+                set_executable(&w.tmp, w.executable)?;
+                Ok((w.tmp, w.path, w.size))
+            }
+            .instrument(tracing::debug_span!("stream_file")),
+        );
+        Some(StreamedFile { tx })
+    }
+}
+
+/// Writes `w` from its chunks in order as they arrive on `rx`, then verifies it.
+fn assemble(
+    w: &Work,
+    sizes: &[u64],
+    rx: &mut tokio::sync::mpsc::Receiver<(u32, Arc<Vec<u8>>)>,
+) -> Result<()> {
+    use sha2::Digest;
+    use std::io::Write;
+    let fail = |reason: String| Error::Verification {
+        path: w.path.clone(),
+        reason,
+    };
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, fs::File::create(&w.tmp)?);
+    let mut sha = sha2::Sha256::new();
+    let (mut next, mut written) = (0usize, 0u64);
+    let mut early: std::collections::HashMap<usize, Arc<Vec<u8>>> = Default::default();
+    while next < sizes.len() {
+        let (i, data) = rx
+            .blocking_recv()
+            .ok_or_else(|| fail("transfer ended before the file was complete".into()))?;
+        let i = i as usize;
+        if sizes.get(i) != Some(&(data.len() as u64)) {
+            return Err(fail(format!("chunk {i} has the wrong size")));
+        }
+        if i != next {
+            early.insert(i, data);
+            continue;
+        }
+        let mut cur = Some(data);
+        while let Some(d) = cur {
+            out.write_all(&d)?;
+            sha.update(&d[..]);
+            written += d.len() as u64;
+            next += 1;
+            cur = early.remove(&next);
+        }
+    }
+    out.flush()?;
+    let file = out.into_inner().map_err(|e| e.into_error())?;
+    crate::durable::sync_file(&file)?;
+    if written != w.size {
+        return Err(fail(format!("size {written}, expected {}", w.size)));
+    }
+    let sha = hex::encode(sha.finalize());
+    if !sha.eq_ignore_ascii_case(&w.sha256) {
+        return Err(fail(format!("SHA-256 {sha}, expected {}", w.sha256)));
+    }
+    Ok(())
+}
+
 /// A file to reconstruct into staging.
 struct Work {
     tmp: PathBuf,

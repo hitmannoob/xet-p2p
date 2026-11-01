@@ -140,6 +140,28 @@ pub fn parse_chunk_run(bytes: &[u8]) -> Result<Vec<VerifiedChunk>> {
     Ok(out)
 }
 
+/// [`parse_chunk_run`], also returning the uncompressed bytes of each chunk for which `keep` is
+/// true (for writing them out directly).
+pub fn parse_chunk_run_keeping(
+    bytes: &[u8],
+    keep: impl Fn(&MerkleHash) -> bool,
+) -> Result<Vec<(VerifiedChunk, Option<Vec<u8>>)>> {
+    let mut out = Vec::new();
+    for_each_chunk(bytes, |hash, plain, span| {
+        let kept = keep(&hash).then(|| plain.to_vec());
+        out.push((
+            VerifiedChunk {
+                hash,
+                size: plain.len() as u32,
+                span,
+            },
+            kept,
+        ));
+        Ok(())
+    })?;
+    Ok(out)
+}
+
 /// Decodes native serialized chunks, calling `f(hash, uncompressed, span)` for each in order.
 /// Sizes are bounded by `MAX_CHUNK_SIZE` before decompression.
 pub(crate) fn for_each_chunk(

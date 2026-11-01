@@ -208,3 +208,56 @@ async fn incompressible_files_skip_compression_and_round_trip() {
         fs::read(src.join("text.log")).unwrap()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn streamed_file_is_written_in_order_from_out_of_order_chunks() {
+    use rand::{Rng, SeedableRng};
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    // Random data with one block repeated, so a chunk occurs at more than one position.
+    let mut block = vec![0u8; 3 << 20];
+    rand::rngs::StdRng::seed_from_u64(5).fill(&mut block[..]);
+    let mut data = block.clone();
+    data.extend_from_slice(&block);
+    let mut tail = vec![0u8; 1 << 20];
+    rand::rngs::StdRng::seed_from_u64(6).fill(&mut tail[..]);
+    data.extend_from_slice(&tail);
+    write(&src, "big.bin", &data);
+    let cas = std::sync::Arc::new(LocalCas::open(tmp.path().join("cas")).await.unwrap());
+    let (m, _) = cas.ingest(&src).await.unwrap();
+    let (_, _, h, ..) = m.files().next().unwrap();
+    let file = xet_local::MerkleHash::from_hex(h).unwrap();
+    let lists = cas
+        .chunk_lists(&[file].into_iter().collect())
+        .await
+        .unwrap();
+    let list = &lists[0].1;
+
+    let dest = tmp.path().join("dest");
+    let mut r = cas
+        .begin_reconstruct(&m, &dest, xet_local::ReconstructOptions::default())
+        .unwrap();
+    let w = r
+        .stream_file(&file, list.iter().map(|(_, n)| *n).collect())
+        .expect("one path needs this content");
+    // Feed every position, last first.
+    let mut offsets = Vec::new();
+    let mut at = 0usize;
+    for (_, n) in list {
+        offsets.push(at);
+        at += *n as usize;
+    }
+    for (i, (_, n)) in list.iter().enumerate().rev() {
+        let chunk = data[offsets[i]..offsets[i] + *n as usize].to_vec();
+        w.put(i as u32, std::sync::Arc::new(chunk)).await.unwrap();
+    }
+    let distinct: std::collections::HashSet<_> = list.iter().map(|(h, _)| h).collect();
+    assert!(
+        distinct.len() < list.len(),
+        "test data should repeat a chunk"
+    );
+    drop(w);
+    let report = r.finish().await.unwrap();
+    assert_eq!(report.files, 1);
+    assert_eq!(fs::read(dest.join("big.bin")).unwrap(), data);
+}
