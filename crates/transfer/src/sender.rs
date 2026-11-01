@@ -84,12 +84,53 @@ pub async fn push(
     conn: &Conn,
     opts: &PushOptions,
 ) -> Result<PushReport> {
+    let prepared = prepare(&cas, src).await?;
+    push_prepared(cas, prepared, conn, opts).await
+}
+
+/// A source ingested into the local CAS, ready to push. Preparing needs no connection, so it can
+/// run while the connection is set up.
+pub struct Prepared {
+    manifest: Manifest,
+    ingest: IngestReport,
+    files: BTreeSet<MerkleHash>,
+    referenced: BTreeSet<MerkleHash>,
+    took: Duration,
+}
+
+/// Ingests `src` (a file or directory) into the local CAS: the connection-free part of a push.
+pub async fn prepare(cas: &LocalCas, src: &Path) -> Result<Prepared> {
     let start = Instant::now();
-    let limiter = opts.bandwidth_limit.map(|b| Arc::new(RateLimiter::new(b)));
     let (manifest, ingest) = cas.ingest(src).await?;
     let files = file_hashes(&manifest)?;
     let referenced = cas.referenced_xorbs(&files).await?;
     cas.touch_xorbs(&referenced); // recency for GC on the sender's CAS
+    Ok(Prepared {
+        manifest,
+        ingest,
+        files,
+        referenced,
+        took: start.elapsed(),
+    })
+}
+
+/// Pushes a [`prepare`]d source. The report's `elapsed` is preparing plus pushing, not any wait
+/// between them.
+pub async fn push_prepared(
+    cas: Arc<LocalCas>,
+    prepared: Prepared,
+    conn: &Conn,
+    opts: &PushOptions,
+) -> Result<PushReport> {
+    let start = Instant::now();
+    let limiter = opts.bandwidth_limit.map(|b| Arc::new(RateLimiter::new(b)));
+    let Prepared {
+        manifest,
+        ingest,
+        files,
+        referenced,
+        took,
+    } = prepared;
 
     let mut report = PushReport {
         ingest,
@@ -176,7 +217,7 @@ pub async fn push(
     report.udp_bytes_sent = stats.tx;
     report.udp_bytes_received = stats.rx;
     report.transport = conn.kind();
-    report.elapsed = start.elapsed();
+    report.elapsed = took + start.elapsed();
     Ok(report)
 }
 

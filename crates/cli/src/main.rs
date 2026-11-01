@@ -5,7 +5,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use transfer::{
-    PullOptions, PushOptions, PushReport, Receiver, ReceiverOptions, TransferMode, pull, push,
+    PullOptions, PushOptions, PushReport, Receiver, ReceiverOptions, TransferMode, prepare, pull,
+    push_prepared,
 };
 use transport::Listener as _;
 use transport_quic::{
@@ -360,12 +361,37 @@ async fn main() -> Result<()> {
                 (None, Some(to), Some(dest)) => format!("quic://{to}/{dest}"),
                 _ => bail!("give a TARGET (or --to HOST:PORT --dest DEST)"),
             };
+            std::fs::symlink_metadata(&src).with_context(|| format!("{}", src.display()))?;
+            if delete {
+                eprintln!(
+                    "--delete: anything under {} not in {} will be removed",
+                    target,
+                    src.display()
+                );
+            }
+            // Connect (possibly starting an agent) while the source is ingested locally.
             let t = std::time::Instant::now();
-            let remote = open_target(&target, &conn).await?;
-            let connect = t.elapsed();
-            let t = std::time::Instant::now();
-            let cas = Arc::new(LocalCas::open(cas_dir(&conn)?).await?);
-            let cas_open = t.elapsed();
+            let (remote, prepared) = tokio::join!(
+                async {
+                    let r = open_target(&target, &conn).await;
+                    (r, t.elapsed())
+                },
+                async {
+                    let t = std::time::Instant::now();
+                    let cas = Arc::new(LocalCas::open(cas_dir(&conn)?).await?);
+                    let cas_open = t.elapsed();
+                    let prepared = prepare(&cas, &src).await?;
+                    anyhow::Ok((cas, cas_open, prepared))
+                }
+            );
+            let (remote, connect) = (remote.0?, remote.1);
+            let (cas, cas_open, prepared) = match prepared {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = remote.finish().await;
+                    return Err(e);
+                }
+            };
             let opts = PushOptions {
                 dest: remote.path.clone(),
                 parallel_streams: parallel as usize,
@@ -376,14 +402,11 @@ async fn main() -> Result<()> {
                     .filter(|m| *m > 0.0)
                     .map(|m| m * 1024.0 * 1024.0),
             };
-            if delete {
-                eprintln!(
-                    "--delete: anything under {} not in {} will be removed",
-                    target,
-                    src.display()
-                );
-            }
-            let result = explain(&remote.conn, push(cas, &src, &remote.conn, &opts).await).await;
+            let result = explain(
+                &remote.conn,
+                push_prepared(cas, prepared, &remote.conn, &opts).await,
+            )
+            .await;
             let (bootstrap, reused) = (remote.bootstrap, remote.reused_agent);
             let t = std::time::Instant::now();
             remote.finish().await?;
@@ -394,8 +417,8 @@ async fn main() -> Result<()> {
                 let mut j = report_json(&report);
                 j["bootstrap_secs"] = bootstrap.as_secs_f64().into();
                 j["reused_agent"] = reused.into();
-                // Time outside the transfer: connecting (includes bootstrap), opening the local
-                // CAS, and ending the session.
+                // Connecting (includes bootstrap) overlaps opening the local CAS and ingesting
+                // (part of elapsed_secs); ending the session follows the transfer.
                 j["connect_secs"] = connect.as_secs_f64().into();
                 j["cas_open_secs"] = cas_open.as_secs_f64().into();
                 j["close_secs"] = close.as_secs_f64().into();

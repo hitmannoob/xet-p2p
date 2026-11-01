@@ -17,7 +17,9 @@ pub use error::{Error, Result};
 pub use protocol::{ReceiverReport, TransferMode};
 pub use pull::{PullOptions, PullReport, pull};
 pub use receiver::{Activity, Receiver, ReceiverOptions};
-pub use sender::{DEFAULT_MAX_MEMORY_BYTES, PushOptions, PushReport, push};
+pub use sender::{
+    DEFAULT_MAX_MEMORY_BYTES, Prepared, PushOptions, PushReport, prepare, push, push_prepared,
+};
 pub use session::SessionRecord;
 
 /// Opens (creating if needed) a receiver session directory, discarding state idle longer than
