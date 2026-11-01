@@ -342,6 +342,7 @@ impl LocalCas {
     // ---- receiver ----
 
     /// Which chunks of `lists` this CAS lacks, and the ranges to request for them.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn plan_chunks(&self, lists: &[(MerkleHash, ChunkList)]) -> Result<ChunkPlan> {
         let present =
             self.locate_chunks(lists.iter().flat_map(|(_, l)| l.iter().map(|(h, _)| h)))?;
@@ -390,6 +391,7 @@ impl LocalCas {
 
     /// Builds a native xorb from verified native chunk bytes (no recompression), stores it
     /// durably and indexes it. Returns its hash and chunk count.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn commit_packed(&self, body: Vec<u8>) -> Result<(MerkleHash, usize)> {
         let t = std::time::Instant::now();
         let (xorb, hash, bytes) = tokio::task::spawn_blocking(move || {
@@ -412,6 +414,7 @@ impl LocalCas {
 
     /// Writes and registers a native reconstruction for each file against chunks held locally.
     /// The result goes through the same verification as a peer's shard.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn register_files(&self, files: &[(MerkleHash, ChunkList, String)]) -> Result<()> {
         let mut infos = Vec::with_capacity(files.len());
         for (file, list, sha256) in files {
@@ -452,6 +455,7 @@ impl LocalCas {
     /// Writes `file`'s bytes to `out` from this CAS: each segment's native chunks are read in one
     /// range read (footers cached), decoded, and checked against the chunk hashes in the xorb's
     /// footer. Returns (bytes written, SHA-256 hex) computed in the same pass.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) async fn write_file_from_cas(
         &self,
         file: &MerkleHash,

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{debug, info};
+use tracing::{Instrument, debug, info};
 use transport::{Conn, RecvStream, SendStream};
 use transport::{read_frame, read_payload, write_frame};
 use xet_local::chunks::{VerifiedChunk, XorbPacker, decode_chunk_lists, parse_chunk_run};
@@ -54,6 +54,7 @@ impl Fetcher {
     /// Fetches everything `manifest` needs that this CAS lacks, then reconstructs and atomically
     /// installs it into `dest_dir`. `session_key` names the resumable session (the destination).
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) async fn fetch_and_install(
         &self,
         conn: &Conn,
@@ -202,6 +203,7 @@ impl Fetcher {
 
     /// Chunk mode: fetch only chunks this CAS does not hold (in any xorb), repack them into native
     /// xorbs, and register fresh reconstructions for the new files.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn fetch_chunks(
         &self,
         conn: &Conn,
@@ -294,6 +296,7 @@ impl Fetcher {
     /// Receives chunk runs until every chunk in `outstanding` has arrived and verified. Each
     /// chunk is hashed; unrequested or repeated chunks abort the transfer. Verified native chunk
     /// bytes are packed into new xorbs, committed as each fills.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn receive_chunk_runs_unguarded(
         &self,
         conn: &Conn,
@@ -315,6 +318,10 @@ impl Fetcher {
 
         while !outstanding.is_empty() || !tasks.is_empty() {
             tokio::select! {
+                // Record each commit as soon as it lands, so resume state is never behind.
+                Some(done) = commits.join_next(), if !commits.is_empty() => {
+                    committed(done, session, report)?;
+                }
                 stream = conn.accept_uni(), if !outstanding.is_empty() => {
                     let mut stream = stream?;
                     let (permits, budget) = (permits.clone(), self.budget.clone());
@@ -328,8 +335,12 @@ impl Fetcher {
                             return Err(transport::Error::FrameTooLarge { len: header.len, max: MAX_CHUNK_RUN_BYTES }.into());
                         }
                         let memory = budget.reserve(header.len).await;
-                        let bytes = read_payload(&mut stream, header.len, MAX_CHUNK_RUN_BYTES).await?;
+                        let bytes = read_payload(&mut stream, header.len, MAX_CHUNK_RUN_BYTES)
+                            .instrument(tracing::debug_span!("read_chunk_run_payload"))
+                            .await?;
+                        let span = tracing::debug_span!("verify_chunk_run");
                         let (bytes, chunks) = tokio::task::spawn_blocking(move || {
+                            let _g = span.entered();
                             let t = std::time::Instant::now();
                             let chunks = parse_chunk_run(&bytes);
                             debug!(ms = t.elapsed().as_millis() as u64, bytes = bytes.len(), "chunk run verified");
@@ -449,20 +460,23 @@ impl Fetcher {
         }
         let body = packer.take();
         let (cas, delay) = (self.cas.clone(), self.opts.commit_delay);
-        commits.spawn(async move {
-            let len = body.len() as u64;
-            let t = std::time::Instant::now();
-            cas.commit_packed(body).await?;
-            debug!(
-                ms = t.elapsed().as_millis() as u64,
-                bytes = len,
-                "xorb committed"
-            );
-            if let Some(d) = delay {
-                tokio::time::sleep(d).await;
+        commits.spawn(
+            async move {
+                let len = body.len() as u64;
+                let t = std::time::Instant::now();
+                cas.commit_packed(body).await?;
+                debug!(
+                    ms = t.elapsed().as_millis() as u64,
+                    bytes = len,
+                    "xorb committed"
+                );
+                if let Some(d) = delay {
+                    tokio::time::sleep(d).await;
+                }
+                Ok(len)
             }
-            Ok(len)
-        });
+            .instrument(tracing::debug_span!("commit_xorb")),
+        );
         Ok(())
     }
 

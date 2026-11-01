@@ -218,6 +218,7 @@ impl LocalCas {
 
     /// Chunks, hashes, and stores `src` (a file or directory) as native Xet xorbs and shards.
     /// Returns the manifest needed to reconstruct it.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn ingest(&self, src: impl AsRef<Path>) -> Result<(Manifest, IngestReport)> {
         let src = src.as_ref();
         let started = std::time::SystemTime::now();
@@ -454,6 +455,7 @@ impl LocalCas {
 
     /// Reports which reconstruction metadata and xorbs `manifest` needs that this CAS lacks.
     /// Purely local: a lookup here is never a network transfer.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn missing_content(&self, manifest: &Manifest) -> Result<MissingContent> {
         let mut missing = MissingContent::default();
         for (entry, size, xet_hash, ..) in manifest.files() {
@@ -515,6 +517,7 @@ impl LocalCas {
     }
 
     /// [`Self::reconstruct`] with options.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn reconstruct_with(
         &self,
         manifest: &Manifest,
@@ -554,6 +557,7 @@ impl LocalCas {
         result
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn reconstruct_via(
         &self,
         manifest: &Manifest,

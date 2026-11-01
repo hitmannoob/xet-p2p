@@ -159,6 +159,7 @@ impl Receiver {
     }
 
     /// Runs one transfer on an established, authenticated connection.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub async fn handle(&self, conn: Conn) -> Result<ReceiverReport> {
         let (mut send, mut recv) = self
             .fetcher

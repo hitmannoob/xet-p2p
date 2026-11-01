@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::debug;
+use tracing::{Instrument, debug};
 use transport::{Conn, RecvStream, SendStream, TransportKind};
 use transport::{read_frame, write_frame};
 use xet_local::chunks::{ChunkRun, encode_chunk_lists};
@@ -99,6 +99,7 @@ pub struct Prepared {
 }
 
 /// Ingests `src` (a file or directory) into the local CAS: the connection-free part of a push.
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn prepare(cas: &LocalCas, src: &Path) -> Result<Prepared> {
     let start = Instant::now();
     let (manifest, ingest) = cas.ingest(src).await?;
@@ -121,6 +122,7 @@ pub async fn prepare(cas: &LocalCas, src: &Path) -> Result<Prepared> {
 
 /// Pushes a [`prepare`]d source. The report's `elapsed` is preparing plus pushing, not any wait
 /// between them.
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn push_prepared(
     cas: Arc<LocalCas>,
     prepared: Prepared,
@@ -256,6 +258,7 @@ impl PushOptions {
 /// Answers the fetching peer's requests for objects of this manifest until it reports a result.
 /// Used by the client of a push and by the server of a pull.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "debug", skip_all)]
 pub(crate) async fn serve_requests(
     cas: &Arc<LocalCas>,
     conn: &Conn,
@@ -360,6 +363,7 @@ async fn send_xorbs(
 
 /// Sends the native bytes of every requested chunk range, one stream per run, bounded by the
 /// stream and memory limits. Returns (bytes, runs).
+#[tracing::instrument(level = "debug", skip_all)]
 async fn send_chunk_runs(
     cas: &Arc<LocalCas>,
     conn: &Conn,
@@ -395,15 +399,25 @@ async fn send_chunk_runs(
         let memory = budget.reserve(bytes).await;
         let (cas, conn, limiter) = (cas.clone(), conn.clone(), limiter.clone());
         streams += 1;
-        tasks.spawn(async move {
-            let _permits = (permit, memory);
-            let mut body = Vec::with_capacity(bytes as usize);
-            for mut run in runs {
-                cas.read_chunk_run(&mut run).await?;
-                body.extend_from_slice(&run.bytes);
+        tasks.spawn(
+            async move {
+                let _permits = (permit, memory);
+                let mut body = Vec::with_capacity(bytes as usize);
+                async {
+                    for mut run in runs {
+                        cas.read_chunk_run(&mut run).await?;
+                        body.extend_from_slice(&run.bytes);
+                    }
+                    Ok::<_, Error>(())
+                }
+                .instrument(tracing::debug_span!("read_chunk_runs"))
+                .await?;
+                send_object(&conn, &limiter, ObjectKind::ChunkRun, None, body)
+                    .instrument(tracing::debug_span!("send_chunk_batch"))
+                    .await
             }
-            send_object(&conn, &limiter, ObjectKind::ChunkRun, None, body).await
-        });
+            .instrument(tracing::debug_span!("chunk_batch")),
+        );
         // Surface failures early rather than after planning everything.
         while let Some(res) = tasks.try_join_next() {
             total += res.map_err(|e| Error::Protocol(format!("send task failed: {e}")))??;

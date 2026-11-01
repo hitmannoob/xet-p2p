@@ -46,7 +46,7 @@ thiserror = "2"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 yamux = "0.13"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "sync", "time", "io-util", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "net", "sync", "time", "io-util", "process", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -60,3 +60,9 @@ transfer = { path = "crates/transfer" }
 # Chunking/hashing/compression are slow unoptimised; keep tests on large inputs fast.
 [profile.dev.package."*"]
 opt-level = 2
+
+# Release speed with symbols and line tables, for the built-in CPU profiler (`--features cpu-profile`).
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"

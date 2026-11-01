@@ -18,13 +18,24 @@ transport-quic.workspace = true
 transport-tcp.workspace = true
 providers.workspace = true
 serde.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
+pprof = { version = "0.15", optional = true, default-features = false, features = ["flamegraph", "frame-pointer"] }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
+[features]
+# CPU sampling profiler (XET_P2P_PROFILE). Build with RUSTFLAGS="-C force-frame-pointers=yes".
+cpu-profile = ["dep:pprof"]
+
 [dev-dependencies]
 rand.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+
+# musl's allocator returns large blocks to the kernel on every free (mmap/munmap per chunk run and
+# xorb); profiling a cold push in a Modal sandbox put 20-40% of CPU there. mimalloc reuses them.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }

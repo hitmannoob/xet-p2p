@@ -14,6 +14,12 @@ use transport_quic::{
 };
 use xet_local::{LocalCas, Manifest};
 
+mod profile;
+
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(
     name = "xet-p2p",
@@ -213,15 +219,46 @@ enum LocalCommand {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn,transfer=info".into()),
+    use tracing_subscriber::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let (trace, profiling) = profile::layer();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "warn,transfer=info".into()),
+                ),
         )
-        .with_writer(std::io::stderr)
+        .with(trace)
         .init();
+    let result = run(Cli::parse()).await;
+    profiling.finish();
+    result
+}
 
-    match Cli::parse().command {
+/// Resolves on SIGTERM or Ctrl-C, so a server can exit cleanly (and write its profile).
+async fn terminated() {
+    #[cfg(unix)]
+    {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => return std::future::pending().await,
+            };
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    match cli.command {
         Command::Keygen { out, name } => keygen(&out, &name),
         Command::Serve {
             listen,
@@ -336,6 +373,11 @@ async fn main() -> Result<()> {
                 _ = async { tokio::join!(serve_quic, serve_tcp) } => {}
                 _ = idle_exit => {
                     eprintln!("idle for {}s; exiting", idle_exit_secs.unwrap_or_default());
+                    if let Some(dir) = &cleanup_on_exit {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                }
+                _ = terminated() => {
                     if let Some(dir) = &cleanup_on_exit {
                         let _ = std::fs::remove_dir_all(dir);
                     }

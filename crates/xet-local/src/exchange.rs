@@ -192,6 +192,7 @@ impl LocalCas {
 
     /// Stores a xorb whose bytes are known to match `xorb` and `hash`, durably, and indexes its
     /// chunks.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub(crate) async fn store_verified_xorb(
         &self,
         hash: MerkleHash,

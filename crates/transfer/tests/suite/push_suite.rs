@@ -928,13 +928,18 @@ async fn chunk_mode_interrupted_push_resumes() {
     let h =
         Harness::with_receiver(|o| o.commit_delay = Some(std::time::Duration::from_millis(400)))
             .await;
-    write(&h.src(), "big.bin", &random_bytes(46, 70 * MIB));
+    write(&h.src(), "big.bin", &random_bytes(46, 160 * MIB));
 
     // Start a push and abandon it (dropping its connection) after the first packed xorb commits.
+    // The sender is rate-limited so that most of the data is still in flight at that point (the
+    // receiver commits in the background, so an unthrottled push could already be complete).
     let sessions = h.root().join(".xet-p2p/cas/sessions");
     let push = {
         let h = &h;
-        async move { h.push("p").await }
+        async move {
+            h.push_with("p", |o| o.bandwidth_limit = Some(20.0 * MIB as f64))
+                .await
+        }
     };
     let committed = async {
         loop {
