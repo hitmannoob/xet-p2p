@@ -17,11 +17,12 @@ use xet_data::processing::{FileUploadSession, Sha256Policy};
 use xet_runtime::core::XetContext;
 
 use crate::error::{Error, Result};
-use crate::index::ChunkIndex;
+use crate::index::{ChunkIndex, shared_db};
+use crate::ingest_cache::{self, Hashed, IngestCache};
 use crate::manifest::{
     Entry, EntryKind, MANIFEST_FORMAT_VERSION, Manifest, STAGING_PREFIX, validate_rel_path,
 };
-use crate::walk::{WalkedKind, walk};
+use crate::walk::{WalkedEntry, WalkedKind, walk};
 
 /// A persistent, on-disk Xet content store. No network access is ever made.
 ///
@@ -33,6 +34,7 @@ pub struct LocalCas {
     /// The same store upstream sessions open for `config` (redb handles are shared per path).
     pub(crate) client: Arc<LocalClient>,
     pub(crate) index: ChunkIndex,
+    ingest_cache: IngestCache,
     /// Advisory lock on `<root>/.lock`: shared for normal use, exclusive for GC. Held for the
     /// lifetime of this value.
     _lock: fs::File,
@@ -70,6 +72,10 @@ impl MissingContent {
 pub struct IngestReport {
     pub files: usize,
     pub dirs: usize,
+    /// Of `files`, how many (and their bytes) were unchanged since an earlier ingest and reused
+    /// its hashes without being read. `dedup` covers only the files that were read.
+    pub cached_files: usize,
+    pub cached_bytes: u64,
     pub dedup: DeduplicationMetrics,
 }
 
@@ -79,6 +85,8 @@ pub struct ReconstructReport {
     pub files: usize,
     /// Files already present at the destination with identical content; left untouched.
     pub files_unchanged: usize,
+    /// Of `files_unchanged`, those trusted from their recorded stamp without being read.
+    pub files_trusted: usize,
     pub dirs: usize,
     /// Bytes reconstructed (excludes unchanged files).
     pub bytes: u64,
@@ -145,11 +153,13 @@ impl LocalCas {
             .await
             .map_err(|e| Error::Xet(e.to_string()))?;
         let index = ChunkIndex::open(&root.join("chunk_index.redb"))?;
+        let ingest_cache = IngestCache::open(shared_db(&root.join("chunk_index.redb"))?)?;
         let cas = Self {
             root,
             config,
             client,
             index,
+            ingest_cache,
             _lock: lock,
             exclusive,
             footers: Default::default(),
@@ -209,19 +219,63 @@ impl LocalCas {
     /// Chunks, hashes, and stores `src` (a file or directory) as native Xet xorbs and shards.
     /// Returns the manifest needed to reconstruct it.
     pub async fn ingest(&self, src: impl AsRef<Path>) -> Result<(Manifest, IngestReport)> {
-        let walked = walk(src.as_ref())?;
-        let file_paths: Vec<&Path> = walked
-            .iter()
-            .filter(|w| matches!(w.kind, WalkedKind::File { .. }))
-            .map(|w| w.abs_path.as_path())
-            .collect();
+        let src = src.as_ref();
+        let started = std::time::SystemTime::now();
+        let walked = walk(src)?;
+        let root = fs::canonicalize(src)?;
+        let single_file = fs::symlink_metadata(src)?.is_file();
+        let key_of = |w: &WalkedEntry| {
+            ingest_cache::key(&if single_file {
+                root.clone()
+            } else {
+                root.join(&w.rel_path)
+            })
+        };
+        let keys: Vec<Vec<u8>> = walked.iter().map(key_of).collect();
 
-        let (infos, dedup) = if file_paths.is_empty() {
+        // Files unchanged since an earlier ingest reuse its hashes (if this CAS still holds
+        // their content); the rest are read, chunked and hashed.
+        let mut known: Vec<Option<(String, String)>> = vec![None; walked.len()];
+        let probe: Vec<(usize, ingest_cache::Stamp)> = walked
+            .iter()
+            .enumerate()
+            .filter_map(|(i, w)| match w.kind {
+                WalkedKind::File {
+                    size,
+                    stamp: Some(stamp),
+                    ..
+                } if size > 0 => Some((i, stamp)),
+                _ => None,
+            })
+            .collect();
+        let lookups: Vec<(&[u8], ingest_cache::Stamp)> = probe
+            .iter()
+            .map(|(i, stamp)| (keys[*i].as_slice(), *stamp))
+            .collect();
+        let mut present_xorbs = std::collections::HashSet::new();
+        for ((i, _), hit) in probe.iter().zip(self.ingest_cache.lookup(&lookups)?) {
+            let Some((xet, sha)) = hit else { continue };
+            if self.holds_file(&xet, &mut present_xorbs).await? {
+                known[*i] = Some((xet.hex(), hex::encode(sha)));
+            }
+        }
+
+        let to_read: Vec<usize> = walked
+            .iter()
+            .enumerate()
+            .filter(|(i, w)| matches!(w.kind, WalkedKind::File { .. }) && known[*i].is_none())
+            .map(|(i, _)| i)
+            .collect();
+        let (infos, dedup) = if to_read.is_empty() {
             (Vec::new(), DeduplicationMetrics::default())
         } else {
             let session = FileUploadSession::new(self.config.clone()).await?;
             let infos = session
-                .upload_files(file_paths.iter().map(|p| (*p, Sha256Policy::Compute)))
+                .upload_files(
+                    to_read
+                        .iter()
+                        .map(|i| (walked[*i].abs_path.as_path(), Sha256Policy::Compute)),
+                )
                 .await?;
             let dedup = session.finalize().await?;
             // Make newly stored chunks visible to chunk-level planning.
@@ -235,17 +289,33 @@ impl LocalCas {
             ..Default::default()
         };
         let mut entries = Vec::with_capacity(walked.len());
+        let mut hashed = Vec::new();
 
-        for w in walked {
+        for (i, w) in walked.into_iter().enumerate() {
             let kind = match w.kind {
                 WalkedKind::Dir => {
                     report.dirs += 1;
                     EntryKind::Dir
                 }
                 WalkedKind::File {
+                    size, executable, ..
+                } if known[i].is_some() => {
+                    report.files += 1;
+                    report.cached_files += 1;
+                    report.cached_bytes += size;
+                    let (xet_hash, sha256) = known[i].take().unwrap();
+                    EntryKind::File {
+                        size,
+                        xet_hash,
+                        sha256,
+                        executable,
+                    }
+                }
+                WalkedKind::File {
                     size,
                     executable,
                     modified,
+                    stamp,
                 } => {
                     report.files += 1;
                     // Detect edits made while the file was being read: a changed size or mtime means
@@ -276,10 +346,23 @@ impl LocalCas {
                             Error::Xet(format!("no SHA-256 computed for {:?}", w.rel_path))
                         })?
                     };
+                    let sha256 = sha256.to_ascii_lowercase();
+                    // Cache only a version that was stable across the read.
+                    if size > 0
+                        && let Some(stamp) =
+                            stamp.filter(|s| ingest_cache::Stamp::of(&now) == Some(*s))
+                        && let (Ok(xet), Ok(sha)) = (
+                            MerkleHash::from_hex(&info.hash),
+                            hex::decode(&sha256).map(<[u8; 32]>::try_from),
+                        )
+                        && let Ok(sha) = sha
+                    {
+                        hashed.push((i, stamp, xet, sha));
+                    }
                     EntryKind::File {
                         size,
                         xet_hash: info.hash,
-                        sha256: sha256.to_ascii_lowercase(),
+                        sha256,
                         executable,
                     }
                 }
@@ -290,12 +373,63 @@ impl LocalCas {
             });
         }
 
+        let records: Vec<Hashed<'_>> = hashed
+            .iter()
+            .map(|(i, stamp, xet, sha)| Hashed {
+                key: keys[*i].as_slice(),
+                stamp: *stamp,
+                xet: *xet,
+                sha256: *sha,
+            })
+            .collect();
+        let mut prefix = ingest_cache::key(&root);
+        prefix.push(b'/');
+        let keep: std::collections::HashSet<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        self.ingest_cache.record(
+            &records,
+            started,
+            (!single_file).then_some((prefix.as_slice(), &keep)),
+        )?;
+
         let manifest = Manifest {
             format_version: MANIFEST_FORMAT_VERSION,
             entries,
         };
         manifest.validate()?;
         Ok((manifest, report))
+    }
+
+    /// Whether this CAS can reconstruct file `hash`: its reconstruction and every xorb it uses
+    /// are present. `present` memoizes xorbs already found.
+    async fn holds_file(
+        &self,
+        hash: &MerkleHash,
+        present: &mut std::collections::HashSet<MerkleHash>,
+    ) -> Result<bool> {
+        let Some((info, _)) = self
+            .client
+            .get_file_reconstruction_info(hash)
+            .await
+            .map_err(|e| Error::Xet(e.to_string()))?
+        else {
+            return Ok(false);
+        };
+        for segment in &info.segments {
+            let x = segment.xorb_hash;
+            if present.contains(&x) {
+                continue;
+            }
+            if !self
+                .client
+                .xorb_exists(&x)
+                .await
+                .map_err(|e| Error::Xet(e.to_string()))?
+            {
+                return Ok(false);
+            }
+            present.insert(x);
+        }
+        Ok(true)
     }
 
     /// Indexes the chunks of any stored xorb not yet in the chunk index (e.g. created by ingest,
@@ -431,17 +565,61 @@ impl LocalCas {
         let mut staged = Vec::new();
         let mut touched_dirs = BTreeSet::new();
 
-        // Decide what to write; identical files already in place are left alone.
+        // Decide what to write; identical files already in place are left alone. A file whose
+        // stamp matches the one recorded when it was last verified with these hashes is not read
+        // again (see `ingest_cache`); any other existing file is read and hashed.
         let t = std::time::Instant::now();
+        let started = std::time::SystemTime::now();
         let mut work = Vec::new();
         let mut buf = vec![0u8; VERIFY_BUF];
-        for (i, (entry, size, xet_hash, sha256, executable)) in manifest.files().enumerate() {
+        let files: Vec<_> = manifest.files().collect();
+        let mut existing = Vec::with_capacity(files.len());
+        for (entry, ..) in &files {
             let rel = validate_rel_path(&entry.path)?;
-            if let Some(existing) = existing_regular_file(dest, &rel)
-                && verify_file(&existing, size, sha256, &mut buf).is_ok()
+            existing.push(existing_regular_file(dest, &rel).map(|(p, m)| {
+                let key = ingest_cache::key(&p);
+                (p, ingest_cache::Stamp::of(&m), key)
+            }));
+        }
+        let probe: Vec<(usize, &[u8], ingest_cache::Stamp)> = existing
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                Some((_, Some(stamp), key)) if files[i].1 > 0 => Some((i, key.as_slice(), *stamp)),
+                _ => None,
+            })
+            .collect();
+        let lookups: Vec<(&[u8], ingest_cache::Stamp)> =
+            probe.iter().map(|(_, k, s)| (*k, *s)).collect();
+        let mut trusted = vec![false; files.len()];
+        for ((i, ..), hit) in probe.iter().zip(self.ingest_cache.lookup(&lookups)?) {
+            let (_, _, xet_hash, sha256, _) = files[*i];
+            trusted[*i] = hit.is_some_and(|(xet, sha)| {
+                xet.hex().eq_ignore_ascii_case(xet_hash)
+                    && hex::encode(sha).eq_ignore_ascii_case(sha256)
+            });
+        }
+        let mut verified = Vec::new();
+        for (i, (entry, size, xet_hash, sha256, executable)) in files.iter().copied().enumerate() {
+            if let Some((path, _, key)) = &existing[i]
+                && (trusted[i] || verify_file(path, size, sha256, &mut buf).is_ok())
             {
-                set_executable(&existing, executable)?;
+                set_executable(path, executable)?;
                 report.files_unchanged += 1;
+                report.files_trusted += usize::from(trusted[i]);
+                if !trusted[i]
+                    && size > 0
+                    // Re-stat: fixing the executable bit moves ctime.
+                    && let Some(now) = fs::symlink_metadata(path)
+                        .ok()
+                        .and_then(|m| ingest_cache::Stamp::of(&m))
+                    && let (Ok(xet), Ok(Ok(sha))) = (
+                        MerkleHash::from_hex(xet_hash),
+                        hex::decode(sha256).map(<[u8; 32]>::try_from),
+                    )
+                {
+                    verified.push((key.clone(), now, xet, sha));
+                }
                 continue;
             }
             work.push((
@@ -454,9 +632,20 @@ impl LocalCas {
             ));
         }
 
+        let records: Vec<Hashed<'_>> = verified
+            .iter()
+            .map(|(key, stamp, xet, sha)| Hashed {
+                key: key.as_slice(),
+                stamp: *stamp,
+                xet: *xet,
+                sha256: *sha,
+            })
+            .collect();
+        self.ingest_cache.record(&records, started, None)?;
         tracing::debug!(
             ms = t.elapsed().as_millis() as u64,
             unchanged = report.files_unchanged,
+            trusted = report.files_trusted,
             "existing files checked"
         );
         // Reconstruct and verify concurrently. Each file is decoded from its native segments with
@@ -675,9 +864,10 @@ fn remove_stale_staging(dest: &Path) -> Result<()> {
 }
 
 /// `dest/rel` if it is a regular file reached without traversing any symlink; otherwise `None`.
-fn existing_regular_file(dest: &Path, rel: &Path) -> Option<PathBuf> {
+fn existing_regular_file(dest: &Path, rel: &Path) -> Option<(PathBuf, fs::Metadata)> {
     let mut cur = dest.to_path_buf();
     let n = rel.components().count();
+    let mut last = None;
     for (i, component) in rel.components().enumerate() {
         cur.push(component);
         let m = fs::symlink_metadata(&cur).ok()?;
@@ -685,8 +875,9 @@ fn existing_regular_file(dest: &Path, rel: &Path) -> Option<PathBuf> {
         if !ok {
             return None;
         }
+        last = Some(m);
     }
-    Some(cur)
+    Some((cur, last?))
 }
 
 /// Creates `rel` (a manifest-style relative path) under `root` without following symlinks, and

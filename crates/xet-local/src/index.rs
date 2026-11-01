@@ -117,7 +117,7 @@ fn key(h: &MerkleHash) -> [u8; 32] {
 }
 
 /// One `Database` per path per process (redb refuses a second open of the same file).
-fn shared_db(path: &Path) -> Result<Arc<Database>> {
+pub(crate) fn shared_db(path: &Path) -> Result<Arc<Database>> {
     static CACHE: Mutex<Vec<(PathBuf, Weak<Database>)>> = Mutex::new(Vec::new());
     let mut cache = CACHE.lock().unwrap();
     cache.retain(|(_, w)| w.strong_count() > 0);

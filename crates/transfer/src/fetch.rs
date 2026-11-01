@@ -96,6 +96,7 @@ impl Fetcher {
         report.dirs_deleted = r.dirs_deleted;
         report.files_installed = r.files;
         report.files_unchanged = r.files_unchanged;
+        report.files_trusted = r.files_trusted;
         report.dirs_created = r.dirs;
         report.bytes_reconstructed = r.bytes;
         let t = std::time::Instant::now();

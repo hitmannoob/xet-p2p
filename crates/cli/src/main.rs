@@ -770,8 +770,14 @@ fn print_push_report(r: &PushReport) {
         r.ingest.files, r.logical_bytes
     );
     eprintln!(
-        "  local ingest: {} chunks ({} new), {} new bytes, {} deduped",
-        d.total_chunks, d.new_chunks, d.new_bytes, d.deduped_bytes
+        "  local ingest: {} files unchanged since last read ({} bytes, not re-read); read {}: {} chunks ({} new), {} new bytes, {} deduped",
+        r.ingest.cached_files,
+        r.ingest.cached_bytes,
+        r.ingest.files - r.ingest.cached_files,
+        d.total_chunks,
+        d.new_chunks,
+        d.new_bytes,
+        d.deduped_bytes
     );
     let rr = &r.receiver;
     match rr.mode {
@@ -839,6 +845,8 @@ fn report_json(r: &PushReport) -> serde_json::Value {
         "dirs": r.ingest.dirs,
         "logical_bytes": r.logical_bytes,
         "ingest": {
+            "cached_files": r.ingest.cached_files,
+            "cached_bytes": r.ingest.cached_bytes,
             "total_chunks": d.total_chunks,
             "new_chunks": d.new_chunks,
             "new_bytes": d.new_bytes,

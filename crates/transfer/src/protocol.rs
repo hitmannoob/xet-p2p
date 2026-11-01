@@ -170,6 +170,8 @@ pub struct ReceiverReport {
     pub files_installed: usize,
     /// Files already identical at the destination, left untouched.
     pub files_unchanged: usize,
+    /// Of those, files trusted from their recorded stamp without being read again.
+    pub files_trusted: usize,
     pub dirs_created: usize,
     pub bytes_reconstructed: u64,
     pub shards_received: usize,

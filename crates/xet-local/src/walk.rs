@@ -12,6 +12,7 @@ pub(crate) enum WalkedKind {
         size: u64,
         executable: bool,
         modified: Option<std::time::SystemTime>,
+        stamp: Option<crate::ingest_cache::Stamp>,
     },
 }
 
@@ -101,6 +102,7 @@ fn file_kind(meta: &fs::Metadata) -> WalkedKind {
         size: meta.len(),
         executable,
         modified: meta.modified().ok(),
+        stamp: crate::ingest_cache::Stamp::of(meta),
     }
 }
 

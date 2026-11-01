@@ -12,6 +12,7 @@ mod error;
 mod exchange;
 pub mod gc;
 mod index;
+mod ingest_cache;
 pub mod manifest;
 mod walk;
 
