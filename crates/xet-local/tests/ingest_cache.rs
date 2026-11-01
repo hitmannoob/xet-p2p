@@ -137,3 +137,45 @@ async fn receiver_trusts_settled_files_and_repairs_edited_ones() {
     assert_eq!((r.files, r.files_trusted), (1, 9));
     assert_eq!(fs::read(&f).unwrap(), fs::read(src.join("f4.txt")).unwrap());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reconstruction_stages_early_and_installs_only_at_finish() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    for i in 0..6 {
+        write(
+            &src,
+            &format!("f{i}.txt"),
+            format!("file {i}\n").repeat(500).as_bytes(),
+        );
+    }
+    let cas = std::sync::Arc::new(LocalCas::open(tmp.path().join("cas")).await.unwrap());
+    let (m, _) = cas.ingest(&src).await.unwrap();
+    let dest = tmp.path().join("dest");
+    let mut r = cas
+        .begin_reconstruct(&m, &dest, xet_local::ReconstructOptions::default())
+        .unwrap();
+    // Start half the files early; the rest start at finish.
+    for (_, _, h, ..) in m.files().take(3) {
+        r.content_ready(&xet_local::MerkleHash::from_hex(h).unwrap());
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !dest.join("f0.txt").exists(),
+        "nothing is installed before finish"
+    );
+    let report = r.finish().await.unwrap();
+    assert_eq!(report.files, 6);
+    for i in 0..6 {
+        assert_eq!(
+            fs::read(dest.join(format!("f{i}.txt"))).unwrap(),
+            fs::read(src.join(format!("f{i}.txt"))).unwrap()
+        );
+    }
+    let leftovers: Vec<_> = fs::read_dir(&dest)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+        .collect();
+    assert!(leftovers.is_empty(), "staging removed: {leftovers:?}");
+}

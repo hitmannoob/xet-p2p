@@ -146,6 +146,16 @@ pub(crate) fn for_each_chunk(
     bytes: &[u8],
     mut f: impl FnMut(MerkleHash, &[u8], Range<usize>) -> Result<()>,
 ) -> Result<()> {
+    for_each_plain_chunk(bytes, |plain, span| {
+        f(compute_data_hash(plain), plain, span)
+    })
+}
+
+/// Like [`for_each_chunk`] without hashing: bounds-checks and decompresses each chunk.
+pub(crate) fn for_each_plain_chunk(
+    bytes: &[u8],
+    mut f: impl FnMut(&[u8], Range<usize>) -> Result<()>,
+) -> Result<()> {
     let fail = |reason: String| Error::Verification {
         path: "<chunk run>".into(),
         reason,
@@ -177,11 +187,7 @@ pub(crate) fn for_each_chunk(
         if plain.len() != size {
             return Err(fail("decompressed size differs from header".into()));
         }
-        f(
-            compute_data_hash(&plain),
-            &plain,
-            pos..data_start + compressed,
-        )?;
+        f(&plain, pos..data_start + compressed)?;
         pos = data_start + compressed;
     }
     Ok(())
@@ -464,58 +470,64 @@ impl LocalCas {
         use sha2::Digest;
         use std::io::Write;
 
+        // Resolve every segment's byte range first (footers are cached). Then one thread reads and
+        // decompresses while another writes and hashes, so the file's SHA-256, the end-to-end
+        // check, is the only serial stage. Chunks are not re-hashed here: each was verified when
+        // it was stored, and the caller checks this SHA-256 against the manifest before install.
         let info = self.file_info(file).await?;
-        let mut writer = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(out)?);
-        let mut sha = sha2::Sha256::new();
-        let mut written = 0u64;
+        let mut segments = Vec::with_capacity(info.segments.len());
         for seg in &info.segments {
             let footer = self.footer(&seg.xorb_hash).await?;
             let (lo, hi) = footer
                 .get_byte_offset(seg.chunk_index_start, seg.chunk_index_end)
                 .map_err(xet_err)?;
-            let expected: Vec<MerkleHash> = footer
-                .info
-                .chunk_hashes
-                .get(seg.chunk_index_start as usize..seg.chunk_index_end as usize)
-                .ok_or_else(|| xet_err("segment outside xorb"))?
-                .to_vec();
-            let path = self.xorb_path(&seg.xorb_hash);
-            let xorb = seg.xorb_hash;
-            let (bytes, w, h, n) = tokio::task::spawn_blocking(move || -> Result<_> {
-                let bytes = read_range(&path, lo as u64, hi as u64)?;
-                let (mut w, mut h, mut n) = (writer, sha, 0u64);
-                let mut i = 0;
-                for_each_chunk(&bytes, |hash, plain, _| {
-                    if expected.get(i) != Some(&hash) {
-                        return Err(Error::Verification {
-                            path: format!("xorb {}", xorb.hex()),
-                            reason: format!("stored chunk {i} does not match its hash"),
-                        });
-                    }
-                    i += 1;
-                    w.write_all(plain)?;
-                    h.update(plain);
-                    n += plain.len() as u64;
-                    Ok(())
-                })?;
-                if i != expected.len() {
-                    return Err(xet_err("segment ended early"));
-                }
-                Ok((bytes.len(), w, h, n))
-            })
-            .await
-            .map_err(xet_err)??;
-            let _ = bytes;
-            writer = w;
-            sha = h;
-            written += n;
+            let chunks = (seg.chunk_index_end - seg.chunk_index_start) as usize;
+            segments.push((self.xorb_path(&seg.xorb_hash), lo as u64, hi as u64, chunks));
         }
-        writer.flush()?;
-        let file = writer.into_inner().map_err(|e| e.into_error())?;
-        tokio::task::spawn_blocking(move || crate::durable::sync_file(&file))
-            .await
-            .map_err(xet_err)??;
-        Ok((written, hex::encode(sha.finalize())))
+        let out = out.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<(u64, String)> {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(4);
+            let reader = std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                for (path, lo, hi, chunks) in segments {
+                    let decoded = (|| -> Result<Vec<u8>> {
+                        read_range_into(&path, lo, hi, &mut buf)?;
+                        let mut plain = Vec::with_capacity(buf.len() * 2);
+                        let mut n = 0;
+                        for_each_plain_chunk(&buf, |p, _| {
+                            plain.extend_from_slice(p);
+                            n += 1;
+                            Ok(())
+                        })?;
+                        if n != chunks {
+                            return Err(xet_err("segment chunk count differs from its xorb"));
+                        }
+                        Ok(plain)
+                    })();
+                    let failed = decoded.is_err();
+                    if tx.send(decoded).is_err() || failed {
+                        break;
+                    }
+                }
+            });
+            let mut writer =
+                std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&out)?);
+            let mut sha = sha2::Sha256::new();
+            let mut written = 0u64;
+            for plain in rx {
+                let plain = plain?;
+                writer.write_all(&plain)?;
+                sha.update(&plain);
+                written += plain.len() as u64;
+            }
+            let _ = reader.join();
+            writer.flush()?;
+            let file = writer.into_inner().map_err(|e| e.into_error())?;
+            crate::durable::sync_file(&file)?;
+            Ok((written, hex::encode(sha.finalize())))
+        })
+        .await
+        .map_err(xet_err)?
     }
 
     async fn file_info(&self, file: &MerkleHash) -> Result<MDBFileInfo> {
@@ -538,6 +550,19 @@ impl LocalCas {
         }
         Ok(&cache[xorb])
     }
+}
+
+/// Reads `[lo, hi)` of `path` into `buf` (reused across calls; not zeroed first).
+fn read_range_into(path: &std::path::Path, lo: u64, hi: u64, buf: &mut Vec<u8>) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(lo))?;
+    buf.clear();
+    f.take(hi - lo).read_to_end(buf)?;
+    if buf.len() as u64 != hi - lo {
+        return Err(xet_err("xorb shorter than its footer says"));
+    }
+    Ok(())
 }
 
 fn read_range(path: &std::path::Path, lo: u64, hi: u64) -> Result<Vec<u8>> {

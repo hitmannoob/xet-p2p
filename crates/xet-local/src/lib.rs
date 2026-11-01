@@ -17,7 +17,7 @@ pub mod manifest;
 mod walk;
 
 pub use cas::{
-    IngestReport, LocalCas, MissingContent, ReconstructOptions, ReconstructReport,
+    IngestReport, LocalCas, MissingContent, ReconstructOptions, ReconstructReport, Reconstruction,
     create_confined_dir, resolve_confined,
 };
 pub use error::{Error, Result};

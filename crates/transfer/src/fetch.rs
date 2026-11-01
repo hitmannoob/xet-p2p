@@ -11,8 +11,12 @@ use tokio::task::JoinSet;
 use tracing::{Instrument, debug, info};
 use transport::{Conn, RecvStream, SendStream};
 use transport::{read_frame, read_payload, write_frame};
+use xet_local::chunks::ChunkList;
 use xet_local::chunks::{VerifiedChunk, XorbPacker, decode_chunk_lists, parse_chunk_run};
-use xet_local::{LocalCas, Manifest, MerkleHash, MissingContent, PendingShard, ReconstructOptions};
+use xet_local::{
+    LocalCas, Manifest, MerkleHash, MissingContent, PendingShard, ReconstructOptions,
+    Reconstruction,
+};
 
 use crate::budget::MemoryBudget;
 use crate::error::{Error, Result};
@@ -40,14 +44,63 @@ pub(crate) struct Fetcher {
 /// Packed xorbs committing at once, beside receiving.
 const PIPELINED_COMMITS: usize = 2;
 
+type CommitDone = std::result::Result<Result<(u64, Vec<MerkleHash>)>, tokio::task::JoinError>;
+
+/// Books a finished background commit; returns the chunk hashes it made available.
 fn committed(
-    done: std::result::Result<Result<u64>, tokio::task::JoinError>,
+    done: CommitDone,
     session: &mut Session<'_>,
     report: &mut ReceiverReport,
-) -> Result<()> {
-    let len = done.map_err(|e| Error::Protocol(format!("commit task failed: {e}")))??;
+) -> Result<Vec<MerkleHash>> {
+    let (len, hashes) = done.map_err(|e| Error::Protocol(format!("commit task failed: {e}")))??;
     report.xorbs_packed += 1;
-    session.xorb_committed(len)
+    session.xorb_committed(len)?;
+    Ok(hashes)
+}
+
+/// Tracks which files' content is complete in the CAS while chunks arrive, registers each file's
+/// reconstruction as soon as it is, and starts staging it (overlapping with the rest of the
+/// transfer).
+struct Readiness<'a> {
+    /// Files not registered yet, with their chunk lists and SHA-256.
+    lists: HashMap<MerkleHash, (ChunkList, String)>,
+    /// Per file, how many of its distinct missing chunks have not been committed yet.
+    waiting: HashMap<MerkleHash, usize>,
+    /// Per missing chunk, the files waiting for it.
+    needed_by: HashMap<MerkleHash, Vec<MerkleHash>>,
+    recon: &'a mut Reconstruction,
+}
+
+impl Readiness<'_> {
+    async fn chunks_committed(&mut self, cas: &LocalCas, hashes: &[MerkleHash]) -> Result<()> {
+        let mut ready = Vec::new();
+        for h in hashes {
+            for f in self.needed_by.remove(h).unwrap_or_default() {
+                if let Some(n) = self.waiting.get_mut(&f) {
+                    *n -= 1;
+                    if *n == 0 {
+                        ready.push(f);
+                    }
+                }
+            }
+        }
+        self.register(cas, ready).await
+    }
+
+    async fn register(&mut self, cas: &LocalCas, files: Vec<MerkleHash>) -> Result<()> {
+        let items: Vec<(MerkleHash, ChunkList, String)> = files
+            .iter()
+            .filter_map(|f| self.lists.remove(f).map(|(l, sha)| (*f, l, sha)))
+            .collect();
+        if items.is_empty() {
+            return Ok(());
+        }
+        cas.register_files(&items).await?;
+        for (f, ..) in &items {
+            self.recon.content_ready(f);
+        }
+        Ok(())
+    }
 }
 
 impl Fetcher {
@@ -83,28 +136,50 @@ impl Fetcher {
         let missing = self.cas.missing_content(manifest).await?;
         debug!(ms = t.elapsed().as_millis() as u64, "missing content found");
         report.mode = mode;
+
+        // Files are staged as soon as their content is here, beside the rest of the transfer;
+        // nothing is installed until all of them verify.
+        let mut recon = self.cas.begin_reconstruct(
+            manifest,
+            dest_dir,
+            ReconstructOptions {
+                delete_extraneous: delete,
+            },
+        )?;
+        let incomplete: BTreeSet<MerkleHash> = missing
+            .reconstructions
+            .union(&missing.files_missing_xorbs)
+            .copied()
+            .collect();
+        for (_, size, h, ..) in manifest.files() {
+            if let Ok(h) = MerkleHash::from_hex(h)
+                && size > 0
+                && !incomplete.contains(&h)
+            {
+                recon.content_ready(&h);
+            }
+        }
         match mode {
             TransferMode::Xorb => {
                 self.fetch_whole_xorbs(conn, send, &missing, &mut session, &mut report)
                     .await?
             }
             TransferMode::Chunk => {
-                self.fetch_chunks(conn, send, manifest, &missing, &mut session, &mut report)
-                    .await?
+                self.fetch_chunks(
+                    conn,
+                    send,
+                    manifest,
+                    &missing,
+                    &mut session,
+                    &mut report,
+                    &mut recon,
+                )
+                .await?
             }
         }
 
         let t = std::time::Instant::now();
-        let r = self
-            .cas
-            .reconstruct_with(
-                manifest,
-                dest_dir,
-                ReconstructOptions {
-                    delete_extraneous: delete,
-                },
-            )
-            .await?;
+        let r = recon.finish().await?;
         debug!(ms = t.elapsed().as_millis() as u64, "reconstructed");
         report.files_deleted = r.files_deleted;
         report.dirs_deleted = r.dirs_deleted;
@@ -204,6 +279,7 @@ impl Fetcher {
     /// Chunk mode: fetch only chunks this CAS does not hold (in any xorb), repack them into native
     /// xorbs, and register fresh reconstructions for the new files.
     #[tracing::instrument(level = "debug", skip_all)]
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_chunks(
         &self,
         conn: &Conn,
@@ -212,6 +288,7 @@ impl Fetcher {
         missing: &MissingContent,
         session: &mut Session<'_>,
         report: &mut ReceiverReport,
+        recon: &mut Reconstruction,
     ) -> Result<()> {
         report.xorbs_already_present = missing.present_xorbs.len();
         // Files to describe: never seen, or whose stored reconstruction lost a xorb.
@@ -259,6 +336,39 @@ impl Fetcher {
         report.chunks_total = plan.total_chunks;
         report.chunks_present = plan.present_chunks;
         report.chunk_bytes_present = plan.present_bytes;
+
+        let sha: HashMap<MerkleHash, String> = manifest
+            .files()
+            .filter_map(|(_, _, h, sha, _)| Some((MerkleHash::from_hex(h).ok()?, sha.to_owned())))
+            .collect();
+        let mut ready = Readiness {
+            lists: HashMap::new(),
+            waiting: HashMap::new(),
+            needed_by: HashMap::new(),
+            recon,
+        };
+        for (f, l) in lists {
+            let sha = sha.get(&f).cloned().ok_or_else(|| {
+                Error::Protocol(format!("chunk list for file {} not in manifest", f.hex()))
+            })?;
+            let mut distinct = std::collections::HashSet::new();
+            for (h, _) in &l {
+                if plan.missing.contains_key(h) && distinct.insert(*h) {
+                    ready.needed_by.entry(*h).or_default().push(f);
+                }
+            }
+            ready.waiting.insert(f, distinct.len());
+            ready.lists.insert(f, (l, sha));
+        }
+        // Files whose every chunk is already here can start now.
+        let complete: Vec<MerkleHash> = ready
+            .waiting
+            .iter()
+            .filter(|(_, n)| **n == 0)
+            .map(|(f, _)| *f)
+            .collect();
+        ready.register(&self.cas, complete).await?;
+
         if !plan.missing.is_empty() {
             let requests = plan
                 .requests
@@ -270,25 +380,20 @@ impl Fetcher {
                 .collect();
             write_frame(send, &Message::NeedChunks { requests }).await?;
             let t = std::time::Instant::now();
-            self.receive_chunk_runs(conn, send, plan.missing.clone(), session, report)
-                .await?;
+            self.receive_chunk_runs(
+                conn,
+                send,
+                plan.missing.clone(),
+                session,
+                report,
+                &mut ready,
+            )
+            .await?;
             debug!(ms = t.elapsed().as_millis() as u64, "chunk runs received");
         }
-
-        let sha: HashMap<MerkleHash, String> = manifest
-            .files()
-            .filter_map(|(_, _, h, sha, _)| Some((MerkleHash::from_hex(h).ok()?, sha.to_owned())))
-            .collect();
-        let files: Vec<_> = lists
-            .into_iter()
-            .map(|(f, l)| {
-                let sha = sha.get(&f).cloned().ok_or_else(|| {
-                    Error::Protocol(format!("chunk list for file {} not in manifest", f.hex()))
-                })?;
-                Ok((f, l, sha))
-            })
-            .collect::<Result<_>>()?;
-        self.cas.register_files(&files).await?;
+        // Anything left (normally nothing) registers now; a missing chunk fails here.
+        let rest: Vec<MerkleHash> = ready.lists.keys().copied().collect();
+        ready.register(&self.cas, rest).await?;
         self.sessions.remove_chunk_lists(&wanted);
         Ok(())
     }
@@ -304,6 +409,7 @@ impl Fetcher {
         mut outstanding: HashMap<MerkleHash, u64>,
         session: &mut Session<'_>,
         report: &mut ReceiverReport,
+        ready: &mut Readiness<'_>,
     ) -> Result<()> {
         type Received = (
             Vec<u8>,
@@ -313,14 +419,17 @@ impl Fetcher {
         let permits = Arc::new(Semaphore::new(self.opts.parallel_objects));
         let mut tasks: JoinSet<Result<Received>> = JoinSet::new();
         let mut packer = XorbPacker::default();
+        // The chunk hashes in `packer`, in order.
+        let mut pack: Vec<MerkleHash> = Vec::new();
         // Packed xorbs commit in the background while chunk runs keep arriving.
-        let mut commits: JoinSet<Result<u64>> = JoinSet::new();
+        let mut commits: JoinSet<Result<(u64, Vec<MerkleHash>)>> = JoinSet::new();
 
         while !outstanding.is_empty() || !tasks.is_empty() {
             tokio::select! {
                 // Record each commit as soon as it lands, so resume state is never behind.
                 Some(done) = commits.join_next(), if !commits.is_empty() => {
-                    committed(done, session, report)?;
+                    let hashes = committed(done, session, report)?;
+                    ready.chunks_committed(&self.cas, &hashes).await?;
                 }
                 stream = conn.accept_uni(), if !outstanding.is_empty() => {
                     let mut stream = stream?;
@@ -359,9 +468,11 @@ impl Fetcher {
                             return Err(Error::Protocol(format!("unrequested or duplicate chunk {}", c.hash.hex())));
                         }
                         packer.push(&bytes[c.span.clone()], c.size);
+                        pack.push(c.hash);
                         report.chunks_received += 1;
                         if packer.is_full() {
-                            self.commit_pack(&mut commits, &mut packer, session, report).await?;
+                            self.commit_pack(&mut commits, &mut packer, &mut pack, session, report, ready)
+                                .await?;
                         }
                     }
                     report.chunk_bytes_received += bytes.len() as u64;
@@ -371,11 +482,12 @@ impl Fetcher {
             }
         }
         if !packer.is_empty() {
-            self.commit_pack(&mut commits, &mut packer, session, report)
+            self.commit_pack(&mut commits, &mut packer, &mut pack, session, report, ready)
                 .await?;
         }
         while let Some(done) = commits.join_next().await {
-            committed(done, session, report)?;
+            let hashes = committed(done, session, report)?;
+            ready.chunks_committed(&self.cas, &hashes).await?;
         }
         Ok(())
     }
@@ -387,10 +499,11 @@ impl Fetcher {
         outstanding: HashMap<MerkleHash, u64>,
         session: &mut Session<'_>,
         report: &mut ReceiverReport,
+        ready: &mut Readiness<'_>,
     ) -> Result<()> {
         self.stall(
             conn,
-            self.receive_chunk_runs_unguarded(conn, send, outstanding, session, report),
+            self.receive_chunk_runs_unguarded(conn, send, outstanding, session, report, ready),
         )
         .await
     }
@@ -444,21 +557,27 @@ impl Fetcher {
     /// if `PIPELINED_COMMITS` are already in flight. Committing (building the footer, which
     /// re-hashes every chunk, then the durable write) used to stall the receive loop for ~45 ms
     /// per 16 MiB.
+    #[allow(clippy::too_many_arguments)]
     async fn commit_pack(
         &self,
-        commits: &mut JoinSet<Result<u64>>,
+        commits: &mut JoinSet<Result<(u64, Vec<MerkleHash>)>>,
         packer: &mut XorbPacker,
+        pack: &mut Vec<MerkleHash>,
         session: &mut Session<'_>,
         report: &mut ReceiverReport,
+        ready: &mut Readiness<'_>,
     ) -> Result<()> {
         while commits.len() >= PIPELINED_COMMITS {
             let done = commits.join_next().await.expect("non-empty");
-            committed(done, session, report)?;
+            let hashes = committed(done, session, report)?;
+            ready.chunks_committed(&self.cas, &hashes).await?;
         }
         while let Some(done) = commits.try_join_next() {
-            committed(done, session, report)?;
+            let hashes = committed(done, session, report)?;
+            ready.chunks_committed(&self.cas, &hashes).await?;
         }
         let body = packer.take();
+        let hashes = std::mem::take(pack);
         let (cas, delay) = (self.cas.clone(), self.opts.commit_delay);
         commits.spawn(
             async move {
@@ -473,7 +592,7 @@ impl Fetcher {
                 if let Some(d) = delay {
                     tokio::time::sleep(d).await;
                 }
-                Ok(len)
+                Ok((len, hashes))
             }
             .instrument(tracing::debug_span!("commit_xorb")),
         );

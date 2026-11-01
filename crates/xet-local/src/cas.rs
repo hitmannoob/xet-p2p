@@ -23,6 +23,7 @@ use crate::manifest::{
     Entry, EntryKind, MANIFEST_FORMAT_VERSION, Manifest, STAGING_PREFIX, validate_rel_path,
 };
 use crate::walk::{WalkedEntry, WalkedKind, walk};
+use tracing::Instrument as _;
 
 /// A persistent, on-disk Xet content store. No network access is ever made.
 ///
@@ -565,13 +566,28 @@ impl LocalCas {
         staging: &Path,
         opts: ReconstructOptions,
     ) -> Result<ReconstructReport> {
-        let mut report = ReconstructReport::default();
-        let mut staged = Vec::new();
-        let mut touched_dirs = BTreeSet::new();
+        let (work, report) = self.decide(manifest, dest, staging)?;
+        let parallel = std::thread::available_parallelism().map_or(4, |n| n.get() * 2);
+        let staged: Vec<Result<Staged>> = futures::stream::iter(work)
+            .map(|w| self.stage(w))
+            .buffer_unordered(parallel)
+            .collect()
+            .await;
+        let staged = staged.into_iter().collect::<Result<Vec<_>>>()?;
+        install(manifest, dest, staging, staged, opts, report)
+    }
 
-        // Decide what to write; identical files already in place are left alone. A file whose
-        // stamp matches the one recorded when it was last verified with these hashes is not read
-        // again (see `ingest_cache`); any other existing file is read and hashed.
+    /// Decides what to write: identical files already in place are left alone. A file whose
+    /// stamp matches the one recorded when it was last verified with these hashes is not read
+    /// again (see `ingest_cache`); any other existing file is read and hashed.
+    #[tracing::instrument(level = "debug", skip_all)]
+    fn decide(
+        &self,
+        manifest: &Manifest,
+        dest: &Path,
+        staging: &Path,
+    ) -> Result<(Vec<Work>, ReconstructReport)> {
+        let mut report = ReconstructReport::default();
         let t = std::time::Instant::now();
         let started = std::time::SystemTime::now();
         let mut work = Vec::new();
@@ -626,14 +642,14 @@ impl LocalCas {
                 }
                 continue;
             }
-            work.push((
-                staging.join(i.to_string()),
-                entry.path.clone(),
+            work.push(Work {
+                tmp: staging.join(i.to_string()),
+                path: entry.path.clone(),
                 size,
-                xet_hash.to_owned(),
-                sha256.to_owned(),
+                xet_hash: xet_hash.to_owned(),
+                sha256: sha256.to_owned(),
                 executable,
-            ));
+            });
         }
 
         let records: Vec<Hashed<'_>> = verified
@@ -652,104 +668,253 @@ impl LocalCas {
             trusted = report.files_trusted,
             "existing files checked"
         );
-        // Reconstruct and verify concurrently. Each file is decoded from its native segments with
-        // cached footers; every chunk is checked against its stored hash, and size + SHA-256
-        // against the manifest, before anything is installed.
-        let parallel = std::thread::available_parallelism().map_or(4, |n| n.get() * 2);
-        let results: Vec<Result<_>> = futures::stream::iter(work)
-            .map(
-                |(tmp, path, size, xet_hash, sha256, executable)| async move {
-                    let fail = |reason: String| Error::Verification {
-                        path: path.clone(),
-                        reason,
-                    };
-                    if size == 0 {
-                        crate::durable::sync_file(&fs::File::create(&tmp)?)?;
-                    } else {
-                        let hash = parse_hash(&path, &xet_hash)?;
-                        let (n, sha) = self.write_file_from_cas(&hash, &tmp).await?;
-                        if n != size {
-                            return Err(fail(format!("size {n}, expected {size}")));
-                        }
-                        if !sha.eq_ignore_ascii_case(&sha256) {
-                            return Err(fail(format!("SHA-256 {sha}, expected {sha256}")));
-                        }
-                    }
-                    if size == 0 && !sha256.eq_ignore_ascii_case(EMPTY_SHA256) {
-                        return Err(fail("SHA-256 of empty file does not match".into()));
-                    }
-                    set_executable(&tmp, executable)?;
-                    Ok((tmp, path, size))
-                },
-            )
-            .buffer_unordered(parallel)
-            .collect()
-            .await;
-        for r in results {
-            let (tmp, path, size) = r?;
-            staged.push((tmp, path));
-            report.bytes += size;
-        }
-
-        // Everything is verified; only now may anything at the destination be removed.
-        if opts.delete_extraneous {
-            let wanted = wanted_paths(manifest)?;
-            let staging_name = staging.file_name().map(|n| n.to_owned());
-            prune(
-                dest,
-                Path::new(""),
-                &wanted,
-                staging_name.as_deref(),
-                &mut report,
-            )?;
-            touched_dirs.insert(dest.to_owned());
-        }
-
-        for entry in &manifest.entries {
-            if matches!(entry.kind, EntryKind::Dir) {
-                ensure_dir(dest, &validate_rel_path(&entry.path)?)?;
-                report.dirs += 1;
-            }
-        }
-
-        for (tmp, path) in staged {
-            let rel = validate_rel_path(&path)?;
-            if let Some(parent) = rel.parent() {
-                ensure_dir(dest, parent)?;
-            }
-            let target = dest.join(&rel);
-            match fs::symlink_metadata(&target) {
-                Ok(m) if m.is_file() => {}
-                Ok(_) => {
-                    return Err(Error::UnsafePath {
-                        path,
-                        reason: "destination exists and is not a regular file",
-                    });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-            fs::rename(&tmp, &target)?;
-            report.files += 1;
-            touched_dirs.insert(target.parent().unwrap_or(dest).to_owned());
-        }
-
-        // Make the renames (and any new directories) durable.
-        for entry in &manifest.entries {
-            if matches!(entry.kind, EntryKind::Dir) {
-                let dir = dest.join(validate_rel_path(&entry.path)?);
-                touched_dirs.insert(dir.parent().unwrap_or(dest).to_owned());
-            }
-        }
-        touched_dirs.insert(dest.to_owned());
-        for dir in touched_dirs {
-            sync_dir(&dir)?;
-        }
-        // One drive-cache flush makes every file and directory synced above durable.
-        crate::durable::barrier(dest)?;
-
-        Ok(report)
+        Ok((work, report))
     }
+
+    /// Reconstructs one file into staging and checks its size and SHA-256 against the manifest.
+    async fn stage(&self, w: Work) -> Result<Staged> {
+        let fail = |reason: String| Error::Verification {
+            path: w.path.clone(),
+            reason,
+        };
+        if w.size == 0 {
+            crate::durable::sync_file(&fs::File::create(&w.tmp)?)?;
+            if !w.sha256.eq_ignore_ascii_case(EMPTY_SHA256) {
+                return Err(fail("SHA-256 of empty file does not match".into()));
+            }
+        } else {
+            let hash = parse_hash(&w.path, &w.xet_hash)?;
+            let (n, sha) = self.write_file_from_cas(&hash, &w.tmp).await?;
+            if n != w.size {
+                return Err(fail(format!("size {n}, expected {}", w.size)));
+            }
+            if !sha.eq_ignore_ascii_case(&w.sha256) {
+                return Err(fail(format!("SHA-256 {sha}, expected {}", w.sha256)));
+            }
+        }
+        set_executable(&w.tmp, w.executable)?;
+        Ok((w.tmp, w.path, w.size))
+    }
+}
+
+/// A reconstruction into a destination that can start files early, as soon as their content is
+/// in this CAS (see [`Reconstruction::content_ready`]), while the rest is still arriving. Nothing
+/// at the destination changes until [`Reconstruction::finish`] has verified every file; then all
+/// are installed at once, as with [`LocalCas::reconstruct_with`].
+pub struct Reconstruction {
+    cas: Arc<LocalCas>,
+    manifest: Manifest,
+    dest: PathBuf,
+    staging: PathBuf,
+    opts: ReconstructOptions,
+    report: ReconstructReport,
+    /// Files still to start, by lowercase Xet hash (empty files under "").
+    pending: std::collections::HashMap<String, Vec<Work>>,
+    running: tokio::task::JoinSet<Result<Staged>>,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+impl LocalCas {
+    /// Validates `manifest`, prepares staging under `dest` and decides which files are already in
+    /// place. Locks are the caller's concern, as with [`LocalCas::reconstruct_with`].
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub fn begin_reconstruct(
+        self: &Arc<Self>,
+        manifest: &Manifest,
+        dest: impl AsRef<Path>,
+        opts: ReconstructOptions,
+    ) -> Result<Reconstruction> {
+        manifest.validate()?;
+        let dest = dest.as_ref();
+        fs::create_dir_all(dest)?;
+        let dest = fs::canonicalize(dest)?;
+        remove_stale_staging(&dest)?;
+        let staging = dest.join(staging_name());
+        fs::create_dir(&staging)?;
+        let (work, report) = match self.decide(manifest, &dest, &staging) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(e);
+            }
+        };
+        let mut pending: std::collections::HashMap<String, Vec<Work>> = Default::default();
+        for w in work {
+            let key = if w.size == 0 {
+                String::new()
+            } else {
+                w.xet_hash.to_ascii_lowercase()
+            };
+            pending.entry(key).or_default().push(w);
+        }
+        let parallel = std::thread::available_parallelism().map_or(4, |n| n.get() * 2);
+        Ok(Reconstruction {
+            cas: self.clone(),
+            manifest: manifest.clone(),
+            dest,
+            staging,
+            opts,
+            report,
+            pending,
+            running: Default::default(),
+            permits: Arc::new(tokio::sync::Semaphore::new(parallel)),
+        })
+    }
+}
+
+impl Reconstruction {
+    /// `file`'s content is now fully in the CAS: start staging every path that needs it.
+    pub fn content_ready(&mut self, file: &MerkleHash) {
+        if let Some(items) = self.pending.remove(&file.hex()) {
+            for w in items {
+                self.start(w);
+            }
+        }
+    }
+
+    fn start(&mut self, w: Work) {
+        let (cas, permits) = (self.cas.clone(), self.permits.clone());
+        self.running.spawn(
+            async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore never closed");
+                cas.stage(w).await
+            }
+            .instrument(tracing::debug_span!("stage_file")),
+        );
+    }
+
+    /// Stages everything not started yet, waits for all files to verify, then installs them.
+    #[tracing::instrument(level = "debug", skip_all)]
+    pub async fn finish(mut self) -> Result<ReconstructReport> {
+        let result = self.finish_inner().await;
+        let _ = fs::remove_dir_all(&self.staging);
+        if result.is_ok() {
+            let files: BTreeSet<MerkleHash> = self
+                .manifest
+                .files()
+                .filter(|(_, size, ..)| *size > 0)
+                .filter_map(|(_, _, h, ..)| MerkleHash::from_hex(h).ok())
+                .collect();
+            if let Ok(xorbs) = self.cas.referenced_xorbs(&files).await {
+                self.cas.touch_xorbs(&xorbs);
+            }
+        }
+        result
+    }
+
+    async fn finish_inner(&mut self) -> Result<ReconstructReport> {
+        for (_, items) in std::mem::take(&mut self.pending) {
+            for w in items {
+                self.start(w);
+            }
+        }
+        let mut staged = Vec::new();
+        while let Some(done) = self.running.join_next().await {
+            staged.push(done.map_err(|e| Error::Xet(format!("staging task failed: {e}")))??);
+        }
+        install(
+            &self.manifest,
+            &self.dest,
+            &self.staging,
+            staged,
+            self.opts,
+            std::mem::take(&mut self.report),
+        )
+    }
+}
+
+/// A file to reconstruct into staging.
+struct Work {
+    tmp: PathBuf,
+    path: String,
+    size: u64,
+    xet_hash: String,
+    sha256: String,
+    executable: bool,
+}
+
+/// A verified file in staging: (staging path, manifest path, size).
+type Staged = (PathBuf, String, u64);
+
+/// Installs verified staged files (and the manifest's directories) into `dest`, after removing
+/// extraneous entries if asked, then makes it all durable.
+fn install(
+    manifest: &Manifest,
+    dest: &Path,
+    staging: &Path,
+    staged: Vec<Staged>,
+    opts: ReconstructOptions,
+    mut report: ReconstructReport,
+) -> Result<ReconstructReport> {
+    let mut touched_dirs = BTreeSet::new();
+    let staged: Vec<(PathBuf, String)> = staged
+        .into_iter()
+        .map(|(tmp, path, size)| {
+            report.bytes += size;
+            (tmp, path)
+        })
+        .collect();
+    // Everything is verified; only now may anything at the destination be removed.
+    if opts.delete_extraneous {
+        let wanted = wanted_paths(manifest)?;
+        let staging_name = staging.file_name().map(|n| n.to_owned());
+        prune(
+            dest,
+            Path::new(""),
+            &wanted,
+            staging_name.as_deref(),
+            &mut report,
+        )?;
+        touched_dirs.insert(dest.to_owned());
+    }
+
+    for entry in &manifest.entries {
+        if matches!(entry.kind, EntryKind::Dir) {
+            ensure_dir(dest, &validate_rel_path(&entry.path)?)?;
+            report.dirs += 1;
+        }
+    }
+
+    for (tmp, path) in staged {
+        let rel = validate_rel_path(&path)?;
+        if let Some(parent) = rel.parent() {
+            ensure_dir(dest, parent)?;
+        }
+        let target = dest.join(&rel);
+        match fs::symlink_metadata(&target) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => {
+                return Err(Error::UnsafePath {
+                    path,
+                    reason: "destination exists and is not a regular file",
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        fs::rename(&tmp, &target)?;
+        report.files += 1;
+        touched_dirs.insert(target.parent().unwrap_or(dest).to_owned());
+    }
+
+    // Make the renames (and any new directories) durable.
+    for entry in &manifest.entries {
+        if matches!(entry.kind, EntryKind::Dir) {
+            let dir = dest.join(validate_rel_path(&entry.path)?);
+            touched_dirs.insert(dir.parent().unwrap_or(dest).to_owned());
+        }
+    }
+    touched_dirs.insert(dest.to_owned());
+    for dir in touched_dirs {
+        sync_dir(&dir)?;
+    }
+    // One drive-cache flush makes every file and directory synced above durable.
+    crate::durable::barrier(dest)?;
+
+    Ok(report)
 }
 
 fn parse_hash(path: &str, hex: &str) -> Result<MerkleHash> {
