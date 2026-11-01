@@ -610,7 +610,50 @@ impl LocalCas {
             .collect()
             .await;
         let staged = staged.into_iter().collect::<Result<Vec<_>>>()?;
-        install(manifest, dest, staging, staged, opts, report)
+        let (report, installed) = install(manifest, dest, staging, staged, opts, report)?;
+        self.record_installed(manifest, &installed).await;
+        Ok(report)
+    }
+
+    /// Records the stamps of files just installed, so the next transfer to this destination
+    /// trusts them without re-reading (see `ingest_cache`). Best effort: a failure here only
+    /// means they get verified by reading next time.
+    async fn record_installed(&self, manifest: &Manifest, installed: &[(PathBuf, String)]) {
+        if installed.is_empty() {
+            return;
+        }
+        tokio::time::sleep(ingest_cache::INSTALL_SETTLE).await;
+        let hashes: std::collections::HashMap<&str, (&str, &str)> = manifest
+            .files()
+            .map(|(e, _, xet, sha, _)| (e.path.as_str(), (xet, sha)))
+            .collect();
+        let mut keys = Vec::new();
+        for (target, path) in installed {
+            let Some((xet, sha)) = hashes.get(path.as_str()) else {
+                continue;
+            };
+            if let (Ok(m), Ok(xet), Ok(Ok(sha))) = (
+                fs::symlink_metadata(target),
+                MerkleHash::from_hex(xet),
+                hex::decode(sha).map(<[u8; 32]>::try_from),
+            ) && let Some(stamp) = ingest_cache::Stamp::of(&m)
+                && m.len() > 0
+            {
+                keys.push((ingest_cache::key(target), stamp, xet, sha));
+            }
+        }
+        let records: Vec<Hashed<'_>> = keys
+            .iter()
+            .map(|(key, stamp, xet, sha)| Hashed {
+                key: key.as_slice(),
+                stamp: *stamp,
+                xet: *xet,
+                sha256: *sha,
+            })
+            .collect();
+        if let Err(e) = self.ingest_cache.record_installed(&records) {
+            tracing::debug!("could not record installed files: {e}");
+        }
     }
 
     /// Decides what to write: identical files already in place are left alone. A file whose
@@ -851,14 +894,16 @@ impl Reconstruction {
         while let Some(done) = self.running.join_next().await {
             staged.push(done.map_err(|e| Error::Xet(format!("staging task failed: {e}")))??);
         }
-        install(
+        let (report, installed) = install(
             &self.manifest,
             &self.dest,
             &self.staging,
             staged,
             self.opts,
             std::mem::take(&mut self.report),
-        )
+        )?;
+        self.cas.record_installed(&self.manifest, &installed).await;
+        Ok(report)
     }
 }
 
@@ -884,8 +929,9 @@ fn install(
     staged: Vec<Staged>,
     opts: ReconstructOptions,
     mut report: ReconstructReport,
-) -> Result<ReconstructReport> {
+) -> Result<(ReconstructReport, Vec<(PathBuf, String)>)> {
     let mut touched_dirs = BTreeSet::new();
+    let mut installed = Vec::new();
     let staged: Vec<(PathBuf, String)> = staged
         .into_iter()
         .map(|(tmp, path, size)| {
@@ -932,6 +978,7 @@ fn install(
             Err(e) => return Err(e.into()),
         }
         fs::rename(&tmp, &target)?;
+        installed.push((target.clone(), path));
         report.files += 1;
         touched_dirs.insert(target.parent().unwrap_or(dest).to_owned());
     }
@@ -950,7 +997,7 @@ fn install(
     // One drive-cache flush makes every file and directory synced above durable.
     crate::durable::barrier(dest)?;
 
-    Ok(report)
+    Ok((report, installed))
 }
 
 /// Whether lz4 is worth trying on `path`: compresses five 64 KiB samples from the interior of the

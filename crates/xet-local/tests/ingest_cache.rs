@@ -99,7 +99,7 @@ async fn cache_hit_needs_the_content_in_this_cas() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn receiver_trusts_settled_files_and_repairs_edited_ones() {
+async fn receiver_trusts_its_installs_and_repairs_edited_ones() {
     let tmp = TempDir::new().unwrap();
     let src = tmp.path().join("src");
     let dest = tmp.path().join("dest");
@@ -114,10 +114,8 @@ async fn receiver_trusts_settled_files_and_repairs_edited_ones() {
     let (m, _) = cas.ingest(&src).await.unwrap();
     let r = cas.reconstruct(&m, &dest).await.unwrap();
     assert_eq!(r.files, 10);
-    settle();
-    // First check after settling reads and records; the next trusts the stamps.
-    let r = cas.reconstruct(&m, &dest).await.unwrap();
-    assert_eq!((r.files_unchanged, r.files_trusted), (10, 0));
+    // Files this receiver installed itself are trusted on the very next transfer, without being
+    // read (on filesystems with sub-second timestamps, which the test filesystems have).
     let r = cas.reconstruct(&m, &dest).await.unwrap();
     assert_eq!((r.files_unchanged, r.files_trusted), (10, 10));
 

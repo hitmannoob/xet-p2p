@@ -23,6 +23,8 @@ const INGEST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ingest_cache
 const RECORD_LEN: usize = 8 + 12 + 12 + 8 + 8 + 32 + 32;
 /// Files modified (mtime or ctime) within this many seconds of being hashed are not cached.
 const RACY_SECS: i64 = 2;
+/// How long after installing a file it may be recorded, on filesystems with sub-second timestamps.
+pub(crate) const INSTALL_SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// What identifies one version of a file without reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +55,22 @@ impl Stamp {
             let _ = m;
             None
         }
+    }
+
+    /// Whether a file this process just wrote and verified can be recorded at `at`. On a
+    /// filesystem with sub-second timestamps (seen as a non-zero nanosecond part) any later write
+    /// moves the stamp once a timestamp tick (milliseconds) has passed, so [`INSTALL_SETTLE`]
+    /// suffices; elsewhere the usual [`Stamp::settled_before`] rule applies.
+    fn settled_after_install(&self, at: SystemTime) -> bool {
+        if self.mtime.1 == 0 && self.ctime.1 == 0 {
+            return self.settled_before(at);
+        }
+        let Ok(at) = at.duration_since(SystemTime::UNIX_EPOCH) else {
+            return false;
+        };
+        let ns = |(s, n): (i64, u32)| s as i128 * 1_000_000_000 + n as i128;
+        let latest = ns(self.mtime).max(ns(self.ctime));
+        latest + INSTALL_SETTLE.as_nanos() as i128 <= at.as_nanos() as i128
     }
 
     /// Whether the file was last changed well before `hashed_at` (so recording it is safe).
@@ -152,6 +170,21 @@ impl IngestCache {
         hashed_at: SystemTime,
         prune: Option<(&[u8], &std::collections::HashSet<&[u8]>)>,
     ) -> Result<()> {
+        self.record_if(hashed, prune, |s| s.settled_before(hashed_at))
+    }
+
+    /// Records files this process just installed (see [`Stamp::settled_after_install`]).
+    pub fn record_installed(&self, installed: &[Hashed<'_>]) -> Result<()> {
+        let now = SystemTime::now();
+        self.record_if(installed, None, |s| s.settled_after_install(now))
+    }
+
+    fn record_if(
+        &self,
+        hashed: &[Hashed<'_>],
+        prune: Option<(&[u8], &std::collections::HashSet<&[u8]>)>,
+        settled: impl Fn(&Stamp) -> bool,
+    ) -> Result<()> {
         let txn = self.db.begin_write().map_err(db_err)?;
         {
             let mut table = txn.open_table(INGEST).map_err(db_err)?;
@@ -172,7 +205,7 @@ impl IngestCache {
                 }
             }
             for h in hashed {
-                if h.stamp.settled_before(hashed_at) {
+                if settled(&h.stamp) {
                     table
                         .insert(h.key, h.stamp.encode(&h.xet, &h.sha256).as_slice())
                         .map_err(db_err)?;
