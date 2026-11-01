@@ -405,6 +405,7 @@ impl LocalCas {
         fs::create_dir(&staging)?;
         let result = self.reconstruct_via(manifest, &dest, &staging, opts).await;
         let _ = fs::remove_dir_all(&staging);
+        let t = std::time::Instant::now();
         if result.is_ok() {
             let files: BTreeSet<MerkleHash> = manifest
                 .files()
@@ -415,6 +416,7 @@ impl LocalCas {
                 self.touch_xorbs(&xorbs);
             }
         }
+        tracing::debug!(ms = t.elapsed().as_millis() as u64, "xorbs touched");
         result
     }
 
@@ -430,11 +432,13 @@ impl LocalCas {
         let mut touched_dirs = BTreeSet::new();
 
         // Decide what to write; identical files already in place are left alone.
+        let t = std::time::Instant::now();
         let mut work = Vec::new();
+        let mut buf = vec![0u8; VERIFY_BUF];
         for (i, (entry, size, xet_hash, sha256, executable)) in manifest.files().enumerate() {
             let rel = validate_rel_path(&entry.path)?;
             if let Some(existing) = existing_regular_file(dest, &rel)
-                && verify_file(&existing, size, sha256).is_ok()
+                && verify_file(&existing, size, sha256, &mut buf).is_ok()
             {
                 set_executable(&existing, executable)?;
                 report.files_unchanged += 1;
@@ -450,6 +454,11 @@ impl LocalCas {
             ));
         }
 
+        tracing::debug!(
+            ms = t.elapsed().as_millis() as u64,
+            unchanged = report.files_unchanged,
+            "existing files checked"
+        );
         // Reconstruct and verify concurrently. Each file is decoded from its native segments with
         // cached footers; every chunk is checked against its stored hash, and size + SHA-256
         // against the manifest, before anything is installed.
@@ -743,7 +752,17 @@ fn ensure_dir(dest: &Path, rel: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_file(path: &Path, size: u64, sha256: &str) -> std::result::Result<(), String> {
+/// Read size for [`verify_file`]. The buffer is reused across files: a fresh large allocation per
+/// file costs an mmap, page faults and munmap with some allocators (musl), which dominated checking
+/// thousands of unchanged files in a gVisor sandbox.
+const VERIFY_BUF: usize = 1 << 20;
+
+fn verify_file(
+    path: &Path,
+    size: u64,
+    sha256: &str,
+    buf: &mut [u8],
+) -> std::result::Result<(), String> {
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
     let actual_size = file.metadata().map_err(|e| e.to_string())?.len();
     if actual_size != size {
@@ -751,9 +770,8 @@ fn verify_file(path: &Path, size: u64, sha256: &str) -> std::result::Result<(), 
     }
 
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
     loop {
-        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        let n = file.read(buf).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }

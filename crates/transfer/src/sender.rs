@@ -105,6 +105,11 @@ pub async fn prepare(cas: &LocalCas, src: &Path) -> Result<Prepared> {
     let files = file_hashes(&manifest)?;
     let referenced = cas.referenced_xorbs(&files).await?;
     cas.touch_xorbs(&referenced); // recency for GC on the sender's CAS
+    debug!(
+        ms = start.elapsed().as_millis() as u64,
+        files = files.len(),
+        "prepared"
+    );
     Ok(Prepared {
         manifest,
         ingest,

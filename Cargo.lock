@@ -3436,6 +3436,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
  "xet-client",
  "xet-core-structures",
  "xet-data",

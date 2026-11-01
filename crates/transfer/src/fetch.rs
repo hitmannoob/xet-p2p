@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::info;
+use tracing::{debug, info};
 use transport::{Conn, RecvStream, SendStream};
 use transport::{read_frame, read_payload, write_frame};
 use xet_local::chunks::{VerifiedChunk, XorbPacker, decode_chunk_lists, parse_chunk_run};
@@ -51,7 +51,9 @@ impl Fetcher {
         mode: TransferMode,
         delete: bool,
     ) -> Result<ReceiverReport> {
+        let t = std::time::Instant::now();
         let mut session = self.sessions.begin(session_key, manifest)?;
+        debug!(ms = t.elapsed().as_millis() as u64, "session begun");
         let mut report = ReceiverReport {
             resumed: session.is_resumed(),
             attempts: session.record.attempts,
@@ -63,7 +65,9 @@ impl Fetcher {
             info!(dest = %session_key, attempt = report.attempts, prior_xorbs = report.prior_xorbs_committed, "resuming session");
         }
 
+        let t = std::time::Instant::now();
         let missing = self.cas.missing_content(manifest).await?;
+        debug!(ms = t.elapsed().as_millis() as u64, "missing content found");
         report.mode = mode;
         match mode {
             TransferMode::Xorb => {
@@ -76,6 +80,7 @@ impl Fetcher {
             }
         }
 
+        let t = std::time::Instant::now();
         let r = self
             .cas
             .reconstruct_with(
@@ -86,13 +91,16 @@ impl Fetcher {
                 },
             )
             .await?;
+        debug!(ms = t.elapsed().as_millis() as u64, "reconstructed");
         report.files_deleted = r.files_deleted;
         report.dirs_deleted = r.dirs_deleted;
         report.files_installed = r.files;
         report.files_unchanged = r.files_unchanged;
         report.dirs_created = r.dirs;
         report.bytes_reconstructed = r.bytes;
+        let t = std::time::Instant::now();
         session.finish()?;
+        debug!(ms = t.elapsed().as_millis() as u64, "session finished");
         Ok(report)
     }
 
