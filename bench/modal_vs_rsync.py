@@ -16,7 +16,8 @@ Method
   conditions do not systematically favour one tool.
 - A network baseline is taken at the start of every repetition: TCP connect RTT and raw upload
   throughput through the tunnel.
-- "Warm" scenarios sync the first version (unmeasured), edit it (mtime +10 s so rsync's quick
+- "Warm" scenarios sync the first version, wait SETTLE_SECS, sync it again (both unmeasured: the
+  steady state of a tree that has been synced before), edit it (mtime +10 s so rsync's quick
   check notices), then measure. Every measured result is verified by SHA-256 inside the sandbox.
 - Reported: median [min-max] over repetitions; raw per-run data is written as JSON too.
 
@@ -77,6 +78,9 @@ def write(root, rel, data):
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "wb") as f:
         f.write(data)
+
+
+SETTLE_SECS = 3
 
 
 def bump(path):
@@ -354,8 +358,13 @@ def main():
                         remote = f"{root.split(sb.object_id)[1]}/{tag}"
                     retries = 0
                     if edit:
+                        # Steady state: the tree was synced a while ago and again since (so
+                        # xet-p2p's stamp caches hold settled records on both sides; files
+                        # changed within 2 s of being hashed are never trusted). Same for every tool.
                         _, r0 = with_retries(run, f"{tool} {name} (setup sync)")
-                        retries += r0
+                        time.sleep(SETTLE_SECS)
+                        _, r0b = with_retries(run, f"{tool} {name} (resync)")
+                        retries += r0 + r0b
                         edit(src, seed)
                     m, r1 = with_retries(run, f"{tool} {name}")
                     m["retries"] = retries + r1
