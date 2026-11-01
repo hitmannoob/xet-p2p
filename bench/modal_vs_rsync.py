@@ -157,6 +157,23 @@ def remote_digests(sb, path):
     return res
 
 
+RSYNC_TEMP = re.compile(r"(^|/)\.[^/]+\.[A-Za-z0-9]{6}$")
+
+
+def check_tree(remote, local, what):
+    """Every source file must be at the destination with identical content. Extra files fail too,
+    except rsync temp files (`.name.XXXXXX`) left by an interrupted (then retried) run: rsync
+    without --delete never removes them. Returns those leftovers."""
+    bad = {f for f in local if remote.get(f) != local[f]}
+    extra = set(remote) - set(local)
+    leftovers = sorted(f for f in extra if RSYNC_TEMP.search(f))
+    assert not bad and len(leftovers) == len(extra), \
+        f"{what}: tree differs (wrong or missing: {sorted(bad)[:5]}, extra: {sorted(extra)[:5]})"
+    if leftovers:
+        print(f"  note: {what}: {len(leftovers)} rsync temp file(s) left by an interrupted run", flush=True)
+    return leftovers
+
+
 # ---------- tools ----------
 
 def run_rsync(src, url, compress):
@@ -368,7 +385,7 @@ def main():
                         edit(src, seed)
                     m, r1 = with_retries(run, f"{tool} {name}")
                     m["retries"] = retries + r1
-                    assert remote_digests(sb, remote) == digest_tree(src), f"{tool} {name} rep {rep}: tree differs"
+                    m["leftovers"] = check_tree(remote_digests(sb, remote), digest_tree(src), f"{tool} {name} rep {rep}")
                     m.update({"tool": tool, "scenario": name, "rep": rep})
                     runs.append(m)
                     print(f"  rep {rep + 1} {tool:22} {name}: {fmt_bytes(m['sent'])}, {m['wall']:.1f}s "
