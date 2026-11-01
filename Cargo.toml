@@ -58,8 +58,14 @@ providers = { path = "crates/providers" }
 transfer = { path = "crates/transfer" }
 
 # Chunking/hashing/compression are slow unoptimised; keep tests on large inputs fast.
+# Line tables only (backtraces keep file:line): full debug info made target/debug ~6 GB, too
+# big to keep between builds on this machine, which forced a full rebuild every cycle.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
 
 # Release speed with symbols and line tables, for the built-in CPU profiler (`--features cpu-profile`).
 [profile.profiling]
