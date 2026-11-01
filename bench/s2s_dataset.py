@@ -90,6 +90,7 @@ def main():
     ap.add_argument("--raw", required=True)
     ap.add_argument("--shards", type=int, default=46)
     ap.add_argument("--extra", type=int, default=5)
+    ap.add_argument("--verbose", action="store_true", help="print xet-p2p's per-step profile")
     args = ap.parse_args()
 
     _gai = socket.getaddrinfo
@@ -158,19 +159,30 @@ def main():
         def serve():
             sh(b, "for p in /proc/[0-9]*; do [ \"$(readlink $p/exe 2>/dev/null)\" = /opt/x/xet-p2p ] && kill ${p#/proc/}; done; "
                   "sleep 1; rm -rf /recv/cas /recv/xet /tmp/ready.json; mkdir -p /recv/xet; "
-                  f"nohup {X} serve --no-quic --listen-tcp 0.0.0.0:{XET_PORT} --root /recv/xet --cas-dir /recv/cas "
+                  f"RUST_LOG=warn,transfer=debug nohup {X} serve --no-quic --listen-tcp 0.0.0.0:{XET_PORT} --root /recv/xet --cas-dir /recv/cas "
                   f"--cert {K}/server.crt --key {K}/server.key --allow-client {K}/client.crt --ready-file /tmp/ready.json "
                   "> /tmp/serve.log 2>&1 < /dev/null & for i in $(seq 1 100); do [ -s /tmp/ready.json ] && exit 0; sleep 0.1; done; exit 1")
 
-        def push(tool, dest):
+        def receiver_log_mark():
+            return int(sh(b, "wc -l < /tmp/serve.log") or 0)
+
+        def receiver_log_since(mark):
+            out = sh(b, f"tail -n +{mark + 1} /tmp/serve.log | sed 's/\x1b\\[[0-9;]*m//g' | grep 'transfer::fetch' || true")
+            return [l.split("DEBUG ", 1)[-1] for l in out.splitlines()]
+
+        def push(tool, dest, tag="push"):
             if tool == "rsync -a":
                 w, out = timed(a, f"rsync -a --stats /work/src/ rsync://{rh}:{rp}/bench/{dest}/")
                 num = lambda k: int(__import__("re").search(rf"Total (?:bytes )?{k}:\s*([\d,]+)", out).group(1).replace(",", ""))
                 return {"wall": w, "sent": num("sent"), "transfer": w}
-            w, out = timed(a, f"{X} push /work/src tcp://{xh}:{xp}/{dest} --cert {K}/client.crt --key {K}/client.key "
+            mark = receiver_log_mark()
+            sh(a, "rm -rf /tmp/trace && mkdir -p /tmp/trace")
+            w, out = timed(a, f"XET_P2P_TRACE=/tmp/trace/{tag} {X} push /work/src tcp://{xh}:{xp}/{dest} --cert {K}/client.crt --key {K}/client.key "
                               f"--peer-cert {K}/server.crt --cas-dir /work/cas --json")
             j = json.loads(out)
-            return {"wall": w, "sent": j["udp_bytes_sent"], "transfer": j["elapsed_secs"], "connect": j["connect_secs"],
+            profile = sh(a, "cat /tmp/trace/*.txt 2>/dev/null || true")
+            recv = receiver_log_since(mark)
+            return {"profile_sender": profile, "receiver_log": recv, "wall": w, "sent": j["udp_bytes_sent"], "transfer": j["elapsed_secs"], "connect": j["connect_secs"],
                     "cached_files": j["ingest"]["cached_files"], "trusted": j["receiver"]["files_trusted"]}
 
         def verify(tool, dest):
@@ -192,7 +204,7 @@ def main():
                 if step == "second destination":
                     sh(b, f"rm -rf /recv/rsync/{d1} /recv/xet/{d1}")
                 dest = d2 if step == "second destination" else d1
-                m = push(tool, dest)
+                m = push(tool, dest, step.split()[0])
                 m.update({"tool": tool, "step": step,
                           "data_bytes": all_bytes if step in ("grown", "second destination") else base_bytes})
                 if step in ("cold", "grown", "second destination"):
@@ -200,6 +212,11 @@ def main():
                 runs.append(m)
                 print(f"  {tool:9} {step:28} {m['wall']:7.0f} s  sent {m['sent'] / GIB:8.2f} GiB  "
                       f"({m['data_bytes'] / m['wall'] / (1 << 20):.0f} MiB/s of data)", flush=True)
+                if args.verbose and tool == "xet-p2p":
+                    for line in m["profile_sender"].splitlines()[2:14]:
+                        print(f"      sender  {line}", flush=True)
+                    for line in m["receiver_log"]:
+                        print(f"      receiver {line}", flush=True)
                 with open(args.raw, "w") as f:
                     json.dump({"meta": meta, "runs": runs}, f, indent=1)
                 report(meta, runs, args.out)
