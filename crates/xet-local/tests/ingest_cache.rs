@@ -179,3 +179,34 @@ async fn reconstruction_stages_early_and_installs_only_at_finish() {
         .collect();
     assert!(leftovers.is_empty(), "staging removed: {leftovers:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incompressible_files_skip_compression_and_round_trip() {
+    use rand::{Rng, SeedableRng};
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    let mut random = vec![0u8; 2 << 20];
+    rand::rngs::StdRng::seed_from_u64(9).fill(&mut random[..]);
+    write(&src, "random.bin", &random);
+    write(
+        &src,
+        "text.log",
+        &b"step=1 loss=0.25 lr=1e-4 tokens=1000\n".repeat(60_000),
+    );
+    let cas = LocalCas::open(tmp.path().join("cas")).await.unwrap();
+    let (m, r) = cas.ingest(&src).await.unwrap();
+    assert_eq!(r.raw_files, 1, "{r:?}");
+    // The compressible file still compresses: far fewer bytes stored than ingested.
+    assert!(
+        r.dedup.xorb_bytes_uploaded < (random.len() + 600_000) as u64,
+        "{:?}",
+        r.dedup
+    );
+    let dest = tmp.path().join("dest");
+    cas.reconstruct(&m, &dest).await.unwrap();
+    assert_eq!(fs::read(dest.join("random.bin")).unwrap(), random);
+    assert_eq!(
+        fs::read(dest.join("text.log")).unwrap(),
+        fs::read(src.join("text.log")).unwrap()
+    );
+}

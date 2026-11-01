@@ -812,10 +812,11 @@ fn print_push_report(r: &PushReport) {
         r.ingest.files, r.logical_bytes
     );
     eprintln!(
-        "  local ingest: {} files unchanged since last read ({} bytes, not re-read); read {}: {} chunks ({} new), {} new bytes, {} deduped",
+        "  local ingest: {} files unchanged since last read ({} bytes, not re-read); read {} ({} incompressible, stored uncompressed): {} chunks ({} new), {} new bytes, {} deduped",
         r.ingest.cached_files,
         r.ingest.cached_bytes,
         r.ingest.files - r.ingest.cached_files,
+        r.ingest.raw_files,
         d.total_chunks,
         d.new_chunks,
         d.new_bytes,
@@ -888,6 +889,7 @@ fn report_json(r: &PushReport) -> serde_json::Value {
         "logical_bytes": r.logical_bytes,
         "ingest": {
             "cached_files": r.ingest.cached_files,
+            "raw_files": r.ingest.raw_files,
             "cached_bytes": r.ingest.cached_bytes,
             "total_chunks": d.total_chunks,
             "new_chunks": d.new_chunks,

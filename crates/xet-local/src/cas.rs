@@ -32,6 +32,8 @@ use tracing::Instrument as _;
 pub struct LocalCas {
     root: PathBuf,
     config: Arc<TranslatorConfig>,
+    /// The same store with xorb compression off, for ingesting files that do not compress.
+    config_raw: Arc<TranslatorConfig>,
     /// The same store upstream sessions open for `config` (redb handles are shared per path).
     pub(crate) client: Arc<LocalClient>,
     pub(crate) index: ChunkIndex,
@@ -77,6 +79,8 @@ pub struct IngestReport {
     /// its hashes without being read. `dedup` covers only the files that were read.
     pub cached_files: usize,
     pub cached_bytes: u64,
+    /// Of the files read, how many were ingested without compression (samples did not compress).
+    pub raw_files: usize,
     pub dedup: DeduplicationMetrics,
 }
 
@@ -149,6 +153,12 @@ impl LocalCas {
         }
         let ctx = XetContext::default()?;
         let config = Arc::new(TranslatorConfig::local_config(&ctx, &root)?);
+        let raw_ctx = XetContext::with_config(
+            xet_runtime::config::XetConfig::new()
+                .with_config("xorb.compression_policy", "none")
+                .map_err(|e| Error::Xet(e.to_string()))?,
+        )?;
+        let config_raw = Arc::new(TranslatorConfig::local_config(&raw_ctx, &root)?);
         // Mirrors `xet_data::processing::create_remote_client` for `local://` endpoints.
         let client = LocalClient::new(ctx.clone(), root.join("xet").join("xorbs"))
             .await
@@ -158,6 +168,7 @@ impl LocalCas {
         let cas = Self {
             root,
             config,
+            config_raw,
             client,
             index,
             ingest_cache,
@@ -268,28 +279,53 @@ impl LocalCas {
             .filter(|(i, w)| matches!(w.kind, WalkedKind::File { .. }) && known[*i].is_none())
             .map(|(i, _)| i)
             .collect();
-        let (infos, dedup) = if to_read.is_empty() {
-            (Vec::new(), DeduplicationMetrics::default())
-        } else {
-            let session = FileUploadSession::new(self.config.clone()).await?;
-            let infos = session
-                .upload_files(
-                    to_read
-                        .iter()
-                        .map(|i| (walked[*i].abs_path.as_path(), Sha256Policy::Compute)),
-                )
-                .await?;
-            let dedup = session.finalize().await?;
+        let mut report = IngestReport::default();
+        // Upstream lz4-compresses every chunk and keeps the result only if it is smaller, so for
+        // data that is already compressed (Parquet, archives, media, most weights) all of that work
+        // is wasted. Files whose samples do not compress are ingested with compression off; the
+        // xorbs are valid either way. Ingest compression is the only compression on the wire.
+        let (compressible, raw): (Vec<usize>, Vec<usize>) = to_read
+            .iter()
+            .copied()
+            .partition(|i| compresses(&walked[*i].abs_path));
+        report.raw_files = raw.len();
+        let upload = |config: Arc<TranslatorConfig>, files: Vec<usize>| {
+            let paths: Vec<&Path> = files
+                .iter()
+                .map(|i| walked[*i].abs_path.as_path())
+                .collect();
+            async move {
+                if paths.is_empty() {
+                    return Ok::<_, Error>((files, Vec::new(), DeduplicationMetrics::default()));
+                }
+                let session = FileUploadSession::new(config).await?;
+                let infos = session
+                    .upload_files(paths.into_iter().map(|p| (p, Sha256Policy::Compute)))
+                    .await?;
+                let dedup = session.finalize().await?;
+                Ok((files, infos, dedup))
+            }
+        };
+        let (a, b) = tokio::try_join!(
+            upload(self.config.clone(), compressible),
+            upload(self.config_raw.clone(), raw)
+        )?;
+        let mut dedup = a.2;
+        dedup.merge_in(&b.2);
+        if !to_read.is_empty() {
             // Make newly stored chunks visible to chunk-level planning.
             self.sync_index().await?;
-            (infos, dedup)
-        };
-
-        let mut infos = infos.into_iter();
-        let mut report = IngestReport {
-            dedup,
-            ..Default::default()
-        };
+        }
+        let mut by_index: std::collections::HashMap<usize, _> = Default::default();
+        for (files, infos) in [(a.0, a.1), (b.0, b.1)] {
+            if infos.len() != files.len() {
+                return Err(Error::Xet(
+                    "upload returned fewer file infos than files".into(),
+                ));
+            }
+            by_index.extend(files.into_iter().zip(infos));
+        }
+        report.dedup = dedup;
         let mut entries = Vec::with_capacity(walked.len());
         let mut hashed = Vec::new();
 
@@ -329,8 +365,8 @@ impl LocalCas {
                             reason: "file changed during ingest; retry once it is stable".into(),
                         });
                     }
-                    let info = infos.next().ok_or_else(|| {
-                        Error::Xet("upload returned fewer file infos than files".into())
+                    let info = by_index.remove(&i).ok_or_else(|| {
+                        Error::Xet("upload returned no file info for a file".into())
                     })?;
                     if info.file_size != Some(size) {
                         return Err(Error::Verification {
@@ -915,6 +951,32 @@ fn install(
     crate::durable::barrier(dest)?;
 
     Ok(report)
+}
+
+/// Whether lz4 is worth trying on `path`: compresses up to three 64 KiB samples (start, middle,
+/// end) and asks for at least 5% savings. Small or unreadable files default to compressing.
+fn compresses(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    const SAMPLE: u64 = 64 * 1024;
+    let Ok(mut f) = fs::File::open(path) else {
+        return true;
+    };
+    let Ok(len) = f.metadata().map(|m| m.len()) else {
+        return true;
+    };
+    if len < 4 * SAMPLE {
+        return true;
+    }
+    let (mut raw, mut packed) = (0usize, 0usize);
+    let mut buf = vec![0u8; SAMPLE as usize];
+    for at in [0, len / 2, len - SAMPLE] {
+        if f.seek(SeekFrom::Start(at)).is_err() || f.read_exact(&mut buf).is_err() {
+            return true;
+        }
+        raw += buf.len();
+        packed += lz4_flex::block::compress(&buf).len();
+    }
+    packed * 100 < raw * 95
 }
 
 fn parse_hash(path: &str, hex: &str) -> Result<MerkleHash> {

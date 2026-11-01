@@ -3734,6 +3734,7 @@ dependencies = [
  "futures",
  "hex",
  "libc",
+ "lz4_flex",
  "rand 0.9.5",
  "redb",
  "serde",
