@@ -125,6 +125,32 @@ struct KeptSession {
     quic: bool,
     workspace_root: String,
     expires_unix: u64,
+    /// [`agent_build`] when the agent was started: a rebuilt xet-p2p starts a new agent instead
+    /// of reusing one running older code.
+    #[serde(default)]
+    agent_build: String,
+}
+
+/// Identifies the binaries an agent is started from (this executable, and the Linux agent build
+/// named by `$XET_P2P_AGENT_LINUX_BIN`) by path, size and modification time.
+fn agent_build() -> String {
+    let id = |p: Option<std::path::PathBuf>| {
+        p.and_then(|p| std::fs::metadata(&p).ok().map(|m| (p, m)))
+            .map(|(p, m)| {
+                let t = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_nanos());
+                format!("{}:{}:{t}", p.display(), m.len())
+            })
+            .unwrap_or_else(|| "none".into())
+    };
+    format!(
+        "exe={};linux={}",
+        id(std::env::current_exe().ok()),
+        id(std::env::var_os("XET_P2P_AGENT_LINUX_BIN").map(Into::into))
+    )
 }
 
 fn now_unix() -> u64 {
@@ -188,7 +214,7 @@ async fn reuse_kept(
         TransportPolicy::Quic => kind == TransportKind::Quic,
         TransportPolicy::Tcp => kind == TransportKind::TlsTcp,
     };
-    if session.expires_unix <= now_unix() || !allowed {
+    if session.expires_unix <= now_unix() || !allowed || session.agent_build != agent_build() {
         forget();
         return None;
     }
@@ -397,6 +423,7 @@ async fn connect_sandbox(
                     workspace_root: caps.workspace_root.clone(),
                     // Conservative: assume the agent may exit `idle` after this session starts.
                     expires_unix: now_unix() + idle.as_secs(),
+                    agent_build: agent_build(),
                 });
                 return Ok((
                     Connected {

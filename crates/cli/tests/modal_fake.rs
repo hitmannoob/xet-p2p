@@ -48,6 +48,10 @@ impl Env {
     }
 
     fn run(&self, args: &[&str], sandboxes: &str) -> Output {
+        self.run_with_agent(args, sandboxes, std::path::Path::new(BIN))
+    }
+
+    fn run_with_agent(&self, args: &[&str], sandboxes: &str, agent: &std::path::Path) -> Output {
         Command::new(BIN)
             .args(args)
             .env("HOME", self.tmp.path())
@@ -56,7 +60,7 @@ impl Env {
                 "PYTHONPATH",
                 concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fake_modal"),
             )
-            .env("XET_P2P_AGENT_LINUX_BIN", BIN)
+            .env("XET_P2P_AGENT_LINUX_BIN", agent)
             .env("FAKE_MODAL_SANDBOXES", sandboxes)
             .output()
             .unwrap()
@@ -226,6 +230,34 @@ fn keep_agent_through_fake_modal() {
         sessions, 1,
         "the replaced agent's credentials were not removed"
     );
+    // A rebuilt agent binary starts a new agent rather than reusing the one running old code.
+    let rebuilt = e.tmp.path().join("xet-p2p-rebuilt");
+    std::fs::copy(BIN, &rebuilt).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&rebuilt)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now())
+        .unwrap();
+    let args = [
+        "push",
+        src.as_str(),
+        uri.as_str(),
+        "--json",
+        "--keep-agent-secs",
+        "3",
+    ];
+    let out = e.run_with_agent(&args, &sb, &rebuilt);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fourth: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(fourth["reused_agent"], false);
+    let out = e.run_with_agent(&args, &sb, &rebuilt);
+    let fifth: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(fifth["reused_agent"], true);
     std::thread::sleep(std::time::Duration::from_secs(6));
     e.no_session_state();
 }
