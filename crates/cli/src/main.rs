@@ -360,8 +360,12 @@ async fn main() -> Result<()> {
                 (None, Some(to), Some(dest)) => format!("quic://{to}/{dest}"),
                 _ => bail!("give a TARGET (or --to HOST:PORT --dest DEST)"),
             };
+            let t = std::time::Instant::now();
             let remote = open_target(&target, &conn).await?;
+            let connect = t.elapsed();
+            let t = std::time::Instant::now();
             let cas = Arc::new(LocalCas::open(cas_dir(&conn)?).await?);
+            let cas_open = t.elapsed();
             let opts = PushOptions {
                 dest: remote.path.clone(),
                 parallel_streams: parallel as usize,
@@ -379,15 +383,22 @@ async fn main() -> Result<()> {
                     src.display()
                 );
             }
-            let result = push(cas, &src, &remote.conn, &opts).await;
+            let result = explain(&remote.conn, push(cas, &src, &remote.conn, &opts).await).await;
             let (bootstrap, reused) = (remote.bootstrap, remote.reused_agent);
+            let t = std::time::Instant::now();
             remote.finish().await?;
+            let close = t.elapsed();
             let report = result?;
             print_push_report(&report);
             if json {
                 let mut j = report_json(&report);
                 j["bootstrap_secs"] = bootstrap.as_secs_f64().into();
                 j["reused_agent"] = reused.into();
+                // Time outside the transfer: connecting (includes bootstrap), opening the local
+                // CAS, and ending the session.
+                j["connect_secs"] = connect.as_secs_f64().into();
+                j["cas_open_secs"] = cas_open.as_secs_f64().into();
+                j["close_secs"] = close.as_secs_f64().into();
                 println!("{}", serde_json::to_string_pretty(&j)?);
             }
             Ok(())
@@ -405,7 +416,7 @@ async fn main() -> Result<()> {
             let mut opts = PullOptions::new(remote.path.clone());
             opts.delete = delete;
             opts.mode = parse_mode(&mode);
-            let result = pull(cas, &remote.conn, &dest, &opts).await;
+            let result = explain(&remote.conn, pull(cas, &remote.conn, &dest, &opts).await).await;
             remote.finish().await?;
             let r = result?;
             print_pull_report(&r);
@@ -571,6 +582,21 @@ fn parse_mode(mode: &str) -> TransferMode {
 }
 
 /// Parses `target`, connects under the --transport policy, and reports what was chosen.
+/// A transfer can fail at its first stream because the peer refused this client after the
+/// connection was set up (TLS 1.3); add the peer's reason to the error.
+async fn explain<T, E>(conn: &transport::Conn, r: std::result::Result<T, E>) -> Result<T>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match r {
+        Ok(v) => Ok(v),
+        Err(e) => match conn.rejection().await {
+            Some(why) => Err(anyhow::Error::new(e).context(why)),
+            None => Err(e.into()),
+        },
+    }
+}
+
 async fn open_target(target: &str, args: &ConnArgs) -> Result<providers::Connected> {
     let parsed = providers::Target::parse(target)?;
     let policy: providers::TransportPolicy = args.transport.parse()?;

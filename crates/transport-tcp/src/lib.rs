@@ -90,7 +90,9 @@ pub async fn tcp_connect(
         .with_client_auth_cert(vec![identity.cert], identity.key)?;
     tls.alpn_protocols = vec![ALPN.to_vec()];
 
+    let t = std::time::Instant::now();
     let stream = TcpStream::connect(addr).await?;
+    tracing::debug!(?addr, ms = t.elapsed().as_millis() as u64, "tcp connected");
     tune(&stream)?;
     let counted = Counted::new(stream);
     let stats = counted.stats.clone();
@@ -109,10 +111,9 @@ pub async fn tcp_connect(
         .1
         .peer_certificates()
         .and_then(|c| c.first().cloned());
+    tracing::debug!(ms = t.elapsed().as_millis() as u64, "tls handshake done");
     let mut conn = start(tls, yamux::Mode::Client, addr, peer, stats);
-    // TLS 1.3 lets the client finish before the server has checked its certificate; make one
-    // round trip so a rejected client fails here, not at its first stream.
-    probe(&mut conn).await?;
+    conn.confirmed = start_probe(&conn).await?;
     Ok(Arc::new(conn))
 }
 
@@ -190,6 +191,9 @@ pub struct TcpTlsConn {
     peer: Option<CertificateDer<'static>>,
     wire: Arc<ByteStats>,
     progress: Arc<AtomicU64>,
+    /// The server's answer to the client's probe: `None` until it arrives (always `Ok` on the
+    /// server side).
+    confirmed: watch::Receiver<Option<std::result::Result<(), String>>>,
 }
 
 fn start<S>(
@@ -225,6 +229,7 @@ where
         peer: peer.map(|c| c.into_owned()),
         wire,
         progress: Arc::new(AtomicU64::new(0)),
+        confirmed: watch::channel(Some(Ok(()))).1,
     }
 }
 
@@ -318,6 +323,14 @@ impl TcpTlsConn {
 
 #[async_trait::async_trait]
 impl Connection for TcpTlsConn {
+    async fn rejection(&self) -> Option<String> {
+        let mut answer = self.confirmed.clone();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(2), answer.wait_for(Option::is_some)).await;
+        let why = answer.borrow().clone();
+        why.and_then(|r| r.err())
+    }
+
     async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
         let (r, w) = tokio::io::split(self.open(TAG_BI).await?);
         Ok((Box::new(w), self.counted(r)))
@@ -385,15 +398,27 @@ impl Connection for TcpTlsConn {
 }
 
 /// Client side of the post-handshake round trip: open a stream, expect one byte back.
-async fn probe(conn: &mut TcpTlsConn) -> Result<()> {
+/// TLS 1.3 lets the client finish before the server has checked its certificate. The server
+/// confirms a session by answering the client's first stream. Rather than wait that round trip
+/// here, the client sends the probe and goes on (its requests follow in the same flight); the
+/// answer is recorded in the background, so a rejected client's first failure can be explained
+/// ([`Connection::rejection`]). QUIC behaves the same way.
+async fn start_probe(
+    conn: &TcpTlsConn,
+) -> Result<watch::Receiver<Option<std::result::Result<(), String>>>> {
     let mut s = conn.open(TAG_UNI).await.map_err(rejected)?;
-    let mut ok = [0u8; 1];
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, s.read_exact(&mut ok))
-        .await
-        .map_err(|_| Error::Connection("server did not confirm the session".into()))?
-        .map_err(rejected)?;
-    let _ = s.shutdown().await;
-    Ok(())
+    let (tx, rx) = watch::channel(None);
+    tokio::spawn(async move {
+        let mut ok = [0u8; 1];
+        let answer = match tokio::time::timeout(HANDSHAKE_TIMEOUT, s.read_exact(&mut ok)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(format!("peer rejected the session: {e}")),
+            Err(_) => Err("server did not confirm the session".into()),
+        };
+        let _ = s.shutdown().await;
+        let _ = tx.send(Some(answer));
+    });
+    Ok(rx)
 }
 
 async fn answer_probe(conn: &mut TcpTlsConn) -> Result<()> {

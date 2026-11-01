@@ -122,17 +122,35 @@ pub async fn push(
         },
     )
     .await?;
-    match next(&mut recv).await? {
-        Message::HelloOk { protocol_version } if protocol_version == PROTOCOL_VERSION => {}
-        Message::HelloOk { protocol_version } => {
-            return Err(Error::Protocol(format!(
-                "receiver speaks protocol {protocol_version}"
-            )));
+    // The manifest follows the HELLO without waiting for HELLO_OK: one round trip less. If the
+    // receiver refuses the HELLO it never reads the manifest, so its reply is awaited alongside
+    // the write and wins over a write that cannot finish.
+    let manifest_msg = Message::manifest(&manifest)?;
+    {
+        let write = write_frame(&mut send, &manifest_msg);
+        let reply = next(&mut recv);
+        tokio::pin!(write, reply);
+        let mut written = None;
+        let reply = loop {
+            tokio::select! {
+                w = &mut write, if written.is_none() => written = Some(w),
+                r = &mut reply => break r,
+            }
+        };
+        match reply? {
+            Message::HelloOk { protocol_version } if protocol_version == PROTOCOL_VERSION => {}
+            Message::HelloOk { protocol_version } => {
+                return Err(Error::Protocol(format!(
+                    "receiver speaks protocol {protocol_version}"
+                )));
+            }
+            other => return Err(unexpected(other)),
         }
-        other => return Err(unexpected(other)),
+        match written {
+            Some(w) => w?,
+            None => write.await?,
+        }
     }
-
-    write_frame(&mut send, &Message::manifest(&manifest)?).await?;
 
     let mut stats = SendStats::default();
     report.receiver = serve_requests(

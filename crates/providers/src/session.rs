@@ -451,7 +451,9 @@ async fn dial(
 ) -> Result<(Conn, Option<QuicClient>)> {
     // Try every address, IPv4 first: networks with DNS64 but broken NAT64 return unusable
     // synthesized IPv6 addresses first, and a single attempt would hang on them.
+    let t = std::time::Instant::now();
     let mut addrs: Vec<_> = tokio::net::lookup_host(&ep.host_port).await?.collect();
+    tracing::debug!(host = %ep.host_port, n = addrs.len(), ms = t.elapsed().as_millis() as u64, "resolved");
     addrs.sort_by_key(|a| !a.is_ipv4());
     if addrs.is_empty() {
         return Err(Error::Unreachable(format!(

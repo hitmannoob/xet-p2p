@@ -222,7 +222,10 @@ fn keep_agent_through_fake_modal() {
         .flatten()
         .filter(|d| d.file_name().to_string_lossy().starts_with("session-"))
         .count();
-    assert_eq!(sessions, 1, "the replaced agent's credentials were not removed");
+    assert_eq!(
+        sessions, 1,
+        "the replaced agent's credentials were not removed"
+    );
     std::thread::sleep(std::time::Duration::from_secs(6));
     e.no_session_state();
 }

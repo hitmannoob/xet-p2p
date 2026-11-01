@@ -2787,6 +2787,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "tracing",
  "transport",
  "yamux",
 ]

@@ -65,6 +65,14 @@ pub trait Connection: Send + Sync {
     /// do not advance it, so it detects a peer that is connected but not sending.
     fn rx_progress(&self) -> u64;
     fn wire_stats(&self) -> WireStats;
+
+    /// Why the peer refused this connection, if it did. With TLS 1.3 a client can finish
+    /// connecting before the server has checked its certificate; a refused client then fails at
+    /// its first stream operation with a generic error, and this gives the reason. May wait
+    /// briefly for the peer's answer.
+    async fn rejection(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A shared handle to a connection.

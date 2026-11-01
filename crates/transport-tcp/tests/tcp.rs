@@ -172,7 +172,40 @@ async fn server_rejects_unauthorized_client() {
     let s = setup().await;
     let accept = spawn_accept(s.server.clone());
     let stranger = generate("stranger").unwrap();
-    assert!(dial(&s, &stranger, &s.server_id).await.is_err());
+    // With TLS 1.3 the client may finish its side before the server rejects its certificate,
+    // so the failure can surface at connect or at the first stream operation; either way the
+    // connection reports why.
+    let (mut connected, mut reason) = (false, None);
+    let outcome = async {
+        let conn = dial(&s, &stranger, &s.server_id).await?;
+        connected = true;
+        let r = async {
+            let (mut send, mut recv) = conn.open_bi().await?;
+            write_frame(
+                &mut send,
+                &Ping {
+                    n: 1,
+                    text: "x".into(),
+                },
+            )
+            .await?;
+            read_frame::<Ping>(&mut recv, 1024).await
+        }
+        .await;
+        reason = conn.rejection().await;
+        r
+    }
+    .await;
+    assert!(
+        !matches!(outcome, Ok(Some(_))),
+        "unauthorized client got a reply: {outcome:?}"
+    );
+    if connected {
+        let why = reason.expect("a client refused after connecting learns why");
+        assert!(why.contains("rejected"), "{why}");
+    } else {
+        assert!(matches!(&outcome, Err(Error::Connection(_))), "{outcome:?}");
+    }
     assert!(
         accept.await.unwrap().is_err(),
         "server must reject the client"

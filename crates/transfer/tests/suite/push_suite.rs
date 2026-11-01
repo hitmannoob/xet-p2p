@@ -302,6 +302,22 @@ async fn destination_escapes_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn refused_hello_reported_despite_pipelined_large_manifest() {
+    // The manifest is sent without waiting for HELLO_OK. A receiver that refuses the HELLO never
+    // reads it; its error must still reach the sender, even if the manifest cannot be written.
+    let h = Harness::new().await;
+    let long = "n".repeat(200);
+    for i in 0..3000 {
+        write(&h.src(), &format!("d{}/{long}{i}.txt", i % 30), b"x");
+    }
+    let err = tokio::time::timeout(std::time::Duration::from_secs(60), h.push("../escape"))
+        .await
+        .expect("the sender must not hang")
+        .unwrap_err();
+    assert!(matches!(err, Error::Remote(_)), "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn destination_overlapping_cas_rejected() {
     let h = Harness::new().await;
     write(&h.src(), "a.txt", b"x");
