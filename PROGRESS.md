@@ -247,11 +247,29 @@ Setup to reproduce: `cargo zigbuild --release --target x86_64-unknown-linux-musl
   small files); the transfer itself is faster than rsync's whole command in 7 of 8 scenarios, and
   ~1 s per command is spent outside it.
 
+### 2026-11-01 — Round trips cut from every command
+
+Measured per phase on a real Modal sandbox (new `push --json` fields `connect_secs`,
+`cas_open_secs`, `close_secs`; debug logs for DNS/TCP/TLS): a full round trip through the tunnel
+is ~400 ms, and a kept-agent command spent 1.05 s connecting (TCP 200 ms, TLS 400 ms, then a
+blocking session probe 400 ms) and 0.97 s in the protocol.
+
+- d7dae76: the TLS-over-TCP client sends the session probe without waiting (a refused client's
+  error is still explained, via `Connection::rejection`); the push manifest follows the HELLO
+  without waiting for HELLO_OK (a refused HELLO still wins; new test with a large manifest).
+- 57a96c2: local ingest runs while connecting (`transfer::prepare` + `push_prepared`).
+- Result: unchanged 100-file tree 2.1 → 1.13 s. Full rerun of the benchmark: `--keep-agent` now
+  beats rsync on all large-file edits (checkpoint 2.5 vs 2.9 s, log append 1.8 vs 2.1 s, 4 KiB
+  insert 1.8 vs 2.0 s) and trails by ~0.5 s on small-file trees.
+
 ## Next
 
 - E2B and Daytona adapters (same `Sandbox` trait; verify their exec/file/port APIs first).
-- Break down and cut the ~1 s per-command overhead outside the transfer (process start, CAS open,
-  TLS connect through the relay); it is what puts `--keep-agent` behind rsync on Modal.
+- Small-file trees: an unchanged 500-file push spends 1.2 s in the protocol vs 0.4 s for 100 files;
+  measure manifest size vs TCP slow start and per-file receiver work, then cut (this is where
+  `--keep-agent` still trails rsync by ~0.5 s).
+- TLS 0-RTT session resumption for kept agents would remove one more round trip (~400 ms on
+  Modal); weigh replay safety first.
 - Fix the benchmark's raw-upload baseline probe (fails through Modal tunnels).
 - Tune the TCP fallback for long-RTT links (multiple TCP connections or larger windows); measure.
 - Opt-in automated real-provider test (`XET_P2P_TEST_MODAL=1`), off by default since it bills.
