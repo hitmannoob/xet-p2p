@@ -391,6 +391,7 @@ impl LocalCas {
     /// Builds a native xorb from verified native chunk bytes (no recompression), stores it
     /// durably and indexes it. Returns its hash and chunk count.
     pub async fn commit_packed(&self, body: Vec<u8>) -> Result<(MerkleHash, usize)> {
+        let t = std::time::Instant::now();
         let (xorb, hash, bytes) = tokio::task::spawn_blocking(move || {
             let mut out = Vec::with_capacity(body.len() + 4096);
             reconstruct_xorb_with_footer(&mut out, &body).map(|(x, h)| (x, h, out))
@@ -398,8 +399,14 @@ impl LocalCas {
         .await
         .map_err(|e| Error::Xet(e.to_string()))?
         .map_err(xet_err)?;
+        let footer = t.elapsed();
         let n = xorb.info.num_chunks as usize;
         self.store_verified_xorb(hash, bytes, &xorb).await?;
+        tracing::debug!(
+            footer_ms = footer.as_millis() as u64,
+            store_ms = (t.elapsed() - footer).as_millis() as u64,
+            "packed xorb built and stored"
+        );
         Ok((hash, n))
     }
 

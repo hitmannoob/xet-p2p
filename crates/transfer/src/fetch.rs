@@ -37,6 +37,19 @@ pub(crate) struct Fetcher {
     pub opts: FetchOptions,
 }
 
+/// Packed xorbs committing at once, beside receiving.
+const PIPELINED_COMMITS: usize = 2;
+
+fn committed(
+    done: std::result::Result<Result<u64>, tokio::task::JoinError>,
+    session: &mut Session<'_>,
+    report: &mut ReceiverReport,
+) -> Result<()> {
+    let len = done.map_err(|e| Error::Protocol(format!("commit task failed: {e}")))??;
+    report.xorbs_packed += 1;
+    session.xorb_committed(len)
+}
+
 impl Fetcher {
     /// Fetches everything `manifest` needs that this CAS lacks, then reconstructs and atomically
     /// installs it into `dest_dir`. `session_key` names the resumable session (the destination).
@@ -254,8 +267,10 @@ impl Fetcher {
                 })
                 .collect();
             write_frame(send, &Message::NeedChunks { requests }).await?;
+            let t = std::time::Instant::now();
             self.receive_chunk_runs(conn, send, plan.missing.clone(), session, report)
                 .await?;
+            debug!(ms = t.elapsed().as_millis() as u64, "chunk runs received");
         }
 
         let sha: HashMap<MerkleHash, String> = manifest
@@ -295,6 +310,8 @@ impl Fetcher {
         let permits = Arc::new(Semaphore::new(self.opts.parallel_objects));
         let mut tasks: JoinSet<Result<Received>> = JoinSet::new();
         let mut packer = XorbPacker::default();
+        // Packed xorbs commit in the background while chunk runs keep arriving.
+        let mut commits: JoinSet<Result<u64>> = JoinSet::new();
 
         while !outstanding.is_empty() || !tasks.is_empty() {
             tokio::select! {
@@ -313,7 +330,9 @@ impl Fetcher {
                         let memory = budget.reserve(header.len).await;
                         let bytes = read_payload(&mut stream, header.len, MAX_CHUNK_RUN_BYTES).await?;
                         let (bytes, chunks) = tokio::task::spawn_blocking(move || {
+                            let t = std::time::Instant::now();
                             let chunks = parse_chunk_run(&bytes);
+                            debug!(ms = t.elapsed().as_millis() as u64, bytes = bytes.len(), "chunk run verified");
                             (bytes, chunks)
                         })
                         .await
@@ -331,7 +350,7 @@ impl Fetcher {
                         packer.push(&bytes[c.span.clone()], c.size);
                         report.chunks_received += 1;
                         if packer.is_full() {
-                            self.flush_pack(&mut packer, session, report).await?;
+                            self.commit_pack(&mut commits, &mut packer, session, report).await?;
                         }
                     }
                     report.chunk_bytes_received += bytes.len() as u64;
@@ -341,7 +360,11 @@ impl Fetcher {
             }
         }
         if !packer.is_empty() {
-            self.flush_pack(&mut packer, session, report).await?;
+            self.commit_pack(&mut commits, &mut packer, session, report)
+                .await?;
+        }
+        while let Some(done) = commits.join_next().await {
+            committed(done, session, report)?;
         }
         Ok(())
     }
@@ -406,20 +429,40 @@ impl Fetcher {
         }
     }
 
-    async fn flush_pack(
+    /// Starts committing the packer's xorb in the background, after waiting for earlier commits
+    /// if `PIPELINED_COMMITS` are already in flight. Committing (building the footer, which
+    /// re-hashes every chunk, then the durable write) used to stall the receive loop for ~45 ms
+    /// per 16 MiB.
+    async fn commit_pack(
         &self,
+        commits: &mut JoinSet<Result<u64>>,
         packer: &mut XorbPacker,
         session: &mut Session<'_>,
         report: &mut ReceiverReport,
     ) -> Result<()> {
-        let body = packer.take();
-        let len = body.len() as u64;
-        self.cas.commit_packed(body).await?;
-        report.xorbs_packed += 1;
-        session.xorb_committed(len)?;
-        if let Some(d) = self.opts.commit_delay {
-            tokio::time::sleep(d).await;
+        while commits.len() >= PIPELINED_COMMITS {
+            let done = commits.join_next().await.expect("non-empty");
+            committed(done, session, report)?;
         }
+        while let Some(done) = commits.try_join_next() {
+            committed(done, session, report)?;
+        }
+        let body = packer.take();
+        let (cas, delay) = (self.cas.clone(), self.opts.commit_delay);
+        commits.spawn(async move {
+            let len = body.len() as u64;
+            let t = std::time::Instant::now();
+            cas.commit_packed(body).await?;
+            debug!(
+                ms = t.elapsed().as_millis() as u64,
+                bytes = len,
+                "xorb committed"
+            );
+            if let Some(d) = delay {
+                tokio::time::sleep(d).await;
+            }
+            Ok(len)
+        });
         Ok(())
     }
 
