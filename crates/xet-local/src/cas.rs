@@ -953,8 +953,10 @@ fn install(
     Ok(report)
 }
 
-/// Whether lz4 is worth trying on `path`: compresses up to three 64 KiB samples (start, middle,
-/// end) and asks for at least 5% savings. Small or unreadable files default to compressing.
+/// Whether lz4 is worth trying on `path`: compresses five 64 KiB samples from the interior of the
+/// file (at 1/6 .. 5/6 of its length, away from headers and footers, which often compress even
+/// when the data does not, e.g. Parquet metadata) and asks for at least 5% savings on the median
+/// sample. Small or unreadable files default to compressing.
 fn compresses(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     const SAMPLE: u64 = 64 * 1024;
@@ -964,19 +966,19 @@ fn compresses(path: &Path) -> bool {
     let Ok(len) = f.metadata().map(|m| m.len()) else {
         return true;
     };
-    if len < 4 * SAMPLE {
+    if len < 12 * SAMPLE {
         return true;
     }
-    let (mut raw, mut packed) = (0usize, 0usize);
     let mut buf = vec![0u8; SAMPLE as usize];
-    for at in [0, len / 2, len - SAMPLE] {
-        if f.seek(SeekFrom::Start(at)).is_err() || f.read_exact(&mut buf).is_err() {
+    let mut ratios = Vec::with_capacity(5);
+    for k in 1..=5 {
+        if f.seek(SeekFrom::Start(len * k / 6)).is_err() || f.read_exact(&mut buf).is_err() {
             return true;
         }
-        raw += buf.len();
-        packed += lz4_flex::block::compress(&buf).len();
+        ratios.push(lz4_flex::block::compress(&buf).len() * 100 / buf.len());
     }
-    packed * 100 < raw * 95
+    ratios.sort_unstable();
+    ratios[2] < 95
 }
 
 fn parse_hash(path: &str, hex: &str) -> Result<MerkleHash> {
