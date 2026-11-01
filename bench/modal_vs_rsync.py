@@ -252,7 +252,7 @@ def baseline(sb, ip, port):
         time.sleep(0.5)
 
 
-def with_retries(fn, what, attempts=3):
+def with_retries(fn, what, attempts=5):
     """Network paths drop connections now and then. Retry a failed run (after a pause) instead of
     aborting the whole benchmark; how many retries each result needed is recorded."""
     for i in range(attempts):
@@ -262,7 +262,7 @@ def with_retries(fn, what, attempts=3):
             if i + 1 == attempts:
                 raise
             print(f"  retrying {what} after: {str(e)[:160]}", flush=True)
-            time.sleep(10)
+            time.sleep(10 * (i + 1))  # ride out network outages of a minute or more
 
 
 # ---------- report ----------

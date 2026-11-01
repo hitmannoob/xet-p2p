@@ -206,9 +206,11 @@ async fn server_rejects_unauthorized_client() {
     } else {
         assert!(matches!(&outcome, Err(Error::Connection(_))), "{outcome:?}");
     }
+    // The listener completes handshakes itself and yields only accepted sessions.
+    let yielded = tokio::time::timeout(std::time::Duration::from_secs(2), accept).await;
     assert!(
-        accept.await.unwrap().is_err(),
-        "server must reject the client"
+        !matches!(yielded, Ok(Ok(Ok(_)))),
+        "server must not accept the client"
     );
 }
 
@@ -278,4 +280,58 @@ async fn close_is_immediate_even_with_unread_data() {
     );
     assert!(t.elapsed() < std::time::Duration::from_secs(5));
     writer.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lanes_join_one_session_and_carry_streams() {
+    let s = setup().await;
+    let accept = spawn_accept(s.server.clone());
+    let client = transport_tcp::tcp_connect_lanes(
+        s.addr,
+        identity(&s.client_id),
+        vec![identity(&s.server_id).cert],
+        4,
+    )
+    .await
+    .unwrap();
+    let server = accept.await.unwrap().unwrap();
+    // Only one session comes out of the listener, however many lanes join it.
+    let more = spawn_accept(s.server.clone());
+
+    // Streams opened before and after the lanes are up all arrive, in both directions.
+    let send = |c: Conn, n: usize| async move {
+        for i in 0..n {
+            let mut w = c.open_uni().await.unwrap();
+            w.write_all(&vec![i as u8; 64 * 1024]).await.unwrap();
+            w.shutdown().await.unwrap();
+        }
+    };
+    let recv = |c: Conn, n: usize| async move {
+        let mut total = 0;
+        for _ in 0..n {
+            let mut r = c.accept_uni().await.unwrap();
+            let mut buf = Vec::new();
+            r.read_to_end(&mut buf).await.unwrap();
+            total += buf.len();
+        }
+        total
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let (_, got) = tokio::join!(send(client.clone(), 32), recv(server.clone(), 32));
+    assert_eq!(got, 32 * 64 * 1024);
+    let (_, got) = tokio::join!(send(server.clone(), 8), recv(client.clone(), 8));
+    assert_eq!(got, 8 * 64 * 1024);
+    // Several TCP connections carried the traffic: the server counts them all.
+    assert!(server.wire_stats().rx >= 32 * 64 * 1024);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), more)
+            .await
+            .is_err(),
+        "lanes must not appear as new sessions"
+    );
+
+    client.close(0, b"done");
+    tokio::time::timeout(std::time::Duration::from_secs(5), server.closed())
+        .await
+        .expect("server should see the close");
 }

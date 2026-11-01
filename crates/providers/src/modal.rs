@@ -72,6 +72,9 @@ fn modal_python() -> Option<PathBuf> {
     Some(PathBuf::from(interp))
 }
 
+/// Idle timeout for an agent started for one command (stopped explicitly when the command ends).
+const SAFETY_IDLE_EXIT: Duration = Duration::from_secs(120);
+
 #[async_trait::async_trait]
 impl SandboxProvider for ModalProvider {
     fn name(&self) -> &'static str {
@@ -271,7 +274,11 @@ impl Sandbox for ModalSandbox {
                     "state_dir": self.state,
                     "session_dir": session,
                     "agent": agent,
-                    "idle_exit_secs": spec.idle_exit.map(|d| d.as_secs().max(1)),
+                    // Every agent exits once idle, so one whose stop is lost (e.g. the network
+                    // dropped mid-command) cannot hold the port for good; only kept agents may
+                    // be replaced by a later command.
+                    "idle_exit_secs": spec.idle_exit.unwrap_or(SAFETY_IDLE_EXIT).as_secs().max(1),
+                    "kept": spec.idle_exit.is_some(),
                     "server_cert_pem": spec.server_cert_pem,
                     "server_key_pem": spec.server_key_pem,
                     "client_cert_pem": spec.client_cert_pem,

@@ -30,7 +30,7 @@ set -u
 # Read the credentials first: Modal rejects stdin writes once the process has exited, and the
 # checks below may exit early.
 IFS= read -r K; IFS= read -r C; IFS= read -r CL
-BIN=$1 SHA=$2 ARCH=$3 ROOT=$4 CAS=$5 SESSION=$6 PORT=$7 IDLE=$8 STATE=$9
+BIN=$1 SHA=$2 ARCH=$3 ROOT=$4 CAS=$5 SESSION=$6 PORT=$7 IDLE=$8 STATE=$9 KEEP=${10}
 KEPT="$STATE/port-$PORT.kept"
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 M=$(uname -m)
@@ -83,7 +83,7 @@ while [ ! -s "$SESSION/ready.json" ]; do
   I=$((I + 1)); if [ "$I" -gt 300 ]; then kill "$PID"; rm -rf "$SESSION"; echo "agent not ready in 30 s" >&2; exit 13; fi
   sleep 0.1
 done
-if [ "$IDLE" != 0 ]; then echo "$PID $SESSION" > "$KEPT"; fi
+if [ "$KEEP" = 1 ]; then echo "$PID $SESSION" > "$KEPT"; fi
 echo "{\"pid\": $PID, \"uname\": \"$(uname -sm)\"}"
 """
 
@@ -135,7 +135,8 @@ def cmd_bootstrap(req):
     secrets = "\n".join(base64.b64encode(req[k].encode()).decode()
                         for k in ("server_key_pem", "server_cert_pem", "client_cert_pem")) + "\n"
     args = [remote_bin, digest, elf_arch(req["agent"]), req["root"], req["cas_dir"],
-            req["session_dir"], str(req["port"]), str(req.get("idle_exit_secs") or 0), req["state_dir"]]
+            req["session_dir"], str(req["port"]), str(req.get("idle_exit_secs") or 0), req["state_dir"],
+            "1" if req.get("kept") else "0"]
     for attempt in range(2):
         code, out, err = run(sb, BOOTSTRAP, args, stdin=secrets, timeout=180)
         if code != 0:
