@@ -750,6 +750,32 @@ impl LocalCas {
         Ok((work, report))
     }
 
+    /// Stages many small files at once (see [`Self::write_small_files`]), checking each like
+    /// [`Self::stage`] does.
+    async fn stage_batch(&self, batch: Vec<Work>) -> Result<Vec<Staged>> {
+        let files: Vec<(MerkleHash, PathBuf)> = batch
+            .iter()
+            .map(|w| Ok((parse_hash(&w.path, &w.xet_hash)?, w.tmp.clone())))
+            .collect::<Result<_>>()?;
+        let written = self.write_small_files(&files).await?;
+        let mut out = Vec::with_capacity(batch.len());
+        for (w, (n, sha)) in batch.into_iter().zip(written) {
+            let fail = |reason: String| Error::Verification {
+                path: w.path.clone(),
+                reason,
+            };
+            if n != w.size {
+                return Err(fail(format!("size {n}, expected {}", w.size)));
+            }
+            if !sha.eq_ignore_ascii_case(&w.sha256) {
+                return Err(fail(format!("SHA-256 {sha}, expected {}", w.sha256)));
+            }
+            set_executable(&w.tmp, w.executable)?;
+            out.push((w.tmp, w.path, w.size));
+        }
+        Ok(out)
+    }
+
     /// Reconstructs one file into staging and checks its size and SHA-256 against the manifest.
     async fn stage(&self, w: Work) -> Result<Staged> {
         let fail = |reason: String| Error::Verification {
@@ -789,9 +815,15 @@ pub struct Reconstruction {
     report: ReconstructReport,
     /// Files still to start, by lowercase Xet hash (empty files under "").
     pending: std::collections::HashMap<String, Vec<Work>>,
-    running: tokio::task::JoinSet<Result<Staged>>,
+    /// Small ready files waiting to be staged together ([`LocalCas::stage_batch`]).
+    small: Vec<Work>,
+    running: tokio::task::JoinSet<Result<Vec<Staged>>>,
     permits: Arc<tokio::sync::Semaphore>,
 }
+
+/// Files smaller than this are staged in batches of up to [`SMALL_BATCH`].
+const SMALL_FILE: u64 = 1 << 20;
+const SMALL_BATCH: usize = 256;
 
 impl LocalCas {
     /// Validates `manifest`, prepares staging under `dest` and decides which files are already in
@@ -835,6 +867,7 @@ impl LocalCas {
             opts,
             report,
             pending,
+            small: Vec::new(),
             running: Default::default(),
             permits: Arc::new(tokio::sync::Semaphore::new(parallel)),
         })
@@ -852,6 +885,13 @@ impl Reconstruction {
     }
 
     fn start(&mut self, w: Work) {
+        if w.size > 0 && w.size < SMALL_FILE {
+            self.small.push(w);
+            if self.small.len() >= SMALL_BATCH {
+                self.flush_small();
+            }
+            return;
+        }
         let (cas, permits) = (self.cas.clone(), self.permits.clone());
         self.running.spawn(
             async move {
@@ -859,9 +899,27 @@ impl Reconstruction {
                     .acquire_owned()
                     .await
                     .expect("semaphore never closed");
-                cas.stage(w).await
+                Ok(vec![cas.stage(w).await?])
             }
             .instrument(tracing::debug_span!("stage_file")),
+        );
+    }
+
+    fn flush_small(&mut self) {
+        if self.small.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.small);
+        let (cas, permits) = (self.cas.clone(), self.permits.clone());
+        self.running.spawn(
+            async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .expect("semaphore never closed");
+                cas.stage_batch(batch).await
+            }
+            .instrument(tracing::debug_span!("stage_small_files")),
         );
     }
 
@@ -890,9 +948,10 @@ impl Reconstruction {
                 self.start(w);
             }
         }
+        self.flush_small();
         let mut staged = Vec::new();
         while let Some(done) = self.running.join_next().await {
-            staged.push(done.map_err(|e| Error::Xet(format!("staging task failed: {e}")))??);
+            staged.extend(done.map_err(|e| Error::Xet(format!("staging task failed: {e}")))??);
         }
         let (report, installed) = install(
             &self.manifest,
@@ -949,7 +1008,7 @@ impl Reconstruction {
                     .await
                     .map_err(|_| Error::Xet("streamed file writer stopped".into()))??;
                 set_executable(&w.tmp, w.executable)?;
-                Ok((w.tmp, w.path, w.size))
+                Ok(vec![(w.tmp, w.path, w.size)])
             }
             .instrument(tracing::debug_span!("stream_file")),
         );

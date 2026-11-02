@@ -531,6 +531,102 @@ impl LocalCas {
         .map_err(xet_err)?
     }
 
+    /// [`Self::write_file_from_cas`] for many small files at once: each xorb they come from is read
+    /// once (when the span covering them is not much larger than what they need), not once per
+    /// file. Files whose content spans several xorbs are written one by one. Returns each file's
+    /// (size, SHA-256), in the order given.
+    pub(crate) async fn write_small_files(
+        &self,
+        files: &[(MerkleHash, std::path::PathBuf)],
+    ) -> Result<Vec<(u64, String)>> {
+        let mut out: Vec<Option<(u64, String)>> = vec![None; files.len()];
+        // xorb -> [(index into files, segment ranges)]
+        let mut groups: HashMap<MerkleHash, Vec<(usize, Vec<(u64, u64, usize)>)>> = HashMap::new();
+        for (i, (file, tmp)) in files.iter().enumerate() {
+            let info = self.file_info(file).await?;
+            let first = info.segments.first().map(|s| s.xorb_hash);
+            if first.is_none() || info.segments.iter().any(|s| Some(s.xorb_hash) != first) {
+                out[i] = Some(self.write_file_from_cas(file, tmp).await?);
+                continue;
+            }
+            let xorb = first.unwrap();
+            let footer = self.footer(&xorb).await?;
+            let mut ranges = Vec::with_capacity(info.segments.len());
+            for seg in &info.segments {
+                let (lo, hi) = footer
+                    .get_byte_offset(seg.chunk_index_start, seg.chunk_index_end)
+                    .map_err(xet_err)?;
+                ranges.push((
+                    lo as u64,
+                    hi as u64,
+                    (seg.chunk_index_end - seg.chunk_index_start) as usize,
+                ));
+            }
+            groups.entry(xorb).or_default().push((i, ranges));
+        }
+        let groups: Vec<_> = groups
+            .into_iter()
+            .map(|(x, g)| (self.xorb_path(&x), g))
+            .collect();
+        let tmps: Vec<std::path::PathBuf> = files.iter().map(|(_, t)| t.clone()).collect();
+        let written =
+            tokio::task::spawn_blocking(move || -> Result<Vec<(usize, (u64, String))>> {
+                let (mut done, mut span, mut one) = (Vec::new(), Vec::new(), Vec::new());
+                for (path, group) in groups {
+                    let lo = group
+                        .iter()
+                        .flat_map(|(_, r)| r.iter().map(|x| x.0))
+                        .min()
+                        .unwrap_or(0);
+                    let hi = group
+                        .iter()
+                        .flat_map(|(_, r)| r.iter().map(|x| x.1))
+                        .max()
+                        .unwrap_or(0);
+                    let needed: u64 = group
+                        .iter()
+                        .flat_map(|(_, r)| r.iter().map(|x| x.1 - x.0))
+                        .sum();
+                    let whole = hi - lo <= 4 * needed + (1 << 20);
+                    if whole {
+                        read_range_into(&path, lo, hi, &mut span)?;
+                    }
+                    for (i, ranges) in group {
+                        let mut decoded = Vec::with_capacity(ranges.len());
+                        for (a, b, chunks) in ranges {
+                            let bytes: &[u8] = if whole {
+                                &span[(a - lo) as usize..(b - lo) as usize]
+                            } else {
+                                read_range_into(&path, a, b, &mut one)?;
+                                &one
+                            };
+                            let mut plain = Vec::with_capacity(bytes.len() * 2);
+                            let mut n = 0;
+                            for_each_plain_chunk(bytes, |p, _| {
+                                plain.extend_from_slice(p);
+                                n += 1;
+                                Ok(())
+                            })?;
+                            if n != chunks {
+                                return Err(xet_err("segment chunk count differs from its xorb"));
+                            }
+                            decoded.push(Ok(plain));
+                        }
+                        done.push((i, finish_file(&tmps[i], decoded)?));
+                    }
+                }
+                Ok(done)
+            })
+            .await
+            .map_err(xet_err)??;
+        for (i, r) in written {
+            out[i] = Some(r);
+        }
+        out.into_iter()
+            .map(|r| r.ok_or_else(|| xet_err("small file not written")))
+            .collect()
+    }
+
     async fn file_info(&self, file: &MerkleHash) -> Result<MDBFileInfo> {
         Ok(self
             .client

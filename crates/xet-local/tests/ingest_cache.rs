@@ -262,3 +262,39 @@ async fn streamed_file_is_written_in_order_from_out_of_order_chunks() {
     assert_eq!(report.files, 1);
     assert_eq!(fs::read(dest.join("big.bin")).unwrap(), data);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn small_files_stage_in_batches_from_shared_xorbs() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    for i in 0..600 {
+        write(
+            &src,
+            &format!("d{}/f{i}.txt", i % 7),
+            format!("small file {i}\n").repeat(1 + i % 50).as_bytes(),
+        );
+    }
+    write(&src, "mid.bin", &vec![7u8; 3 << 20]); // above the small-file size
+    write(&src, "empty", b"");
+    let cas = std::sync::Arc::new(LocalCas::open(tmp.path().join("cas")).await.unwrap());
+    let (m, _) = cas.ingest(&src).await.unwrap();
+    let dest = tmp.path().join("dest");
+    let mut r = cas
+        .begin_reconstruct(&m, &dest, xet_local::ReconstructOptions::default())
+        .unwrap();
+    for (_, _, h, ..) in m.files() {
+        if let Ok(h) = xet_local::MerkleHash::from_hex(h) {
+            r.content_ready(&h);
+        }
+    }
+    let report = r.finish().await.unwrap();
+    assert_eq!(report.files, 602);
+    for (e, ..) in m.files() {
+        assert_eq!(
+            fs::read(dest.join(&e.path)).unwrap(),
+            fs::read(src.join(&e.path)).unwrap(),
+            "{}",
+            e.path
+        );
+    }
+}
