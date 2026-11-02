@@ -96,7 +96,7 @@ def deploy(args):
 
 
 def restart_agent(b, trace=False):
-    sh(b, "for p in /proc/[0-9]*; do [ \"$(readlink $p/exe 2>/dev/null)\" = /opt/x/xet-p2p ] && kill ${p#/proc/}; done; "
+    sh(b, "for p in /proc/[0-9]*; do case \"$(tr '\\0' ' ' < $p/cmdline 2>/dev/null)\" in '/opt/x/xet-p2p serve'*) kill ${p#/proc/};; esac; done; "
           "sleep 1; rm -rf /recv/cas /recv/xet /tmp/ready.json /tmp/trace; mkdir -p /recv/xet /tmp/trace; "
           f"RUST_LOG=warn,transfer=debug {'XET_P2P_TRACE=/tmp/trace/serve ' if trace else ''}"
           f"nohup {X} serve --no-quic --listen-tcp 0.0.0.0:{XET_PORT} --root /recv/xet "
@@ -218,8 +218,8 @@ def agents(args):
             print(f"--- sender profile, first sync of agent {args.n}:\n" + sh(a, f"cat {first}"), flush=True)
             if last != first:
                 print(f"--- sender profile, last sync of agent {args.n}:\n" + sh(a, f"cat {last}"), flush=True)
-            sh(b, "for p in /proc/[0-9]*; do [ \"$(readlink $p/exe 2>/dev/null)\" = /opt/x/xet-p2p ] && "
-                  "kill -TERM ${p#/proc/}; done; sleep 3")
+            sh(b, "for p in /proc/[0-9]*; do case \"$(tr '\\0' ' ' < $p/cmdline 2>/dev/null)\" in "
+                  "'/opt/x/xet-p2p serve'*) kill -TERM ${p#/proc/};; esac; done; sleep 3")
             print("--- receiver profile (all syncs):\n" + sh(b, "cat /tmp/trace/serve.*.txt"), flush=True)
 
     phases = ["first, agent 1", "first, agents 2..N", "incremental rounds"]
