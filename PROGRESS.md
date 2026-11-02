@@ -262,16 +262,42 @@ blocking session probe 400 ms) and 0.97 s in the protocol.
   beats rsync on all large-file edits (checkpoint 2.5 vs 2.9 s, log append 1.8 vs 2.1 s, 4 KiB
   insert 1.8 vs 2.0 s) and trails by ~0.5 s on small-file trees.
 
+### 2026-11-01/02 — Profiler, cold path, small files, sandbox-to-sandbox benchmarks
+
+Constraint kept throughout: no protocol or storage-model changes (native Xet CAS on both ends).
+Details and numbers: [docs/BENCHMARK_S2S.md](docs/BENCHMARK_S2S.md).
+
+- **Profiler** (`crates/cli/src/profile.rs`): `XET_P2P_TRACE` (span timeline + per-stage summary,
+  ours and upstream's), `XET_P2P_PROFILE` (CPU flame graph, `--features cpu-profile`, `profiling`
+  build profile). Works for client and agent, inside sandboxes.
+- **Small files**: verify buffer reused (`75cd244`); stamp cache on both sides, like git's index
+  (`a50f6c6`); kept agents never reused across builds (`f8b40cd`); receiver trusts its own installs
+  (`cf13a73`); empty files never read (`3e54e50`).
+- **Cold path**: 4 TCP lanes per session, ALPN `xet-p2p-tcp/4`, `/3` peers get one (`ecc451f`);
+  background xorb commits (`8e682ba`); mimalloc for the musl agent, which removed mmap/munmap churn
+  (20–40% of CPU) and halved a cold 4.3 GB push (`4ff5952`); lz4 skipped for incompressible files
+  (`57a9056`, `fbb9ae4`).
+- **Receiver**: files staged as soon as their content is in (`bec6041`); entirely new large files
+  written from arriving chunks (`db76c14`); one `syncfs` per install on Linux instead of an fsync per
+  file (`5fc2afb`); small files batched per xorb (`bec56a5`); directories checked once, renames in
+  parallel (`989cbf4`, `3e54e50`).
+- **Benchmarks**: FineWeb-Edu between sandboxes (xet-p2p ahead on every step on one pair; the second
+  destination 6× faster), coding-agent fleet and single-agent rollouts (even with rsync `--link-dest`
+  on time, more bytes because of the full manifest per push). An earlier fleet table was unfair to
+  rsync (`--link-dest` path ignored in daemon mode); corrected in `c3d1a29`.
+- **Dev cycle**: dev builds keep line tables only (target/debug 3–6 GB → 1.5 GB, kept between
+  builds); `bench/devpair.py` keeps a sandbox pair up for repeated runs.
+
 ## Next
 
 - E2B and Daytona adapters (same `Sandbox` trait; verify their exec/file/port APIs first).
-- Small-file trees: an unchanged 500-file push spends 1.2 s in the protocol vs 0.4 s for 100 files;
-  measure manifest size vs TCP slow start and per-file receiver work, then cut (this is where
-  `--keep-agent` still trails rsync by ~0.5 s).
+- Re-run the Mac → Modal benchmark on the current build (the README table predates the small-file
+  and receiver work).
+- Keep the receiver's store on a Modal Volume (`?state=`/`--cas-dir`), so dedup survives sandbox
+  restarts; untested.
 - TLS 0-RTT session resumption for kept agents would remove one more round trip (~400 ms on
   Modal); weigh replay safety first.
 - Fix the benchmark's raw-upload baseline probe (fails through Modal tunnels).
-- Tune the TCP fallback for long-RTT links (multiple TCP connections or larger windows); measure.
 - Opt-in automated real-provider test (`XET_P2P_TEST_MODAL=1`), off by default since it bills.
 
 ## Known gaps / risks
@@ -284,11 +310,19 @@ blocking session probe 400 ms) and 0.97 s in the protocol.
 - Sender-side CAS writes during ingest are not fsynced (upstream sessions). A sender power loss can
   corrupt its own CAS; the receiver rejects any bad xorb, so the result is a failed push, never
   corrupt data on the receiver. Recovery: delete the sender's `--cas-dir`.
-- Ingest change detection relies on mtime/size; an edit that restores both exactly is not seen.
+- Unchanged files are detected by stamp (size, mtime, ctime, inode, device), like git's index: any
+  write moves ctime. Files changed within 2 s of being hashed are not trusted; files the receiver
+  itself installed are trusted after 50 ms where timestamps have sub-second resolution.
+- **Every push sends the full manifest** (~80 bytes per file, mostly two 32-byte hashes, ~545 KB for
+  6,800 files) even when few files changed. On large code trees this makes xet-p2p send more bytes
+  than rsync `--link-dest`. Fixing it needs an incremental manifest, a protocol change (out of scope).
+- The receiver keeps full copies plus its store (about 2× the disk of the data); rsync
+  `--link-dest` shares files between copies via hard links.
 - Chunk mode sends a chunk list (36 B/chunk) for every new file before knowing what is missing;
   for same-sender edits this is slightly more than whole-xorb (+0.03 MiB per 64 MiB file).
 - Compression is upstream's lz4; on compressible data rsync -az (zlib) sends ~2× less. A
-  transport-level compressor over chunk runs would close this without changing object bytes.
+  transport-level compressor over chunk runs would close this without changing object bytes, but
+  changes the wire protocol (out of scope).
 - Smallest unit resent is one content-defined chunk (~64 KiB); a tiny edit costs 1–2 chunks.
 - Local reconstruction no longer uses upstream `FileDownloadSession` (see audit): formats and
   decoding are upstream's, the driver loop is ours.

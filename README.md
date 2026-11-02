@@ -201,12 +201,28 @@ the other) wait for each other.
 ## Operations
 
 - **Bandwidth**: `push --bwlimit-mib 20` caps payload throughput across all streams.
+- **TCP lanes**: over TLS-over-TCP a session uses 4 TCP connections (`XET_P2P_TCP_LANES=N`, 1–16)
+  so parallel streams get their own congestion windows; peers that only speak `xet-p2p-tcp/3` get one.
 - **Stalled senders**: `serve --stall-timeout-secs 120` (default) aborts a transfer whose sender
   stops sending data, freeing its destination for others.
 - **Disk space**: the CAS is a cache. `xet-p2p gc --cas-dir DIR` deletes content no file references
   (after a 7-day grace that protects resumable transfers); add `--max-size-mib N` to evict least
   recently used content down to a cap (it is re-fetched from a peer when next needed). `gc` needs
   the CAS to itself and refuses to run while a `serve` or `push` is using it.
+
+## Profiling
+
+Both the client and the agent (also inside a sandbox) can profile themselves:
+
+- `XET_P2P_TRACE=PATH` records every pipeline stage (ours and upstream xet-core's) and at exit
+  writes `PATH.<pid>.json` (open in <https://ui.perfetto.dev>) and `PATH.<pid>.txt`, a summary of
+  each stage's count, total and busy time, share of the run and concurrency. `serve` writes it
+  when it exits (idle exit, SIGTERM, Ctrl-C).
+- `XET_P2P_PROFILE=PATH` samples CPU stacks into a flame graph (`.svg`) and folded stacks
+  (`.folded`). Build with `RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
+  --features cpu-profile`.
+- `bench/devpair.py` keeps a pair of Modal sandboxes up for repeated measurements (`deploy BIN`,
+  `run --profile`, `agents`, `rollouts`).
 
 ## Compared with rsync
 
@@ -245,13 +261,29 @@ transfer is faster than rsync's whole command in 7 of 8 scenarios (TLS included)
 
 With `--keep-agent`, xet-p2p beats rsync on large-file edits and trails it by 0.5 s on small-file
 trees. A kept-agent command costs ~0.6 s of connection setup (one TCP and one TLS round trip);
-starting a fresh agent through Modal's API adds ~3.2 s.
+starting a fresh agent through Modal's API adds ~3.2 s. (This table predates the small-file and
+receiver work below; it has not been re-run.)
 
-- **xet-p2p wins** on large-file edits (3–5× faster at similar bytes) and never resends content the
-  receiver holds anywhere — in other files, other destinations, or from other senders.
-- **rsync wins** on compressible data (zlib vs Xet's lz4, ~2×), on tiny edits (literal bytes vs
-  whole ~64 KiB chunks plus a ~10 KiB handshake), and on big trees of tiny files (mtimes vs content
-  hashes in the file list).
+**Between two Modal sandboxes** ([docs/BENCHMARK_S2S.md](docs/BENCHMARK_S2S.md), single runs):
+
+| Scenario | rsync | xet-p2p |
+|---|---:|---:|
+| FineWeb-Edu Parquet, cold 4.3 GB | 19.5 s | **13.8 s** |
+| Same dataset to a second destination | 21.4 s, 6.0 GiB sent | **3.5 s, ~0 sent** |
+| Agent rollouts from one Django base, per rollout (rsync `--link-dest`) | **1.3 s, 244 KiB** | 1.3 s, 611 KiB |
+| 7 agents joining a shared Django base (rsync `--link-dest`) | **8.7 s, 1.4 MiB** | 13.4 s, 3.7 MiB |
+| Same, plain `rsync -az` | 14.8 s, 66.2 MiB | **13.4 s, 3.7 MiB** |
+
+Where each tool wins:
+
+- **xet-p2p** on large binary data (checkpoints, datasets): large-file edits, growing datasets,
+  pushes to further destinations, and content the receiver already holds anywhere, in other files,
+  other destinations or from other senders, without naming a reference directory. Every file is
+  verified end to end, and copies are independent.
+- **rsync** on code and text trees: zlib compresses ~2× better than Xet's lz4, tiny edits cost
+  literal bytes rather than a ~64 KiB chunk, and its file list is smaller than xet-p2p's manifest
+  (~80 bytes per file, sent in full on every push, ~545 KB for a 6,800-file tree). With
+  `--link-dest` pointing at a previous copy it matches or beats xet-p2p on repeated code trees.
 
 ## Transfer modes
 
