@@ -95,6 +95,7 @@ pub async fn pull(
             parallel_objects: opts.parallel_streams.max(1),
             stall_timeout: opts.stall_timeout,
             commit_delay: None,
+            link_identical: false,
         },
         cas,
     };

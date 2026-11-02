@@ -85,6 +85,11 @@ enum Command {
         /// Abort a transfer when the sender sends no data for this many seconds.
         #[arg(long, default_value_t = 120)]
         stall_timeout_secs: u64,
+        /// Hard-link received files identical to ones already installed (and verified) under the
+        /// root, where no copy-on-write clone is possible (like rsync --link-dest). The copies
+        /// then share one file: editing one in place edits the other.
+        #[arg(long)]
+        link_identical: bool,
         /// Resumable session state (default: <cas-dir>/sessions).
         #[arg(long)]
         session_dir: Option<PathBuf>,
@@ -275,6 +280,7 @@ async fn run(cli: Cli) -> Result<()> {
             parallel,
             max_memory_mib,
             stall_timeout_secs,
+            link_identical,
             session_dir,
             test_commit_delay_ms,
         } => {
@@ -327,6 +333,7 @@ async fn run(cli: Cli) -> Result<()> {
             ropts.commit_delay = test_commit_delay_ms.map(std::time::Duration::from_millis);
             ropts.client_scopes = scopes;
             ropts.stall_timeout = std::time::Duration::from_secs(stall_timeout_secs.max(1));
+            ropts.link_identical = link_identical;
             let receiver = Arc::new(Receiver::new(&root, cas, ropts)?);
 
             let quic_addr = quic.as_ref().map(|q| q.local_addr()).transpose()?;

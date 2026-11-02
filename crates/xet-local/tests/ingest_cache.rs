@@ -322,3 +322,47 @@ async fn empty_files_are_not_read_and_hash_as_upstream_does() {
     cas.reconstruct(&m, &dest).await.unwrap();
     assert_eq!(fs::read(dest.join("pkg/__init__.py")).unwrap(), b"");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn second_destination_reuses_verified_copies_but_never_edited_ones() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    for i in 0..20 {
+        write(
+            &src,
+            &format!("f{i}.txt"),
+            format!("content {i}\n").repeat(400).as_bytes(),
+        );
+    }
+    let cas = std::sync::Arc::new(LocalCas::open(tmp.path().join("cas")).await.unwrap());
+    let (m, _) = cas.ingest(&src).await.unwrap();
+    let opts = xet_local::ReconstructOptions::default();
+    let d1 = tmp.path().join("d1");
+    assert_eq!(
+        cas.reconstruct_with(&m, &d1, opts)
+            .await
+            .unwrap()
+            .files_reused,
+        0
+    );
+
+    // Edit one installed copy in place: it must not be reused for the next destination.
+    let edited = d1.join("f3.txt");
+    let mut bytes = fs::read(&edited).unwrap();
+    bytes[0] ^= 1;
+    fs::write(&edited, &bytes).unwrap();
+
+    let d2 = tmp.path().join("d2");
+    let r = cas.reconstruct_with(&m, &d2, opts).await.unwrap();
+    assert_eq!(r.files, 20);
+    if cfg!(target_vendor = "apple") {
+        // APFS clones; elsewhere this depends on the filesystem (or link_identical).
+        assert_eq!(r.files_reused, 19, "{r:?}");
+    }
+    for i in 0..20 {
+        assert_eq!(
+            fs::read(d2.join(format!("f{i}.txt"))).unwrap(),
+            fs::read(src.join(format!("f{i}.txt"))).unwrap()
+        );
+    }
+}

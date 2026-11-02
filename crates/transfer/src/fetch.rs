@@ -32,6 +32,7 @@ pub(crate) struct FetchOptions {
     pub parallel_objects: usize,
     pub stall_timeout: Duration,
     pub commit_delay: Option<Duration>,
+    pub link_identical: bool,
 }
 
 pub(crate) struct Fetcher {
@@ -163,6 +164,7 @@ impl Fetcher {
             dest_dir,
             ReconstructOptions {
                 delete_extraneous: delete,
+                link_identical: self.opts.link_identical,
             },
         )?;
         let incomplete: BTreeSet<MerkleHash> = missing

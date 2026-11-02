@@ -46,6 +46,10 @@ pub struct ReceiverOptions {
     pub stall_timeout: Duration,
     /// Test hook: pause after committing each xorb, to make interruption timing deterministic.
     pub commit_delay: Option<Duration>,
+    /// Where no copy-on-write clone is possible, hard-link files identical to ones already
+    /// installed (and verified) under the root, like rsync --link-dest: the copies then share one
+    /// file. Off by default.
+    pub link_identical: bool,
 }
 
 impl ReceiverOptions {
@@ -59,6 +63,7 @@ impl ReceiverOptions {
             client_scopes: HashMap::new(),
             stall_timeout: Duration::from_secs(120),
             commit_delay: None,
+            link_identical: false,
         }
     }
 }
@@ -121,6 +126,7 @@ impl Receiver {
                 parallel_objects: opts.parallel_objects.max(1),
                 stall_timeout: opts.stall_timeout,
                 commit_delay: opts.commit_delay,
+                link_identical: opts.link_identical,
             },
         };
         Ok(Self {

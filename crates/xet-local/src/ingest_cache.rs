@@ -20,6 +20,10 @@ use xet_core_structures::merklehash::MerkleHash;
 use crate::error::{Error, Result};
 
 const INGEST: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ingest_cache");
+/// Xet file hash -> key of a destination file this receiver installed or verified with that
+/// content (only receiver-owned files: never a sender's source file). Used to make new copies of
+/// it without rebuilding from the CAS; trusted only while that file's stamp still matches.
+const INSTALLED: TableDefinition<[u8; 32], &[u8]> = TableDefinition::new("installed_by_content");
 const RECORD_LEN: usize = 8 + 12 + 12 + 8 + 8 + 32 + 32;
 /// Files modified (mtime or ctime) within this many seconds of being hashed are not cached.
 const RACY_SECS: i64 = 2;
@@ -133,6 +137,7 @@ pub(crate) struct Hashed<'a> {
     pub sha256: [u8; 32],
 }
 
+#[derive(Clone)]
 pub(crate) struct IngestCache {
     db: Arc<Database>,
 }
@@ -141,6 +146,7 @@ impl IngestCache {
     pub fn open(db: Arc<Database>) -> Result<Self> {
         let txn = db.begin_write().map_err(db_err)?;
         txn.open_table(INGEST).map_err(db_err)?;
+        txn.open_table(INSTALLED).map_err(db_err)?;
         txn.commit().map_err(db_err)?;
         Ok(Self { db })
     }
@@ -173,10 +179,65 @@ impl IngestCache {
         self.record_if(hashed, prune, |s| s.settled_before(hashed_at))
     }
 
-    /// Records files this process just installed (see [`Stamp::settled_after_install`]).
+    /// Records files this process just installed (see [`Stamp::settled_after_install`]), also as
+    /// copies of their content.
     pub fn record_installed(&self, installed: &[Hashed<'_>]) -> Result<()> {
         let now = SystemTime::now();
-        self.record_if(installed, None, |s| s.settled_after_install(now))
+        self.record_if(installed, None, |s| s.settled_after_install(now))?;
+        self.index_copies(installed, |s| s.settled_after_install(now))
+    }
+
+    /// Records destination files this receiver just verified unchanged (see [`Self::record`]),
+    /// also as copies of their content.
+    pub fn record_verified(&self, verified: &[Hashed<'_>], hashed_at: SystemTime) -> Result<()> {
+        self.record(verified, hashed_at, None)?;
+        self.index_copies(verified, |s| s.settled_before(hashed_at))
+    }
+
+    fn index_copies(&self, files: &[Hashed<'_>], settled: impl Fn(&Stamp) -> bool) -> Result<()> {
+        let txn = self.db.begin_write().map_err(db_err)?;
+        {
+            let mut table = txn.open_table(INSTALLED).map_err(db_err)?;
+            for h in files.iter().filter(|h| settled(&h.stamp)) {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(h.xet.as_bytes());
+                table.insert(k, h.key).map_err(db_err)?;
+            }
+        }
+        txn.commit().map_err(db_err)
+    }
+
+    /// A receiver-owned file recorded with content `xet` and SHA-256 `sha256`, if its stamp still
+    /// matches the record (so it has not been written since it was verified): its path and size.
+    pub fn installed_copy(
+        &self,
+        xet: &MerkleHash,
+        sha256: &[u8; 32],
+    ) -> Result<Option<(std::path::PathBuf, std::fs::Metadata)>> {
+        let mut k = [0u8; 32];
+        k.copy_from_slice(xet.as_bytes());
+        let key = {
+            let txn = self.db.begin_read().map_err(db_err)?;
+            let table = txn.open_table(INSTALLED).map_err(db_err)?;
+            match table.get(k).map_err(db_err)? {
+                Some(v) => v.value().to_vec(),
+                None => return Ok(None),
+            }
+        };
+        let path = path_of(&key);
+        let Ok(m) = std::fs::symlink_metadata(&path) else {
+            return Ok(None);
+        };
+        let Some(stamp) = Stamp::of(&m).filter(|_| m.is_file()) else {
+            return Ok(None);
+        };
+        Ok(self
+            .lookup(&[(key.as_slice(), stamp)])?
+            .into_iter()
+            .next()
+            .flatten()
+            .filter(|(x, sha)| x == xet && sha == sha256)
+            .map(|_| (path, m)))
     }
 
     fn record_if(
@@ -215,6 +276,19 @@ impl IngestCache {
             }
         }
         txn.commit().map_err(db_err)
+    }
+}
+
+/// Inverse of [`key`].
+fn path_of(key: &[u8]) -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(key))
+    }
+    #[cfg(not(unix))]
+    {
+        std::path::PathBuf::from(String::from_utf8_lossy(key).into_owned())
     }
 }
 

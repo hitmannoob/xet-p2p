@@ -456,6 +456,7 @@ use xet_local::ReconstructOptions;
 
 const DELETE: ReconstructOptions = ReconstructOptions {
     delete_extraneous: true,
+    link_identical: false,
 };
 
 #[tokio::test(flavor = "multi_thread")]

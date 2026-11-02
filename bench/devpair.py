@@ -95,12 +95,13 @@ def deploy(args):
     print("deployed", flush=True)
 
 
-def restart_agent(b, trace=False):
+def restart_agent(b, trace=False, link=False):
     sh(b, "for p in /proc/[0-9]*; do case \"$(tr '\\0' ' ' < $p/cmdline 2>/dev/null)\" in '/opt/x/xet-p2p serve'*) kill ${p#/proc/};; esac; done; "
           "sleep 1; rm -rf /recv/cas /recv/xet /tmp/ready.json /tmp/trace; mkdir -p /recv/xet /tmp/trace; "
           f"RUST_LOG=warn,transfer=debug {'XET_P2P_TRACE=/tmp/trace/serve ' if trace else ''}"
           f"nohup {X} serve --no-quic --listen-tcp 0.0.0.0:{XET_PORT} --root /recv/xet "
           f"--cas-dir /recv/cas --cert {K}/server.crt --key {K}/server.key --allow-client {K}/client.crt "
+          f"{'--link-identical ' if link else ''}"
           "--ready-file /tmp/ready.json > /tmp/serve.log 2>&1 < /dev/null & "
           "for i in $(seq 1 100); do [ -s /tmp/ready.json ] && exit 0; sleep 0.1; done; cat /tmp/serve.log; exit 1")
 
@@ -245,14 +246,14 @@ def rollouts(args):
     tools = args.tools.split(",")
     rows = []
     for tool in tools:
-        if tool == "xet":
-            restart_agent(b)
+        if tool.startswith("xet"):
+            restart_agent(b, link=tool == "xet-link")
         sh(b, "rm -rf /recv/rsync/*")
         sh(a, "rm -rf /work && mkdir -p /work && python3 /opt/x/agents_sim.py rollout 0 && sleep 3")
         for k in range(1, args.n + 1):
             sh(a, f"python3 /opt/x/agents_sim.py rollout {k}")
             dest = f"rollout-{k}"
-            if tool == "xet":
+            if tool.startswith("xet"):
                 cmd = (f"{X} push /agent/run tcp://{xh}:{xp}/{dest} --cert {K}/client.crt --key {K}/client.key "
                        f"--peer-cert {K}/server.crt --cas-dir /work/cas --json")
             else:
@@ -261,11 +262,11 @@ def rollouts(args):
             out = sh(a, f"s=$(date +%s.%N); {cmd} > /tmp/out.txt; e=$(date +%s.%N); "
                         "python3 -c \"import sys; print(float(sys.argv[2]) - float(sys.argv[1]))\" $s $e")
             wall, stdout = float(out.splitlines()[-1]), sh(a, "cat /tmp/out.txt")
-            if tool == "xet":
+            if tool.startswith("xet"):
                 sent = json.loads(stdout)["udp_bytes_sent"]
             else:
                 sent = int(re.search(r"Total (?:bytes )?sent:\s*([\d,]+)", stdout).group(1).replace(",", ""))
-            remote = f"/recv/{'xet' if tool == 'xet' else 'rsync'}/{dest}"
+            remote = f"/recv/{'xet' if tool.startswith('xet') else 'rsync'}/{dest}"
             assert sh(a, DIGEST.format("/agent/run")) == sh(b, DIGEST.format(remote)), f"{tool} {dest}: differs"
             rows.append((tool, k, wall, sent))
             print(f"{tool:10} rollout {k:2}: {wall:5.1f} s  sent {sent / 1024:9.0f} KiB", flush=True)

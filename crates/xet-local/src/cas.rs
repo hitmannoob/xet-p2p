@@ -92,6 +92,9 @@ pub struct ReconstructReport {
     pub files_unchanged: usize,
     /// Of `files_unchanged`, those trusted from their recorded stamp without being read.
     pub files_trusted: usize,
+    /// Of `files`, those made from a verified copy already installed elsewhere (a clone, or a
+    /// hard link with `link_identical`) instead of being rebuilt from the CAS.
+    pub files_reused: usize,
     pub dirs: usize,
     /// Bytes reconstructed (excludes unchanged files).
     pub bytes: u64,
@@ -107,6 +110,10 @@ pub struct ReconstructOptions {
     /// remove whatever under `dest` the manifest does not describe, including entries whose type
     /// conflicts with it. Symlinks are removed, never followed. Off by default.
     pub delete_extraneous: bool,
+    /// Where no copy-on-write clone is possible, make a file whose content the receiver already
+    /// holds at another verified destination path a hard link to it (like rsync --link-dest):
+    /// the copies then share one file, so editing one in place edits both. Off by default.
+    pub link_identical: bool,
 }
 
 impl LocalCas {
@@ -631,7 +638,10 @@ impl LocalCas {
         staging: &Path,
         opts: ReconstructOptions,
     ) -> Result<ReconstructReport> {
-        let (work, report) = self.decide(manifest, dest, staging)?;
+        let (mut work, report) = self.decide(manifest, dest, staging)?;
+        for w in &mut work {
+            w.link = opts.link_identical;
+        }
         let parallel = std::thread::available_parallelism().map_or(4, |n| n.get() * 2);
         let staged: Vec<Result<Staged>> = futures::stream::iter(work)
             .map(|w| self.stage(w))
@@ -758,6 +768,7 @@ impl LocalCas {
                 xet_hash: xet_hash.to_owned(),
                 sha256: sha256.to_owned(),
                 executable,
+                link: false,
             });
         }
 
@@ -770,7 +781,7 @@ impl LocalCas {
                 sha256: *sha,
             })
             .collect();
-        self.ingest_cache.record(&records, started, None)?;
+        self.ingest_cache.record_verified(&records, started)?;
         tracing::debug!(
             ms = t.elapsed().as_millis() as u64,
             unchanged = report.files_unchanged,
@@ -783,12 +794,32 @@ impl LocalCas {
     /// Stages many small files at once (see [`Self::write_small_files`]), checking each like
     /// [`Self::stage`] does.
     async fn stage_batch(&self, batch: Vec<Work>) -> Result<Vec<Staged>> {
+        // Files whose content this receiver already holds at a verified path are cloned or
+        // linked from it; only the rest are rebuilt from the CAS.
+        let cache = self.ingest_cache.clone();
+        let (mut out, batch) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<Staged>, Vec<Work>)> {
+                let (mut reused, mut rest) = (Vec::new(), Vec::new());
+                for w in batch {
+                    if reuse_copy(&cache, &w)? {
+                        reused.push((w.tmp, w.path, w.size, true));
+                    } else {
+                        rest.push(w);
+                    }
+                }
+                Ok((reused, rest))
+            })
+            .await
+            .map_err(|e| Error::Xet(e.to_string()))??;
+        if batch.is_empty() {
+            return Ok(out);
+        }
         let files: Vec<(MerkleHash, PathBuf)> = batch
             .iter()
             .map(|w| Ok((parse_hash(&w.path, &w.xet_hash)?, w.tmp.clone())))
             .collect::<Result<_>>()?;
         let written = self.write_small_files(&files).await?;
-        let mut out = Vec::with_capacity(batch.len());
+        out.reserve(batch.len());
         for (w, (n, sha)) in batch.into_iter().zip(written) {
             let fail = |reason: String| Error::Verification {
                 path: w.path.clone(),
@@ -801,13 +832,16 @@ impl LocalCas {
                 return Err(fail(format!("SHA-256 {sha}, expected {}", w.sha256)));
             }
             set_executable(&w.tmp, w.executable)?;
-            out.push((w.tmp, w.path, w.size));
+            out.push((w.tmp, w.path, w.size, false));
         }
         Ok(out)
     }
 
     /// Reconstructs one file into staging and checks its size and SHA-256 against the manifest.
     async fn stage(&self, w: Work) -> Result<Staged> {
+        if reuse_copy(&self.ingest_cache, &w)? {
+            return Ok((w.tmp, w.path, w.size, true));
+        }
         let fail = |reason: String| Error::Verification {
             path: w.path.clone(),
             reason,
@@ -828,7 +862,7 @@ impl LocalCas {
             }
         }
         set_executable(&w.tmp, w.executable)?;
-        Ok((w.tmp, w.path, w.size))
+        Ok((w.tmp, w.path, w.size, false))
     }
 }
 
@@ -880,7 +914,8 @@ impl LocalCas {
             }
         };
         let mut pending: std::collections::HashMap<String, Vec<Work>> = Default::default();
-        for w in work {
+        for mut w in work {
+            w.link = opts.link_identical;
             let key = if w.size == 0 {
                 String::new()
             } else {
@@ -1041,7 +1076,7 @@ impl Reconstruction {
                     .await
                     .map_err(|_| Error::Xet("streamed file writer stopped".into()))??;
                 set_executable(&w.tmp, w.executable)?;
-                Ok(vec![(w.tmp, w.path, w.size)])
+                Ok(vec![(w.tmp, w.path, w.size, false)])
             }
             .instrument(tracing::debug_span!("stream_file")),
         );
@@ -1103,6 +1138,77 @@ fn assemble(
     Ok(())
 }
 
+/// Makes `w`'s staged file from a verified copy of its content this receiver already holds at a
+/// destination path (one whose stamp still matches its record, so unwritten since it was
+/// verified): a copy-on-write clone where the filesystem can, else, if allowed, a hard link with
+/// the same permissions. Returns whether it did; otherwise the caller rebuilds from the CAS.
+fn reuse_copy(cache: &IngestCache, w: &Work) -> Result<bool> {
+    if w.size == 0 {
+        return Ok(false);
+    }
+    let (Ok(xet), Ok(Ok(sha))) = (
+        MerkleHash::from_hex(&w.xet_hash),
+        hex::decode(&w.sha256).map(<[u8; 32]>::try_from),
+    ) else {
+        return Ok(false);
+    };
+    let Some((src, m)) = cache.installed_copy(&xet, &sha)? else {
+        return Ok(false);
+    };
+    if m.len() != w.size {
+        return Ok(false);
+    }
+    if clone_file(&src, &w.tmp).is_ok() {
+        set_executable(&w.tmp, w.executable)?;
+        return Ok(true);
+    }
+    let _ = fs::remove_file(&w.tmp);
+    #[cfg(unix)]
+    let same_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        (m.permissions().mode() & 0o111 != 0) == w.executable
+    };
+    #[cfg(not(unix))]
+    let same_mode = false;
+    Ok(w.link && same_mode && fs::hard_link(&src, &w.tmp).is_ok())
+}
+
+/// Copy-on-write clone of `src` as the new file `dst` (APFS `clonefile`, Linux `FICLONE` on btrfs,
+/// XFS and similar). Fails where the filesystem cannot share data between files.
+fn clone_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let s = std::ffi::CString::new(src.as_os_str().as_bytes())?;
+        let d = std::ffi::CString::new(dst.as_os_str().as_bytes())?;
+        // SAFETY: valid NUL-terminated paths; clonefile(2) creates `dst` or fails.
+        if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+        let s = fs::File::open(src)?;
+        let d = fs::File::create(dst)?;
+        // SAFETY: ioctl(FICLONE) on two valid, owned descriptors.
+        if unsafe { libc::ioctl(d.as_raw_fd(), FICLONE as _, s.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    {
+        let _ = (src, dst);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "clone",
+        ))
+    }
+}
+
 /// A file to reconstruct into staging.
 struct Work {
     tmp: PathBuf,
@@ -1111,10 +1217,12 @@ struct Work {
     xet_hash: String,
     sha256: String,
     executable: bool,
+    /// Hard links to an identical verified copy are allowed ([`ReconstructOptions::link_identical`]).
+    link: bool,
 }
 
-/// A verified file in staging: (staging path, manifest path, size).
-type Staged = (PathBuf, String, u64);
+/// A verified file in staging: (staging path, manifest path, size, made from an installed copy).
+type Staged = (PathBuf, String, u64, bool);
 
 /// Installs verified staged files (and the manifest's directories) into `dest`, after removing
 /// extraneous entries if asked, then makes it all durable.
@@ -1138,8 +1246,9 @@ fn install(
     }
     let staged: Vec<(PathBuf, String)> = staged
         .into_iter()
-        .map(|(tmp, path, size)| {
+        .map(|(tmp, path, size, reused)| {
             report.bytes += size;
+            report.files_reused += usize::from(reused);
             (tmp, path)
         })
         .collect();
