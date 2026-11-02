@@ -213,8 +213,11 @@ def agents(args):
             assert sh(a, DIGEST.format(f"/agents/a{i}")) == sh(b, DIGEST.format(remote)), f"{tool} a{i}: differs"
         print(f"{tool}: done, {args.n} agent trees verified", flush=True)
         if tool == "xet" and args.profile:
-            last = sh(a, f"ls -t /tmp/trace/push-a{args.n}-*.txt | tail -1")
-            print(f"--- sender profile, first sync of agent {args.n}:\n" + sh(a, f"cat {last}"), flush=True)
+            first = sh(a, f"ls -t /tmp/trace/push-a{args.n}-*.txt | tail -1")
+            last = sh(a, f"ls -t /tmp/trace/push-a{args.n}-*.txt | head -1")
+            print(f"--- sender profile, first sync of agent {args.n}:\n" + sh(a, f"cat {first}"), flush=True)
+            if last != first:
+                print(f"--- sender profile, last sync of agent {args.n}:\n" + sh(a, f"cat {last}"), flush=True)
             sh(b, "for p in /proc/[0-9]*; do [ \"$(readlink $p/exe 2>/dev/null)\" = /opt/x/xet-p2p ] && "
                   "kill -TERM ${p#/proc/}; done; sleep 3")
             print("--- receiver profile (all syncs):\n" + sh(b, "cat /tmp/trace/serve.*.txt"), flush=True)

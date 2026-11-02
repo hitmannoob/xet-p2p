@@ -298,3 +298,27 @@ async fn small_files_stage_in_batches_from_shared_xorbs() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_files_are_not_read_and_hash_as_upstream_does() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    write(&src, "pkg/__init__.py", b"");
+    write(&src, "pkg/mod.py", b"x = 1\n");
+    let cas = LocalCas::open(tmp.path().join("cas")).await.unwrap();
+    let (m, r) = cas.ingest(&src).await.unwrap();
+    let (_, size, h, sha, _) = m
+        .files()
+        .find(|(e, ..)| e.path == "pkg/__init__.py")
+        .unwrap();
+    // Upstream ingest gives an empty file the all-zero Xet hash and SHA-256 of empty input.
+    assert_eq!((size, h), (0, "0".repeat(64).as_str()));
+    assert_eq!(
+        sha,
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+    assert_eq!((r.files, r.cached_files), (2, 0), "{r:?}");
+    let dest = tmp.path().join("dest");
+    cas.reconstruct(&m, &dest).await.unwrap();
+    assert_eq!(fs::read(dest.join("pkg/__init__.py")).unwrap(), b"");
+}

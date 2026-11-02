@@ -265,6 +265,14 @@ impl LocalCas {
             .iter()
             .map(|(i, stamp)| (keys[*i].as_slice(), *stamp))
             .collect();
+        // Empty files need no reading: their Xet hash (that of an empty chunk list) and SHA-256 are
+        // constants, and no content or reconstruction is stored for them.
+        let empty_hash = xet_core_structures::merklehash::file_hash(&[]).hex();
+        for (i, w) in walked.iter().enumerate() {
+            if matches!(w.kind, WalkedKind::File { size: 0, .. }) {
+                known[i] = Some((empty_hash.clone(), EMPTY_SHA256.to_owned()));
+            }
+        }
         let mut present_xorbs = std::collections::HashSet::new();
         for ((i, _), hit) in probe.iter().zip(self.ingest_cache.lookup(&lookups)?) {
             let Some((xet, sha)) = hit else { continue };
@@ -279,6 +287,25 @@ impl LocalCas {
             .filter(|(i, w)| matches!(w.kind, WalkedKind::File { .. }) && known[*i].is_none())
             .map(|(i, _)| i)
             .collect();
+        if tracing::enabled!(tracing::Level::DEBUG) && !to_read.is_empty() {
+            let sample: Vec<String> = to_read
+                .iter()
+                .take(8)
+                .map(|i| {
+                    let w = &walked[*i];
+                    let why = match (
+                        &w.kind,
+                        lookups.iter().position(|(k, _)| *k == keys[*i].as_slice()),
+                    ) {
+                        (WalkedKind::File { stamp: None, .. }, _) => "no stamp".to_string(),
+                        (_, None) => "not probed (empty?)".to_string(),
+                        (_, Some(_)) => "cache miss or content absent".to_string(),
+                    };
+                    format!("{} ({why})", w.rel_path)
+                })
+                .collect();
+            tracing::debug!(read = to_read.len(), ?sample, "ingest reads files");
+        }
         let mut report = IngestReport::default();
         // Upstream lz4-compresses every chunk and keeps the result only if it is smaller, so for
         // data that is already compressed (Parquet, archives, media, most weights) all of that work
@@ -339,8 +366,10 @@ impl LocalCas {
                     size, executable, ..
                 } if known[i].is_some() => {
                     report.files += 1;
-                    report.cached_files += 1;
-                    report.cached_bytes += size;
+                    if size > 0 {
+                        report.cached_files += 1;
+                        report.cached_bytes += size;
+                    }
                     let (xet_hash, sha256) = known[i].take().unwrap();
                     EntryKind::File {
                         size,
@@ -673,9 +702,10 @@ impl LocalCas {
         let mut buf = vec![0u8; VERIFY_BUF];
         let files: Vec<_> = manifest.files().collect();
         let mut existing = Vec::with_capacity(files.len());
+        let mut dirs = DirProbe::default();
         for (entry, ..) in &files {
             let rel = validate_rel_path(&entry.path)?;
-            existing.push(existing_regular_file(dest, &rel).map(|(p, m)| {
+            existing.push(dirs.existing_regular_file(dest, &rel).map(|(p, m)| {
                 let key = ingest_cache::key(&p);
                 (p, ingest_cache::Stamp::of(&m), key)
             }));
@@ -1355,20 +1385,37 @@ fn remove_stale_staging(dest: &Path) -> Result<()> {
 }
 
 /// `dest/rel` if it is a regular file reached without traversing any symlink; otherwise `None`.
-fn existing_regular_file(dest: &Path, rel: &Path) -> Option<(PathBuf, fs::Metadata)> {
-    let mut cur = dest.to_path_buf();
-    let n = rel.components().count();
-    let mut last = None;
-    for (i, component) in rel.components().enumerate() {
-        cur.push(component);
-        let m = fs::symlink_metadata(&cur).ok()?;
-        let ok = if i + 1 == n { m.is_file() } else { m.is_dir() };
-        if !ok {
-            return None;
+/// Caches, for one pass over a destination, which directories are real directories and which do
+/// not exist, so each is checked once rather than once per file under it.
+#[derive(Default)]
+struct DirProbe {
+    dirs: std::collections::HashMap<PathBuf, bool>,
+}
+
+impl DirProbe {
+    /// The regular file at `rel` under `dest`, if every component is what it should be (real
+    /// directories, then a regular file; symlinks are never followed), with its metadata.
+    fn existing_regular_file(
+        &mut self,
+        dest: &Path,
+        rel: &Path,
+    ) -> Option<(PathBuf, fs::Metadata)> {
+        let parent = rel.parent().unwrap_or(Path::new(""));
+        let mut cur = PathBuf::new();
+        for component in parent.components() {
+            cur.push(component);
+            let is_dir = *self
+                .dirs
+                .entry(cur.clone())
+                .or_insert_with(|| fs::symlink_metadata(dest.join(&cur)).is_ok_and(|m| m.is_dir()));
+            if !is_dir {
+                return None;
+            }
         }
-        last = Some(m);
+        let path = dest.join(rel);
+        let m = fs::symlink_metadata(&path).ok()?;
+        m.is_file().then_some((path, m))
     }
-    Some((cur, last?))
 }
 
 /// Creates `rel` (a manifest-style relative path) under `root` without following symlinks, and
