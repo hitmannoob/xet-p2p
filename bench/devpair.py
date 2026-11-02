@@ -247,14 +247,15 @@ def rollouts(args):
     rows = []
     for tool in tools:
         if tool.startswith("xet"):
-            restart_agent(b, link=tool == "xet-link")
+            restart_agent(b, trace=args.profile, link=tool == "xet-link")
         sh(b, "rm -rf /recv/rsync/*")
-        sh(a, "rm -rf /work && mkdir -p /work && python3 /opt/x/agents_sim.py rollout 0 && sleep 3")
+        sh(a, "rm -rf /work /tmp/trace && mkdir -p /work /tmp/trace && python3 /opt/x/agents_sim.py rollout 0 && sleep 3")
         for k in range(1, args.n + 1):
             sh(a, f"python3 /opt/x/agents_sim.py rollout {k}")
             dest = f"rollout-{k}"
             if tool.startswith("xet"):
-                cmd = (f"{X} push /agent/run tcp://{xh}:{xp}/{dest} --cert {K}/client.crt --key {K}/client.key "
+                trace = "XET_P2P_TRACE=/tmp/trace/push " if args.profile and k == args.n else ""
+                cmd = (f"{trace}{X} push /agent/run tcp://{xh}:{xp}/{dest} --cert {K}/client.crt --key {K}/client.key "
                        f"--peer-cert {K}/server.crt --cas-dir /work/cas --json")
             else:
                 link = f" --link-dest=/rollout-{k - 1}" if tool == "rsync-link" and k > 1 else ""
@@ -271,6 +272,11 @@ def rollouts(args):
             rows.append((tool, k, wall, sent))
             print(f"{tool:10} rollout {k:2}: {wall:5.1f} s  sent {sent / 1024:9.0f} KiB", flush=True)
             time.sleep(1)
+        if tool.startswith("xet") and args.profile:
+            print(f"--- {tool} sender, rollout {args.n}:\n" + sh(a, "cat /tmp/trace/push.*.txt"), flush=True)
+            sh(b, "for p in /proc/[0-9]*; do case \"$(tr '\\0' ' ' < $p/cmdline 2>/dev/null)\" in "
+                  "'/opt/x/xet-p2p serve'*) kill -TERM ${p#/proc/};; esac; done; sleep 3")
+            print(f"--- {tool} receiver, all rollouts:\n" + sh(b, "cat /tmp/trace/serve.*.txt"), flush=True)
     print(f"\n{'':24}" + "".join(f"{t:>22}" for t in tools))
     for label, pick in (("rollout 1 (cold)", lambda k: k == 1), ("rollouts 2..N, median", lambda k: k > 1)):
         cells = []
@@ -314,6 +320,7 @@ if __name__ == "__main__":
     p = sub.add_parser("rollouts")
     p.add_argument("--n", type=int, default=10)
     p.add_argument("--tools", default="xet,rsync-z,rsync-link")
+    p.add_argument("--profile", action="store_true")
     p = sub.add_parser("sh")
     p.add_argument("which", choices=["a", "b"])
     p.add_argument("command")

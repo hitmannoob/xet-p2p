@@ -81,6 +81,10 @@ pub struct IngestReport {
     pub cached_bytes: u64,
     /// Of the files read, how many were ingested without compression (samples did not compress).
     pub raw_files: usize,
+    /// Xet hashes of the files reused from the cache, and the xorbs they reference (confirmed
+    /// present), so callers need not look them up again.
+    pub cached_hashes: BTreeSet<MerkleHash>,
+    pub cached_xorbs: BTreeSet<MerkleHash>,
     pub dedup: DeduplicationMetrics,
 }
 
@@ -241,7 +245,7 @@ impl LocalCas {
     pub async fn ingest(&self, src: impl AsRef<Path>) -> Result<(Manifest, IngestReport)> {
         let src = src.as_ref();
         let started = std::time::SystemTime::now();
-        let walked = walk(src)?;
+        let walked = tracing::debug_span!("walk").in_scope(|| walk(src))?;
         let root = fs::canonicalize(src)?;
         let single_file = fs::symlink_metadata(src)?.is_file();
         let key_of = |w: &WalkedEntry| {
@@ -281,12 +285,21 @@ impl LocalCas {
             }
         }
         let mut present_xorbs = std::collections::HashSet::new();
-        for ((i, _), hit) in probe.iter().zip(self.ingest_cache.lookup(&lookups)?) {
-            let Some((xet, sha)) = hit else { continue };
-            if self.holds_file(&xet, &mut present_xorbs).await? {
-                known[*i] = Some((xet.hex(), hex::encode(sha)));
+        let mut cached_hashes = BTreeSet::new();
+        let hits =
+            tracing::debug_span!("stamp_lookup").in_scope(|| self.ingest_cache.lookup(&lookups))?;
+        async {
+            for ((i, _), hit) in probe.iter().zip(hits) {
+                let Some((xet, sha)) = hit else { continue };
+                if self.holds_file(&xet, &mut present_xorbs).await? {
+                    known[*i] = Some((xet.hex(), hex::encode(sha)));
+                    cached_hashes.insert(xet);
+                }
             }
+            Ok::<_, Error>(())
         }
+        .instrument(tracing::debug_span!("check_cached_content"))
+        .await?;
 
         let to_read: Vec<usize> = walked
             .iter()
@@ -360,6 +373,8 @@ impl LocalCas {
             by_index.extend(files.into_iter().zip(infos));
         }
         report.dedup = dedup;
+        report.cached_xorbs = present_xorbs.iter().copied().collect();
+        report.cached_hashes = cached_hashes;
         let mut entries = Vec::with_capacity(walked.len());
         let mut hashed = Vec::new();
 
@@ -459,11 +474,13 @@ impl LocalCas {
         let mut prefix = ingest_cache::key(&root);
         prefix.push(b'/');
         let keep: std::collections::HashSet<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-        self.ingest_cache.record(
-            &records,
-            started,
-            (!single_file).then_some((prefix.as_slice(), &keep)),
-        )?;
+        tracing::debug_span!("record_stamps").in_scope(|| {
+            self.ingest_cache.record(
+                &records,
+                started,
+                (!single_file).then_some((prefix.as_slice(), &keep)),
+            )
+        })?;
 
         let manifest = Manifest {
             format_version: MANIFEST_FORMAT_VERSION,
@@ -799,15 +816,26 @@ impl LocalCas {
         let cache = self.ingest_cache.clone();
         let (mut out, batch) =
             tokio::task::spawn_blocking(move || -> Result<(Vec<Staged>, Vec<Work>)> {
-                let (mut reused, mut rest) = (Vec::new(), Vec::new());
+                let (mut done, mut rest) = (Vec::new(), Vec::new());
                 for w in batch {
-                    if reuse_copy(&cache, &w)? {
-                        reused.push((w.tmp, w.path, w.size, true));
+                    if w.size == 0 {
+                        // Empty files need no content: create them here.
+                        if !w.sha256.eq_ignore_ascii_case(EMPTY_SHA256) {
+                            return Err(Error::Verification {
+                                path: w.path.clone(),
+                                reason: "SHA-256 of empty file does not match".into(),
+                            });
+                        }
+                        crate::durable::sync_staged(&fs::File::create(&w.tmp)?)?;
+                        set_executable(&w.tmp, w.executable)?;
+                        done.push((w.tmp, w.path, 0, false));
+                    } else if reuse_copy(&cache, &w)? {
+                        done.push((w.tmp, w.path, w.size, true));
                     } else {
                         rest.push(w);
                     }
                 }
-                Ok((reused, rest))
+                Ok((done, rest))
             })
             .await
             .map_err(|e| Error::Xet(e.to_string()))??;
@@ -950,7 +978,7 @@ impl Reconstruction {
     }
 
     fn start(&mut self, w: Work) {
-        if w.size > 0 && w.size < SMALL_FILE {
+        if w.size < SMALL_FILE {
             self.small.push(w);
             if self.small.len() >= SMALL_BATCH {
                 self.flush_small();
@@ -1158,11 +1186,32 @@ fn reuse_copy(cache: &IngestCache, w: &Work) -> Result<bool> {
     if m.len() != w.size {
         return Ok(false);
     }
-    if clone_file(&src, &w.tmp).is_ok() {
-        set_executable(&w.tmp, w.executable)?;
-        return Ok(true);
+    if CLONES.load(std::sync::atomic::Ordering::Relaxed) {
+        match clone_file(&src, &w.tmp) {
+            Ok(()) => {
+                set_executable(&w.tmp, w.executable)?;
+                return Ok(true);
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&w.tmp);
+                // The filesystem cannot clone: stop trying (it would cost four system calls per
+                // file); other errors may be specific to this file.
+                if e.raw_os_error().is_some_and(|c| {
+                    [
+                        libc::EOPNOTSUPP,
+                        libc::ENOTSUP,
+                        libc::ENOTTY,
+                        libc::EINVAL,
+                        libc::EXDEV,
+                    ]
+                    .contains(&c)
+                }) || e.kind() == std::io::ErrorKind::Unsupported
+                {
+                    CLONES.store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
     }
-    let _ = fs::remove_file(&w.tmp);
     #[cfg(unix)]
     let same_mode = {
         use std::os::unix::fs::PermissionsExt;
@@ -1172,6 +1221,9 @@ fn reuse_copy(cache: &IngestCache, w: &Work) -> Result<bool> {
     let same_mode = false;
     Ok(w.link && same_mode && fs::hard_link(&src, &w.tmp).is_ok())
 }
+
+/// Whether copy-on-write clones may work here; cleared at the first "not supported".
+static CLONES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Copy-on-write clone of `src` as the new file `dst` (APFS `clonefile`, Linux `FICLONE` on btrfs,
 /// XFS and similar). Fails where the filesystem cannot share data between files.

@@ -104,7 +104,12 @@ pub async fn prepare(cas: &LocalCas, src: &Path) -> Result<Prepared> {
     let start = Instant::now();
     let (manifest, ingest) = cas.ingest(src).await?;
     let files = file_hashes(&manifest)?;
-    let referenced = cas.referenced_xorbs(&files).await?;
+    // Files reused from the ingest cache already had their xorbs confirmed present.
+    let mut referenced = ingest.cached_xorbs.clone();
+    let read: BTreeSet<MerkleHash> = files.difference(&ingest.cached_hashes).copied().collect();
+    if !read.is_empty() {
+        referenced.extend(cas.referenced_xorbs(&read).await?);
+    }
     cas.touch_xorbs(&referenced); // recency for GC on the sender's CAS
     debug!(
         ms = start.elapsed().as_millis() as u64,
