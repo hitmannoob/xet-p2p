@@ -183,7 +183,9 @@ def agents(args):
             cmd = (f"{trace}{X} push {src} tcp://{xh}:{xp}/{dest} --cert {K}/client.crt --key {K}/client.key "
                    f"--peer-cert {K}/server.crt --cas-dir /work/cas{i} --json")
         else:
-            link = " --link-dest=../a1" if tool == "rsync-link" and i > 1 else ""
+            # In daemon mode --link-dest is relative to the module root (a relative ../ path is
+            # silently ignored).
+            link = " --link-dest=/a1" if tool == "rsync-link" and i > 1 else ""
             cmd = f"rsync -az{link} --stats {src}/ rsync://{rh}:{rp}/bench/{dest}/"
         out = sh(a, f"s=$(date +%s.%N); {cmd} > /tmp/out.txt; e=$(date +%s.%N); "
                     "python3 -c \"import sys; print(float(sys.argv[2]) - float(sys.argv[1]))\" $s $e")
@@ -232,6 +234,51 @@ def agents(args):
         print(f"{ph:22}" + "".join(f"{c:>24}" for c in cells))
 
 
+def rollouts(args):
+    """One agent, many rollouts from the same base; the collector keeps each as rollout-k."""
+    import re
+    import statistics
+    st, a, b = load()
+    (xh, xp), (rh, rp) = st["xet"], st["rsync"]
+    a.filesystem.copy_from_local(os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents_sim.py"),
+                                 "/opt/x/agents_sim.py")
+    tools = args.tools.split(",")
+    rows = []
+    for tool in tools:
+        if tool == "xet":
+            restart_agent(b)
+        sh(b, "rm -rf /recv/rsync/*")
+        sh(a, "rm -rf /work && mkdir -p /work && python3 /opt/x/agents_sim.py rollout 0 && sleep 3")
+        for k in range(1, args.n + 1):
+            sh(a, f"python3 /opt/x/agents_sim.py rollout {k}")
+            dest = f"rollout-{k}"
+            if tool == "xet":
+                cmd = (f"{X} push /agent/run tcp://{xh}:{xp}/{dest} --cert {K}/client.crt --key {K}/client.key "
+                       f"--peer-cert {K}/server.crt --cas-dir /work/cas --json")
+            else:
+                link = f" --link-dest=/rollout-{k - 1}" if tool == "rsync-link" and k > 1 else ""
+                cmd = f"rsync -az{link} --stats /agent/run/ rsync://{rh}:{rp}/bench/{dest}/"
+            out = sh(a, f"s=$(date +%s.%N); {cmd} > /tmp/out.txt; e=$(date +%s.%N); "
+                        "python3 -c \"import sys; print(float(sys.argv[2]) - float(sys.argv[1]))\" $s $e")
+            wall, stdout = float(out.splitlines()[-1]), sh(a, "cat /tmp/out.txt")
+            if tool == "xet":
+                sent = json.loads(stdout)["udp_bytes_sent"]
+            else:
+                sent = int(re.search(r"Total (?:bytes )?sent:\s*([\d,]+)", stdout).group(1).replace(",", ""))
+            remote = f"/recv/{'xet' if tool == 'xet' else 'rsync'}/{dest}"
+            assert sh(a, DIGEST.format("/agent/run")) == sh(b, DIGEST.format(remote)), f"{tool} {dest}: differs"
+            rows.append((tool, k, wall, sent))
+            print(f"{tool:10} rollout {k:2}: {wall:5.1f} s  sent {sent / 1024:9.0f} KiB", flush=True)
+            time.sleep(1)
+    print(f"\n{'':24}" + "".join(f"{t:>22}" for t in tools))
+    for label, pick in (("rollout 1 (cold)", lambda k: k == 1), ("rollouts 2..N, median", lambda k: k > 1)):
+        cells = []
+        for t in tools:
+            m = [(w, n) for tt, k, w, n in rows if tt == t and pick(k)]
+            cells.append(f"{statistics.median(w for w, _ in m):5.1f} s {statistics.median(n for _, n in m) / 1024:8.0f} KiB")
+        print(f"{label:24}" + "".join(f"{c:>22}" for c in cells))
+
+
 def shell(args):
     _, a, b = load()
     print(sh(a if args.which == "a" else b, args.command, check=False))
@@ -263,6 +310,9 @@ if __name__ == "__main__":
     p = sub.add_parser("run")
     p.add_argument("--tools", default="xet,rsync")
     p.add_argument("--profile", action="store_true")
+    p = sub.add_parser("rollouts")
+    p.add_argument("--n", type=int, default=10)
+    p.add_argument("--tools", default="xet,rsync-z,rsync-link")
     p = sub.add_parser("sh")
     p.add_argument("which", choices=["a", "b"])
     p.add_argument("command")
@@ -273,4 +323,5 @@ if __name__ == "__main__":
     p.add_argument("--profile", action="store_true")
     sub.add_parser("down")
     args = ap.parse_args()
-    {"up": up, "deploy": deploy, "run": run, "agents": agents, "sh": shell, "down": down}[args.cmd](args)
+    {"up": up, "deploy": deploy, "run": run, "agents": agents, "rollouts": rollouts, "sh": shell,
+     "down": down}[args.cmd](args)
