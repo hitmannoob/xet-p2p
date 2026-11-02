@@ -50,6 +50,38 @@ pub fn barrier(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Whether staged files can skip their own fsync because [`sync_filesystem`] will make them all
+/// durable in one call before they are installed (Linux `syncfs`). Thousands of small files
+/// otherwise cost one fsync each, which is slow on some filesystems (e.g. gVisor sandboxes).
+pub fn batched() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// A staged file's sync: now, unless [`batched`].
+pub fn sync_staged(file: &File) -> io::Result<()> {
+    if batched() { Ok(()) } else { sync_file(file) }
+}
+
+/// Makes everything written on the filesystem holding `path` durable, data and metadata
+/// (`syncfs(2)` on Linux). Unsupported elsewhere.
+pub fn sync_filesystem(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let f = File::open(path)?;
+        // SAFETY: syncfs(2) on a valid, owned descriptor.
+        if unsafe { libc::syncfs(f.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err(io::Error::new(io::ErrorKind::Unsupported, "syncfs"))
+    }
+}
+
 /// `sync_file` + `sync_dir(parent)` + `barrier`: one object, fully durable.
 pub fn persist(path: &Path) -> io::Result<()> {
     sync_file(&File::open(path)?)?;

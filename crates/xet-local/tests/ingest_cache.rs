@@ -215,7 +215,8 @@ async fn streamed_file_is_written_in_order_from_out_of_order_chunks() {
     let tmp = TempDir::new().unwrap();
     let src = tmp.path().join("src");
     // Random data with one block repeated, so a chunk occurs at more than one position.
-    let mut block = vec![0u8; 3 << 20];
+    // Large enough to be streamed (small files are rebuilt from the CAS instead).
+    let mut block = vec![0u8; 5 << 20];
     rand::rngs::StdRng::seed_from_u64(5).fill(&mut block[..]);
     let mut data = block.clone();
     data.extend_from_slice(&block);

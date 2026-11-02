@@ -6,6 +6,8 @@
     devpair.py deploy BIN                  upload a Linux xet-p2p build to both; restart B's agent
     devpair.py run [--tools xet,rsync]     cold -> unchanged x2 -> grown -> second destination,
                    [--profile]             per tool, verified; --profile prints xet-p2p's phases
+    devpair.py agents [--n 8 --rounds 3]   coding-agent fleet -> collector: first sync per agent,
+                                           then incremental rounds (see agents_sim.py)
     devpair.py sh a|b CMD                  run a shell command in A or B
     devpair.py down                        terminate both
 
@@ -93,10 +95,11 @@ def deploy(args):
     print("deployed", flush=True)
 
 
-def restart_agent(b):
+def restart_agent(b, trace=False):
     sh(b, "for p in /proc/[0-9]*; do [ \"$(readlink $p/exe 2>/dev/null)\" = /opt/x/xet-p2p ] && kill ${p#/proc/}; done; "
-          "sleep 1; rm -rf /recv/cas /recv/xet /tmp/ready.json; mkdir -p /recv/xet; "
-          f"RUST_LOG=warn,transfer=debug nohup {X} serve --no-quic --listen-tcp 0.0.0.0:{XET_PORT} --root /recv/xet "
+          "sleep 1; rm -rf /recv/cas /recv/xet /tmp/ready.json /tmp/trace; mkdir -p /recv/xet /tmp/trace; "
+          f"RUST_LOG=warn,transfer=debug {'XET_P2P_TRACE=/tmp/trace/serve ' if trace else ''}"
+          f"nohup {X} serve --no-quic --listen-tcp 0.0.0.0:{XET_PORT} --root /recv/xet "
           f"--cas-dir /recv/cas --cert {K}/server.crt --key {K}/server.key --allow-client {K}/client.crt "
           "--ready-file /tmp/ready.json > /tmp/serve.log 2>&1 < /dev/null & "
           "for i in $(seq 1 100); do [ -s /tmp/ready.json ] && exit 0; sleep 0.1; done; cat /tmp/serve.log; exit 1")
@@ -155,6 +158,77 @@ def run(args):
             print(f"{step:17} " + "".join(f"{row.get(t, 0):9.1f}s" for t in args.tools.split(",")))
 
 
+REPO_TGZ = "https://codeload.github.com/django/django/tar.gz/refs/tags/5.1"
+
+
+def agents(args):
+    import re
+    st, a, b = load()
+    (xh, xp), (rh, rp) = st["xet"], st["rsync"]
+    a.filesystem.copy_from_local(os.path.join(os.path.dirname(os.path.abspath(__file__)), "agents_sim.py"),
+                                 "/opt/x/agents_sim.py")
+    sh(a, "[ -d /data/repo ] || python3 -c \"import io, tarfile, urllib.request; "
+          f"t = tarfile.open(fileobj=io.BytesIO(urllib.request.urlopen('{REPO_TGZ}').read())); "
+          "m = [x for x in t.getmembers() if '/' in x.name and (x.isfile() or x.isdir())]; "
+          "[setattr(x, 'name', x.name.split('/', 1)[1]) for x in m]; t.extractall('/data/repo', members=m)\"")
+    print("base repo:", sh(a, "find /data/repo -type f | wc -l"), "files,",
+          sh(a, "du -sh /data/repo | cut -f1"), flush=True)
+    tools = args.tools.split(",")
+    rows = []
+
+    def sync(tool, i):
+        src, dest = f"/agents/a{i}", f"a{i}"
+        if tool == "xet":
+            trace = f"XET_P2P_TRACE=/tmp/trace/push-a{i}-$(date +%s%N) " if args.profile else ""
+            cmd = (f"{trace}{X} push {src} tcp://{xh}:{xp}/{dest} --cert {K}/client.crt --key {K}/client.key "
+                   f"--peer-cert {K}/server.crt --cas-dir /work/cas{i} --json")
+        else:
+            link = " --link-dest=../a1" if tool == "rsync-link" and i > 1 else ""
+            cmd = f"rsync -az{link} --stats {src}/ rsync://{rh}:{rp}/bench/{dest}/"
+        out = sh(a, f"s=$(date +%s.%N); {cmd} > /tmp/out.txt; e=$(date +%s.%N); "
+                    "python3 -c \"import sys; print(float(sys.argv[2]) - float(sys.argv[1]))\" $s $e")
+        wall, stdout = float(out.splitlines()[-1]), sh(a, "cat /tmp/out.txt")
+        if tool == "xet":
+            sent = json.loads(stdout)["udp_bytes_sent"]
+        else:
+            sent = int(re.search(r"Total (?:bytes )?sent:\s*([\d,]+)", stdout).group(1).replace(",", ""))
+        return wall, sent
+
+    for tool in tools:
+        if tool == "xet":
+            restart_agent(b, trace=args.profile)
+        sh(b, "rm -rf /recv/rsync/*")
+        sh(a, f"rm -rf /work /tmp/trace && mkdir -p /work /tmp/trace && "
+              f"python3 /opt/x/agents_sim.py init {args.n} && sleep 3")
+        for i in range(1, args.n + 1):
+            w, n = sync(tool, i)
+            rows.append((tool, "first, agent 1" if i == 1 else "first, agents 2..N", w, n))
+        for rnd in range(1, args.rounds + 1):
+            sh(a, f"python3 /opt/x/agents_sim.py step {rnd} && sleep 3")
+            for i in range(1, args.n + 1):
+                w, n = sync(tool, i)
+                rows.append((tool, "incremental rounds", w, n))
+        for i in range(1, args.n + 1):
+            remote = f"/recv/{'xet' if tool == 'xet' else 'rsync'}/a{i}"
+            assert sh(a, DIGEST.format(f"/agents/a{i}")) == sh(b, DIGEST.format(remote)), f"{tool} a{i}: differs"
+        print(f"{tool}: done, {args.n} agent trees verified", flush=True)
+        if tool == "xet" and args.profile:
+            last = sh(a, f"ls -t /tmp/trace/push-a{args.n}-*.txt | tail -1")
+            print(f"--- sender profile, first sync of agent {args.n}:\n" + sh(a, f"cat {last}"), flush=True)
+            sh(b, "for p in /proc/[0-9]*; do [ \"$(readlink $p/exe 2>/dev/null)\" = /opt/x/xet-p2p ] && "
+                  "kill -TERM ${p#/proc/}; done; sleep 3")
+            print("--- receiver profile (all syncs):\n" + sh(b, "cat /tmp/trace/serve.*.txt"), flush=True)
+
+    phases = ["first, agent 1", "first, agents 2..N", "incremental rounds"]
+    print(f"\n{'phase':22}" + "".join(f"{t:>24}" for t in tools))
+    for ph in phases:
+        cells = []
+        for t in tools:
+            m = [(w, n) for tt, p, w, n in rows if tt == t and p == ph]
+            cells.append(f"{sum(w for w, _ in m):7.1f} s {sum(n for _, n in m) / 2**20:8.1f} MiB")
+        print(f"{ph:22}" + "".join(f"{c:>24}" for c in cells))
+
+
 def shell(args):
     _, a, b = load()
     print(sh(a if args.which == "a" else b, args.command, check=False))
@@ -189,6 +263,11 @@ if __name__ == "__main__":
     p = sub.add_parser("sh")
     p.add_argument("which", choices=["a", "b"])
     p.add_argument("command")
+    p = sub.add_parser("agents")
+    p.add_argument("--n", type=int, default=8)
+    p.add_argument("--rounds", type=int, default=3)
+    p.add_argument("--tools", default="xet,rsync-z,rsync-link")
+    p.add_argument("--profile", action="store_true")
     sub.add_parser("down")
     args = ap.parse_args()
-    {"up": up, "deploy": deploy, "run": run, "sh": shell, "down": down}[args.cmd](args)
+    {"up": up, "deploy": deploy, "run": run, "agents": agents, "sh": shell, "down": down}[args.cmd](args)

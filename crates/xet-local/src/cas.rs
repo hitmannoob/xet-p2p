@@ -757,7 +757,7 @@ impl LocalCas {
             reason,
         };
         if w.size == 0 {
-            crate::durable::sync_file(&fs::File::create(&w.tmp)?)?;
+            crate::durable::sync_staged(&fs::File::create(&w.tmp)?)?;
             if !w.sha256.eq_ignore_ascii_case(EMPTY_SHA256) {
                 return Err(fail("SHA-256 of empty file does not match".into()));
             }
@@ -931,7 +931,9 @@ impl Reconstruction {
     /// manifest, like any staged file. `None` unless exactly one path needs `file`'s content.
     pub fn stream_file(&mut self, file: &MerkleHash, sizes: Vec<u64>) -> Option<StreamedFile> {
         let key = file.hex();
-        if self.pending.get(&key).map(Vec::len) != Some(1) || sizes.is_empty() {
+        if self.pending.get(&key).map(Vec::len) != Some(1)
+            || sizes.iter().sum::<u64>() < STREAM_MIN_BYTES
+        {
             return None;
         }
         let w = self.pending.remove(&key)?.pop()?;
@@ -954,6 +956,10 @@ impl Reconstruction {
         Some(StreamedFile { tx })
     }
 }
+
+/// Smaller files are rebuilt from the CAS once complete: a writer thread per small file costs
+/// more than it saves.
+const STREAM_MIN_BYTES: u64 = 8 << 20;
 
 /// Writes `w` from its chunks in order as they arrive on `rx`, then verifies it.
 fn assemble(
@@ -994,7 +1000,7 @@ fn assemble(
     }
     out.flush()?;
     let file = out.into_inner().map_err(|e| e.into_error())?;
-    crate::durable::sync_file(&file)?;
+    crate::durable::sync_staged(&file)?;
     if written != w.size {
         return Err(fail(format!("size {written}, expected {}", w.size)));
     }
@@ -1030,6 +1036,14 @@ fn install(
 ) -> Result<(ReconstructReport, Vec<(PathBuf, String)>)> {
     let mut touched_dirs = BTreeSet::new();
     let mut installed = Vec::new();
+    // Staged files were not synced one by one where one filesystem sync can do it: do it now,
+    // before anything is renamed into place (or sync each file if that is not possible).
+    let batched = crate::durable::batched();
+    if batched && crate::durable::sync_filesystem(staging).is_err() {
+        for (tmp, ..) in &staged {
+            crate::durable::sync_file(&fs::File::open(tmp)?)?;
+        }
+    }
     let staged: Vec<(PathBuf, String)> = staged
         .into_iter()
         .map(|(tmp, path, size)| {
@@ -1089,8 +1103,10 @@ fn install(
         }
     }
     touched_dirs.insert(dest.to_owned());
-    for dir in touched_dirs {
-        sync_dir(&dir)?;
+    if !batched || crate::durable::sync_filesystem(dest).is_err() {
+        for dir in touched_dirs {
+            sync_dir(&dir)?;
+        }
     }
     // One drive-cache flush makes every file and directory synced above durable.
     crate::durable::barrier(dest)?;

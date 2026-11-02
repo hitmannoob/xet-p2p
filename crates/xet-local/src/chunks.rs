@@ -489,9 +489,6 @@ impl LocalCas {
         file: &MerkleHash,
         out: &std::path::Path,
     ) -> Result<(u64, String)> {
-        use sha2::Digest;
-        use std::io::Write;
-
         // Resolve every segment's byte range first (footers are cached). Then one thread reads and
         // decompresses while another writes and hashes, so the file's SHA-256, the end-to-end
         // check, is the only serial stage. Chunks are not re-hashed here: each was verified when
@@ -507,46 +504,28 @@ impl LocalCas {
             segments.push((self.xorb_path(&seg.xorb_hash), lo as u64, hi as u64, chunks));
         }
         let out = out.to_owned();
+        let total: u64 = segments.iter().map(|(_, lo, hi, _)| hi - lo).sum();
         tokio::task::spawn_blocking(move || -> Result<(u64, String)> {
+            if total < PIPELINE_MIN_BYTES {
+                // Small files are decoded inline: a second thread only pays off for large ones.
+                let mut decoded = Vec::new();
+                decode_segments(segments, &mut |d| {
+                    let ok = d.is_ok();
+                    decoded.push(d);
+                    ok
+                });
+                return finish_file(&out, decoded);
+            }
             let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>>>(4);
             let reader = std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                for (path, lo, hi, chunks) in segments {
-                    let decoded = (|| -> Result<Vec<u8>> {
-                        read_range_into(&path, lo, hi, &mut buf)?;
-                        let mut plain = Vec::with_capacity(buf.len() * 2);
-                        let mut n = 0;
-                        for_each_plain_chunk(&buf, |p, _| {
-                            plain.extend_from_slice(p);
-                            n += 1;
-                            Ok(())
-                        })?;
-                        if n != chunks {
-                            return Err(xet_err("segment chunk count differs from its xorb"));
-                        }
-                        Ok(plain)
-                    })();
-                    let failed = decoded.is_err();
-                    if tx.send(decoded).is_err() || failed {
-                        break;
-                    }
-                }
+                decode_segments(segments, &mut |d| {
+                    let ok = d.is_ok();
+                    tx.send(d).is_ok() && ok
+                })
             });
-            let mut writer =
-                std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&out)?);
-            let mut sha = sha2::Sha256::new();
-            let mut written = 0u64;
-            for plain in rx {
-                let plain = plain?;
-                writer.write_all(&plain)?;
-                sha.update(&plain);
-                written += plain.len() as u64;
-            }
+            let r = finish_file(&out, rx);
             let _ = reader.join();
-            writer.flush()?;
-            let file = writer.into_inner().map_err(|e| e.into_error())?;
-            crate::durable::sync_file(&file)?;
-            Ok((written, hex::encode(sha.finalize())))
+            r
         })
         .await
         .map_err(xet_err)?
@@ -575,6 +554,59 @@ impl LocalCas {
 }
 
 /// Reads `[lo, hi)` of `path` into `buf` (reused across calls; not zeroed first).
+/// A file segment to decode: (xorb path, byte range, number of chunks).
+type Segment = (std::path::PathBuf, u64, u64, usize);
+
+/// Reads and decompresses each segment in order, handing each result to `emit` until it returns
+/// false (after an error, or when the consumer has gone).
+fn decode_segments(segments: Vec<Segment>, emit: &mut dyn FnMut(Result<Vec<u8>>) -> bool) {
+    let mut buf = Vec::new();
+    for (path, lo, hi, chunks) in segments {
+        let decoded = (|| -> Result<Vec<u8>> {
+            read_range_into(&path, lo, hi, &mut buf)?;
+            let mut plain = Vec::with_capacity(buf.len() * 2);
+            let mut n = 0;
+            for_each_plain_chunk(&buf, |p, _| {
+                plain.extend_from_slice(p);
+                n += 1;
+                Ok(())
+            })?;
+            if n != chunks {
+                return Err(xet_err("segment chunk count differs from its xorb"));
+            }
+            Ok(plain)
+        })();
+        if !emit(decoded) {
+            break;
+        }
+    }
+}
+
+/// Files at least this large are decoded on one thread while another writes and hashes.
+const PIPELINE_MIN_BYTES: u64 = 8 << 20;
+
+/// Writes the decoded segments arriving on `rx` to `out`, hashing them; returns (size, SHA-256).
+fn finish_file(
+    out: &std::path::Path,
+    decoded: impl IntoIterator<Item = Result<Vec<u8>>>,
+) -> Result<(u64, String)> {
+    use sha2::Digest;
+    use std::io::Write;
+    let mut writer = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(out)?);
+    let mut sha = sha2::Sha256::new();
+    let mut written = 0u64;
+    for plain in decoded {
+        let plain = plain?;
+        writer.write_all(&plain)?;
+        sha.update(&plain);
+        written += plain.len() as u64;
+    }
+    writer.flush()?;
+    let file = writer.into_inner().map_err(|e| e.into_error())?;
+    crate::durable::sync_staged(&file)?;
+    Ok((written, hex::encode(sha.finalize())))
+}
+
 fn read_range_into(path: &std::path::Path, lo: u64, hi: u64, buf: &mut Vec<u8>) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path)?;
