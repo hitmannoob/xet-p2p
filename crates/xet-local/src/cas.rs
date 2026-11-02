@@ -961,7 +961,10 @@ impl Reconstruction {
             self.opts,
             std::mem::take(&mut self.report),
         )?;
-        self.cas.record_installed(&self.manifest, &installed).await;
+        // Off the critical path: it waits out INSTALL_SETTLE and stats every file. Missing it
+        // only means the next transfer verifies these files by reading them.
+        let (cas, manifest) = (self.cas.clone(), self.manifest.clone());
+        tokio::spawn(async move { cas.record_installed(&manifest, &installed).await });
         Ok(report)
     }
 }
@@ -1124,34 +1127,69 @@ fn install(
         touched_dirs.insert(dest.to_owned());
     }
 
+    let mut dirs = Dirs::default();
     for entry in &manifest.entries {
         if matches!(entry.kind, EntryKind::Dir) {
-            ensure_dir(dest, &validate_rel_path(&entry.path)?)?;
+            dirs.ensure(dest, &validate_rel_path(&entry.path)?)?;
             report.dirs += 1;
         }
     }
 
+    // Directories first (each checked once), then the renames, in parallel: every file is
+    // verified, so their order does not matter. A file in a directory this install created
+    // cannot have anything in its way.
+    let mut moves = Vec::with_capacity(staged.len());
     for (tmp, path) in staged {
         let rel = validate_rel_path(&path)?;
-        if let Some(parent) = rel.parent() {
-            ensure_dir(dest, parent)?;
-        }
+        let parent = rel.parent().map(Path::to_path_buf).unwrap_or_default();
+        let fresh = dirs.ensure(dest, &parent)?;
         let target = dest.join(&rel);
-        match fs::symlink_metadata(&target) {
-            Ok(m) if m.is_file() => {}
-            Ok(_) => {
-                return Err(Error::UnsafePath {
-                    path,
-                    reason: "destination exists and is not a regular file",
-                });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        fs::rename(&tmp, &target)?;
-        installed.push((target.clone(), path));
-        report.files += 1;
         touched_dirs.insert(target.parent().unwrap_or(dest).to_owned());
+        moves.push((tmp, target, path, fresh));
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .clamp(1, 8);
+    let per = moves.len().div_ceil(threads).max(1);
+    let results: Vec<Result<Vec<(PathBuf, String)>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = moves
+            .chunks(per)
+            .map(|part| {
+                scope.spawn(move || -> Result<Vec<(PathBuf, String)>> {
+                    let mut done = Vec::with_capacity(part.len());
+                    for (tmp, target, path, fresh) in part {
+                        if !fresh {
+                            match fs::symlink_metadata(target) {
+                                Ok(m) if m.is_file() => {}
+                                Ok(_) => {
+                                    return Err(Error::UnsafePath {
+                                        path: path.clone(),
+                                        reason: "destination exists and is not a regular file",
+                                    });
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => return Err(e.into()),
+                            }
+                        }
+                        fs::rename(tmp, target)?;
+                        done.push((target.clone(), path.clone()));
+                    }
+                    Ok(done)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(Error::Xet("install thread panicked".into())))
+            })
+            .collect()
+    });
+    for r in results {
+        let done = r?;
+        report.files += done.len();
+        installed.extend(done);
     }
 
     // Make the renames (and any new directories) durable.
@@ -1377,6 +1415,45 @@ pub fn resolve_confined(root: &Path, rel: &str) -> Result<PathBuf> {
 }
 
 /// Creates `rel` under `dest` one component at a time, refusing to traverse symlinks or files.
+/// Directories under an install's destination checked (or created) so far, so each is checked
+/// once per install rather than once per file.
+#[derive(Default)]
+struct Dirs {
+    known: std::collections::HashSet<PathBuf>,
+    created: std::collections::HashSet<PathBuf>,
+}
+
+impl Dirs {
+    /// Makes sure `rel` under `dest` is a real directory, creating what is missing (never
+    /// following symlinks). Returns whether `rel` itself was created by this install.
+    fn ensure(&mut self, dest: &Path, rel: &Path) -> Result<bool> {
+        let mut cur = PathBuf::new();
+        for component in rel.components() {
+            cur.push(component);
+            if self.known.contains(&cur) {
+                continue;
+            }
+            let full = dest.join(&cur);
+            match fs::symlink_metadata(&full) {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => {
+                    return Err(Error::UnsafePath {
+                        path: rel.to_string_lossy().into_owned(),
+                        reason: "an existing symlink or non-directory is in the way",
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&full)?;
+                    self.created.insert(cur.clone());
+                }
+                Err(e) => return Err(e.into()),
+            }
+            self.known.insert(cur.clone());
+        }
+        Ok(self.created.contains(rel))
+    }
+}
+
 fn ensure_dir(dest: &Path, rel: &Path) -> Result<()> {
     let mut cur = dest.to_path_buf();
     for component in rel.components() {

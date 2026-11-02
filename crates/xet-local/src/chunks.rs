@@ -541,7 +541,7 @@ impl LocalCas {
     ) -> Result<Vec<(u64, String)>> {
         let mut out: Vec<Option<(u64, String)>> = vec![None; files.len()];
         // xorb -> [(index into files, segment ranges)]
-        let mut groups: HashMap<MerkleHash, Vec<(usize, Vec<(u64, u64, usize)>)>> = HashMap::new();
+        let mut groups: HashMap<MerkleHash, Vec<SmallFile>> = HashMap::new();
         for (i, (file, tmp)) in files.iter().enumerate() {
             let info = self.file_info(file).await?;
             let first = info.segments.first().map(|s| s.xorb_hash);
@@ -650,6 +650,9 @@ impl LocalCas {
 }
 
 /// Reads `[lo, hi)` of `path` into `buf` (reused across calls; not zeroed first).
+/// A small file in a batch: (index into the batch, its segments as (lo, hi, chunks) in one xorb).
+type SmallFile = (usize, Vec<(u64, u64, usize)>);
+
 /// A file segment to decode: (xorb path, byte range, number of chunks).
 type Segment = (std::path::PathBuf, u64, u64, usize);
 
