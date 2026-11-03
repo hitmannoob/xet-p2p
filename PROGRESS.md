@@ -288,7 +288,34 @@ Details and numbers: [docs/BENCHMARK_S2S.md](docs/BENCHMARK_S2S.md).
 - **Dev cycle**: dev builds keep line tables only (target/debug 3–6 GB → 1.5 GB, kept between
   builds); `bench/devpair.py` keeps a sandbox pair up for repeated runs.
 
+### 2026-11-02/03 — Linking, incremental manifest, file-format benchmarks
+
+The no-protocol-change constraint was lifted for one change, after measuring it (kept on request).
+Numbers: [docs/BENCHMARK_S2S.md](docs/BENCHMARK_S2S.md), raw output in
+[bench/results/s2s_formats.log](bench/results/s2s_formats.log).
+
+- **Receiver linking** (`f2c34df`, `3f28725`): a file the receiver already holds at another path is
+  made by clone (APFS `clonefile`, Linux `FICLONE`) or, with `serve --link-identical`, hard link.
+  Sender walks in parallel and reuses cached files' xorbs.
+- **Incremental manifest** (protocol extension, `PROTOCOL_VERSION` unchanged): `HELLO_OK` carries
+  `manifest_delta` (serde default false, so older receivers never get a delta). The receiver keeps
+  its last 16 installed manifests under `<cas>/manifests/<sha256>.bin`; the sender keeps, per
+  receiver certificate, the last manifest that receiver stored (`<cas>/peers/<fingerprint>.manifest`)
+  and sends `MANIFEST_DELTA {base, upserts, removed}`. A receiver without the base answers
+  `NEED_FULL_MANIFEST` and gets the full one. Pull is unchanged. Rollouts: 611 → 88 KiB per
+  rollout (rsync `--link-dest` 244 KiB); fleet incremental rounds 13.5 → 1.3 MiB (rsync 5.0 MiB).
+- **File formats** (`devpair.py formats`, `bench/formats_sim.py`): model weights with a real
+  fine-tune, SQLite, tar/tar.gz, CSV, raw floats, and Sintel as MP4, WAV, FLAC, MP3 and a clip
+  dataset. xet-p2p wins on content the receiver holds (second destinations, moved clips: 0.02 vs
+  48 MiB) and on the fine-tune swap (3.7 vs 20.9 s); rsync wins on small edits inside one large
+  file, scattered SQLite edits and cold compressible data.
+
 ## Next
+
+- Check whether the per-file lz4 skip turns off upstream's `bg4-lz4` (byte grouping) for bf16
+  weights and 16-bit PCM; rsync -z sends 22–27% less on both. Sample bg4 too, then re-measure.
+- Profile a small edit inside one 1.1 GB file (xet-p2p 2.0 s, rsync 1.0 s): likely whole-file
+  re-chunking and re-hashing on the sender, not measured yet.
 
 - E2B and Daytona adapters (same `Sandbox` trait; verify their exec/file/port APIs first).
 - Re-run the Mac → Modal benchmark on the current build (the README table predates the small-file
@@ -313,9 +340,11 @@ Details and numbers: [docs/BENCHMARK_S2S.md](docs/BENCHMARK_S2S.md).
 - Unchanged files are detected by stamp (size, mtime, ctime, inode, device), like git's index: any
   write moves ctime. Files changed within 2 s of being hashed are not trusted; files the receiver
   itself installed are trusted after 50 ms where timestamps have sub-second resolution.
-- **Every push sends the full manifest** (~80 bytes per file, mostly two 32-byte hashes, ~545 KB for
-  6,800 files) even when few files changed. On large code trees this makes xet-p2p send more bytes
-  than rsync `--link-dest`. Fixing it needs an incremental manifest, a protocol change (out of scope).
+- The incremental manifest needs a previous push to the same receiver: the first push from a new
+  sender (or after the receiver dropped the base, or on pull) still sends the full manifest, ~80
+  bytes per file.
+- A small edit inside one large file re-chunks and re-hashes the whole file, and SQLite-style
+  scattered edits touch most 64 KiB chunks; rsync is faster or sends less on both.
 - The receiver keeps full copies plus its store (about 2× the disk of the data); rsync
   `--link-dest` shares files between copies via hard links.
 - Chunk mode sends a chunk list (36 B/chunk) for every new file before knowing what is missing;

@@ -56,7 +56,7 @@ def load():
 def up(args):
     m = modal()
     app = m.App.lookup("xet-p2p-test", create_if_missing=True)
-    image = m.Image.debian_slim().apt_install("rsync").pip_install("huggingface_hub[hf_xet]")
+    image = m.Image.debian_slim().apt_install("rsync", "ffmpeg").pip_install("huggingface_hub[hf_xet]")
     a = m.Sandbox.create("sleep", "infinity", app=app, image=image, cpu=4.0, memory=8192,
                          timeout=int(args.hours * 3600), region="us-east")
     b = m.Sandbox.create("sleep", "infinity", app=app, image=image, cpu=4.0, memory=8192,
@@ -286,6 +286,66 @@ def rollouts(args):
         print(f"{label:24}" + "".join(f"{c:>22}" for c in cells))
 
 
+def formats(args):
+    """Per file format: cold sync, a realistic edit synced to the same destination, and the
+    edited data to a second destination (see formats_sim.py)."""
+    import re
+    st, a, b = load()
+    (xh, xp), (rh, rp) = st["xet"], st["rsync"]
+    here = os.path.dirname(os.path.abspath(__file__))
+    for f in ("formats_sim.py",):
+        a.filesystem.copy_from_local(os.path.join(here, f), f"/opt/x/{f}")
+    sh(a, "[ -d /data/repo ] || python3 -c \"import io, tarfile, urllib.request; "
+          f"t = tarfile.open(fileobj=io.BytesIO(urllib.request.urlopen('{REPO_TGZ}').read())); "
+          "m = [x for x in t.getmembers() if '/' in x.name and (x.isfile() or x.isdir())]; "
+          "[setattr(x, 'name', x.name.split('/', 1)[1]) for x in m]; t.extractall('/data/repo', members=m)\"")
+    t0 = time.time()
+    sh(a, "which ffmpeg >/dev/null || (apt-get update -qq && apt-get install -y -qq ffmpeg >/dev/null)")
+    sh(a, "python3 /opt/x/formats_sim.py init", t=3600)
+    print(f"datasets ready ({time.time() - t0:.0f} s):", sh(a, "ls -la /data/formats | awk 'NR>1 {print $5, $9}' | tr '\\n' ' '"), flush=True)
+    tools, fmts = args.tools.split(","), args.formats.split(",")
+    rows = []
+
+    def sync(tool, dest):
+        if tool.startswith("xet"):
+            cmd = (f"{X} push /work/fsrc tcp://{xh}:{xp}/{dest} --cert {K}/client.crt --key {K}/client.key "
+                   f"--peer-cert {K}/server.crt --cas-dir /work/fcas --json --delete")
+        else:
+            z = "z" if tool == "rsync-z" else ""
+            cmd = f"rsync -a{z} --delete --stats /work/fsrc/ rsync://{rh}:{rp}/bench/{dest}/"
+        out = sh(a, f"s=$(date +%s.%N); {cmd} > /tmp/out.txt; e=$(date +%s.%N); "
+                    "python3 -c \"import sys; print(float(sys.argv[2]) - float(sys.argv[1]))\" $s $e")
+        wall, stdout = float(out.splitlines()[-1]), sh(a, "cat /tmp/out.txt")
+        sent = (json.loads(stdout)["udp_bytes_sent"] if tool.startswith("xet") else
+                int(re.search(r"Total (?:bytes )?sent:\s*([\d,]+)", stdout).group(1).replace(",", "")))
+        remote = f"/recv/{'xet' if tool.startswith('xet') else 'rsync'}/{dest}"
+        assert sh(a, DIGEST.format("/work/fsrc")) == sh(b, DIGEST.format(remote)), f"{tool} {dest}: differs"
+        return wall, sent
+
+    for tool in tools:
+        if tool.startswith("xet"):
+            restart_agent(b, link=True)
+        sh(b, "rm -rf /recv/rsync/*")
+        sh(a, "rm -rf /work/fcas")
+        for fmt in fmts:
+            sh(a, f"python3 /opt/x/formats_sim.py reset {fmt} /work/fsrc && sleep 3")
+            for step, dest in (("cold", f"{fmt}-1"), ("edit", f"{fmt}-1"), ("second dest", f"{fmt}-2")):
+                if step == "edit":
+                    sh(a, f"python3 /opt/x/formats_sim.py edit {fmt} /work/fsrc && sleep 3")
+                w, n = sync(tool, dest)
+                rows.append((fmt, step, tool, w, n))
+                print(f"{fmt:8} {step:11} {tool:8} {w:6.1f} s  {n / 2**20:9.2f} MiB", flush=True)
+            sh(b, f"rm -rf /recv/rsync/{fmt}-* /recv/xet/{fmt}-*")
+    print(f"\n{'format':8} {'step':11}" + "".join(f"{t:>22}" for t in tools))
+    for fmt in fmts:
+        for step in ("cold", "edit", "second dest"):
+            cells = []
+            for t in tools:
+                m = [(w, n) for f, s, tt, w, n in rows if f == fmt and s == step and tt == t]
+                cells.append(f"{m[0][0]:6.1f} s {m[0][1] / 2**20:8.2f} MiB" if m else "—")
+            print(f"{fmt:8} {step:11}" + "".join(f"{c:>22}" for c in cells))
+
+
 def shell(args):
     _, a, b = load()
     print(sh(a if args.which == "a" else b, args.command, check=False))
@@ -321,6 +381,9 @@ if __name__ == "__main__":
     p.add_argument("--n", type=int, default=10)
     p.add_argument("--tools", default="xet,rsync-z,rsync-link")
     p.add_argument("--profile", action="store_true")
+    p = sub.add_parser("formats")
+    p.add_argument("--tools", default="xet,rsync-z,rsync-a")
+    p.add_argument("--formats", default="weights,sqlite,targz,tar,csv,floats")
     p = sub.add_parser("sh")
     p.add_argument("which", choices=["a", "b"])
     p.add_argument("command")
@@ -331,5 +394,5 @@ if __name__ == "__main__":
     p.add_argument("--profile", action="store_true")
     sub.add_parser("down")
     args = ap.parse_args()
-    {"up": up, "deploy": deploy, "run": run, "agents": agents, "rollouts": rollouts, "sh": shell,
-     "down": down}[args.cmd](args)
+    {"up": up, "deploy": deploy, "run": run, "agents": agents, "rollouts": rollouts,
+     "formats": formats, "sh": shell, "down": down}[args.cmd](args)
