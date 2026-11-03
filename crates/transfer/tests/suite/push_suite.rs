@@ -1170,3 +1170,54 @@ async fn push_then_pull_round_trip_through_server() {
     // The client already holds every chunk (it pushed them): nothing but metadata moves.
     assert_eq!(r.local.chunks_received, 0, "{:?}", r.local);
 }
+
+// ---- incremental manifests ----
+
+fn many_files(h: &Harness, n: usize) {
+    for i in 0..n {
+        write(&h.src(), &format!("d{}/f{i}.txt", i % 17), format!("file {i}\n").as_bytes());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn second_push_sends_a_manifest_delta() {
+    let h = Harness::new().await;
+    many_files(&h, 2000);
+    let first = h.push("p").await.unwrap();
+    // Unchanged but for one edit, one new and one removed file.
+    write(&h.src(), "d1/f1.txt", b"edited\n");
+    write(&h.src(), "d1/new.txt", b"new\n");
+    fs::remove_file(h.src().join("d2/f2.txt")).unwrap();
+    let second = h.push("p").await.unwrap();
+    assert!(
+        second.udp_bytes_sent * 4 < first.udp_bytes_sent,
+        "delta push sent {} bytes, full push {}",
+        second.udp_bytes_sent,
+        first.udp_bytes_sent
+    );
+    let delete = h.push_with("p", |o| o.delete = true).await.unwrap();
+    assert_eq!(delete.receiver.files_deleted, 1, "{:?}", delete.receiver);
+    assert_trees_equal(&h.src(), &h.root().join("p"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn receiver_without_the_base_asks_for_the_full_manifest() {
+    let h = Harness::new().await;
+    many_files(&h, 300);
+    h.push("p").await.unwrap();
+    fs::remove_dir_all(h.root().join(".xet-p2p/cas/manifests")).unwrap();
+    write(&h.src(), "d3/f3.txt", b"changed\n");
+    h.push("p").await.unwrap();
+    assert_trees_equal(&h.src(), &h.root().join("p"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delta_applies_to_a_new_destination() {
+    let h = Harness::new().await;
+    many_files(&h, 300);
+    h.push("r1").await.unwrap();
+    write(&h.src(), "d4/f4.txt", b"rollout 2\n");
+    let r2 = h.push("r2").await.unwrap();
+    assert_eq!(r2.receiver.files_installed, 300, "{:?}", r2.receiver);
+    assert_trees_equal(&h.src(), &h.root().join("r2"));
+}

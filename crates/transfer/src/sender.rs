@@ -178,7 +178,29 @@ pub async fn push_prepared(
     // The manifest follows the HELLO without waiting for HELLO_OK: one round trip less. If the
     // receiver refuses the HELLO it never reads the manifest, so its reply is awaited alongside
     // the write and wins over a write that cannot finish.
-    let manifest_msg = Message::manifest(&manifest)?;
+    // A receiver that has stored an earlier manifest from this sender gets only the changes.
+    let encoded = crate::protocol::encode_manifest(&manifest)?;
+    let base = crate::manifests::SenderBase::for_peer(cas.root(), conn.peer_certificate().as_ref());
+    let manifest_msg = match base.as_ref().and_then(|b| b.load()) {
+        Some((digest, old)) => {
+            let (upserts, removed) = crate::protocol::manifest_delta(&old, &manifest);
+            debug!(
+                base = %digest,
+                changed = upserts.entries.len(),
+                removed = removed.len(),
+                "manifest delta"
+            );
+            Message::ManifestDelta {
+                base: digest,
+                upserts: serde_bytes::ByteBuf::from(crate::protocol::encode_manifest(&upserts)?),
+                removed,
+            }
+        }
+        None => Message::Manifest {
+            encoded: serde_bytes::ByteBuf::from(encoded.clone()),
+        },
+    };
+    let supports_delta;
     {
         let write = write_frame(&mut send, &manifest_msg);
         let reply = next(&mut recv);
@@ -191,8 +213,13 @@ pub async fn push_prepared(
             }
         };
         match reply? {
-            Message::HelloOk { protocol_version } if protocol_version == PROTOCOL_VERSION => {}
-            Message::HelloOk { protocol_version } => {
+            Message::HelloOk {
+                protocol_version,
+                manifest_delta,
+            } if protocol_version == PROTOCOL_VERSION => supports_delta = manifest_delta,
+            Message::HelloOk {
+                protocol_version, ..
+            } => {
                 return Err(Error::Protocol(format!(
                     "receiver speaks protocol {protocol_version}"
                 )));
@@ -210,6 +237,7 @@ pub async fn push_prepared(
         &cas,
         conn,
         &mut recv,
+        Some((&mut send, encoded.as_slice())),
         &files,
         &referenced,
         &opts.tuning(),
@@ -217,6 +245,9 @@ pub async fn push_prepared(
         &mut stats,
     )
     .await?;
+    if let Some(base) = base.filter(|_| supports_delta) {
+        base.save(&encoded);
+    }
     report.xorbs_sent = stats.xorbs_sent;
     report.xorb_bytes_sent = stats.xorb_bytes_sent;
     report.shard_bytes_sent = stats.shard_bytes_sent;
@@ -268,6 +299,8 @@ pub(crate) async fn serve_requests(
     cas: &Arc<LocalCas>,
     conn: &Conn,
     recv: &mut RecvStream,
+    // The control send stream and full encoded manifest, for a receiver that lacks a delta's base.
+    mut full_manifest: Option<(&mut SendStream, &[u8])>,
     files: &BTreeSet<MerkleHash>,
     referenced: &BTreeSet<MerkleHash>,
     tuning: &SendTuning,
@@ -310,6 +343,19 @@ pub(crate) async fn serve_requests(
                 stats.chunk_runs_sent += runs;
             }
             Message::Ack { .. } => {}
+            Message::NeedFullManifest {} => {
+                let Some((send, encoded)) = full_manifest.take() else {
+                    return Err(Error::Protocol("NEED_FULL_MANIFEST without a delta".into()));
+                };
+                debug!("receiver lacks the delta's base; sending the full manifest");
+                write_frame(
+                    send,
+                    &Message::Manifest {
+                        encoded: serde_bytes::ByteBuf::from(encoded.to_vec()),
+                    },
+                )
+                .await?;
+            }
             Message::Result { report } => return Ok(report),
             other => return Err(unexpected(other)),
         }

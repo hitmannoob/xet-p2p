@@ -79,8 +79,12 @@ pub async fn pull(
     )
     .await?;
     match next(&mut recv).await? {
-        Message::HelloOk { protocol_version } if protocol_version == PROTOCOL_VERSION => {}
-        Message::HelloOk { protocol_version } => {
+        Message::HelloOk {
+            protocol_version, ..
+        } if protocol_version == PROTOCOL_VERSION => {}
+        Message::HelloOk {
+            protocol_version, ..
+        } => {
             return Err(Error::Protocol(format!(
                 "server speaks protocol {protocol_version}"
             )));

@@ -98,11 +98,24 @@ pub enum Message {
     },
     HelloOk {
         protocol_version: u32,
+        /// The receiver accepts [`Message::ManifestDelta`] (older receivers omit this).
+        #[serde(default)]
+        manifest_delta: bool,
     },
     /// The file tree, in the compact encoding of [`encode_manifest`].
     Manifest {
         encoded: serde_bytes::ByteBuf,
     },
+    /// The file tree as changes to a manifest the receiver stored after an earlier transfer,
+    /// named by [`manifest_digest`]: entries added or changed (encoded like a manifest) and paths
+    /// removed. Sent only to a receiver that advertised `manifest_delta`.
+    ManifestDelta {
+        base: String,
+        upserts: serde_bytes::ByteBuf,
+        removed: Vec<String>,
+    },
+    /// The receiver does not have the delta's base: send the full [`Message::Manifest`].
+    NeedFullManifest {},
     Need {
         /// Xet file hashes whose reconstruction entries (as one native shard) are wanted.
         reconstructions: Vec<String>,
@@ -133,6 +146,8 @@ impl Message {
             Message::Hello { .. } => "HELLO",
             Message::HelloOk { .. } => "HELLO_OK",
             Message::Manifest { .. } => "MANIFEST",
+            Message::ManifestDelta { .. } => "MANIFEST_DELTA",
+            Message::NeedFullManifest { .. } => "NEED_FULL_MANIFEST",
             Message::Need { .. } => "NEED",
             Message::NeedChunkLists { .. } => "NEED_CHUNK_LISTS",
             Message::NeedChunks { .. } => "NEED_CHUNKS",
@@ -218,6 +233,59 @@ impl Message {
         Ok(Message::Manifest {
             encoded: serde_bytes::ByteBuf::from(encode_manifest(manifest)?),
         })
+    }
+}
+
+/// Names a manifest by the SHA-256 of its [`encode_manifest`] encoding (deterministic).
+pub fn manifest_digest(encoded: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(encoded))
+}
+
+/// What changed from `base` to `new`: entries added or changed, and paths removed.
+pub fn manifest_delta(base: &Manifest, new: &Manifest) -> (Manifest, Vec<String>) {
+    let old: std::collections::HashMap<&str, &xet_local::Entry> =
+        base.entries.iter().map(|e| (e.path.as_str(), e)).collect();
+    let paths: std::collections::HashSet<&str> =
+        new.entries.iter().map(|e| e.path.as_str()).collect();
+    let upserts = new
+        .entries
+        .iter()
+        .filter(|e| old.get(e.path.as_str()) != Some(e))
+        .cloned()
+        .collect();
+    let removed = base
+        .entries
+        .iter()
+        .filter(|e| !paths.contains(e.path.as_str()))
+        .map(|e| e.path.clone())
+        .collect();
+    (
+        Manifest {
+            format_version: new.format_version,
+            entries: upserts,
+        },
+        removed,
+    )
+}
+
+/// Inverse of [`manifest_delta`]: `base` with `upserts` applied and `removed` taken out, in the
+/// sender's order (path components, as its walk produces). The result still needs
+/// [`Manifest::validate`].
+pub fn apply_manifest_delta(base: Manifest, upserts: Manifest, removed: &[String]) -> Manifest {
+    let removed: std::collections::HashSet<&str> = removed.iter().map(String::as_str).collect();
+    let mut by_path: std::collections::BTreeMap<Vec<String>, xet_local::Entry> = base
+        .entries
+        .into_iter()
+        .filter(|e| !removed.contains(e.path.as_str()))
+        .map(|e| (e.path.split('/').map(str::to_owned).collect(), e))
+        .collect();
+    for e in upserts.entries {
+        by_path.insert(e.path.split('/').map(str::to_owned).collect(), e);
+    }
+    Manifest {
+        format_version: base.format_version,
+        entries: by_path.into_values().collect(),
     }
 }
 

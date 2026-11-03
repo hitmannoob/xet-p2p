@@ -252,20 +252,46 @@ impl Receiver {
             send,
             &Message::HelloOk {
                 protocol_version: PROTOCOL_VERSION,
+                manifest_delta: true,
             },
         )
         .await?;
 
+        let stored = crate::manifests::ReceiverManifests::new(self.fetcher.cas.root());
         let manifest = match self.fetcher.stall(conn, next(recv)).await? {
             Message::Manifest { encoded } => decode_manifest(&encoded)?,
+            Message::ManifestDelta {
+                base,
+                upserts,
+                removed,
+            } => match stored.load(&base) {
+                Some(b) => crate::protocol::apply_manifest_delta(
+                    decode_manifest(&b)?,
+                    decode_manifest(&upserts)?,
+                    &removed,
+                ),
+                None => {
+                    write_frame(send, &Message::NeedFullManifest {}).await?;
+                    match self.fetcher.stall(conn, next(recv)).await? {
+                        Message::Manifest { encoded } => decode_manifest(&encoded)?,
+                        other => return Err(unexpected(other)),
+                    }
+                }
+            },
             other => return Err(unexpected(other)),
         };
         manifest.validate()?;
 
         let dest_dir = create_confined_dir(&self.root, dest)?;
-        self.fetcher
+        let report = self
+            .fetcher
             .fetch_and_install(conn, send, &manifest, dest, &dest_dir, mode, delete)
-            .await
+            .await?;
+        // Kept so the sender's next push can be a delta against it.
+        if let Ok(encoded) = crate::protocol::encode_manifest(&manifest) {
+            stored.save(&encoded);
+        }
+        Ok(report)
     }
 
     /// The client pulls the tree at `src`: this side ingests it and serves the client's requests.
@@ -290,6 +316,7 @@ impl Receiver {
             send,
             &Message::HelloOk {
                 protocol_version: PROTOCOL_VERSION,
+                manifest_delta: false,
             },
         )
         .await?;
@@ -315,6 +342,7 @@ impl Receiver {
                     cas,
                     conn,
                     recv,
+                    None,
                     &files,
                     &referenced,
                     &tuning,

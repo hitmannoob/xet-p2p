@@ -6,6 +6,7 @@ mod budget;
 mod error;
 mod fetch;
 mod locks;
+mod manifests;
 pub mod protocol;
 mod pull;
 mod rate;
