@@ -1,29 +1,79 @@
 # xet-p2p
 
-Direct peer-to-peer file and directory transfer built on **native Xet storage** and **QUIC**.
+Sync files and directories directly between two machines, like rsync, but matching on **content**
+instead of **paths**.
+
+rsync compares each file with the file of the same name on the other side. xet-p2p splits every
+file into content-defined chunks (Hugging Face's [Xet](https://github.com/huggingface/xet-core)
+storage format) and keeps a local store of them on both ends. Anything the receiver already holds,
+under any name, in any folder, from any earlier transfer, is never sent again. Every file is
+verified end to end before it is installed.
+
+```bash
+xet-p2p push ./dataset tcp://receiver:4434/dataset ...   # first time: sends everything
+mv dataset/clips dataset/train                            # reorganize
+xet-p2p push ./dataset tcp://receiver:4434/dataset ...   # sends a few KB, not the clips again
+```
+
+No server, no cloud storage, no Hugging Face account: just two peers and a pair of pinned
+certificates. Modal sandboxes are supported out of the box.
+
+## When it beats rsync, and when it doesn't
+
+Measured between two Modal sandboxes (single runs; [all results](docs/BENCHMARK_S2S.md)):
+
+| Scenario | xet-p2p | rsync |
+|---|---:|---:|
+| Reorganize 178 audio clips into `train/` and `val/` | **0.1 s, 0.02 MiB** | 0.5 s, 48 MiB |
+| Same 1.1 GB movie to a second folder | **1.0 s, 0 MiB** | 4.8 s, 1,125 MiB |
+| Model weights replaced by their fine-tune (943 MiB) | **3.7 s** | 20.9 s |
+| FineWeb-Edu Parquet, first copy (4.3 GB) | **13.8 s** | 19.5 s |
+| Coding-agent rollouts, per rollout (rsync with `--link-dest`) | 1.3 s, **88 KiB** | 1.3–1.5 s, 244 KiB |
+| Trim the first minute off that 1.1 GB movie | 2.0 s, 3.0 MiB | **1.0 s, 1.1 MiB** |
+| Update 1% of the rows of a 190 MB SQLite database | 2.1 s, 164 MiB | 3.1 s, **64 MiB** |
+| 7 agents joining a shared code base (rsync with `--link-dest`) | 13–18 s, 3.7 MiB | **9 s, 1.4 MiB** |
+
+rsync is `rsync -az` unless noted. Speed on first copies depends on the network path: on another
+sandbox pair with a faster single TCP stream, rsync won the FineWeb-Edu first copy.
+
+**Use xet-p2p** when data moves around: renamed or reorganized files, copies to several
+destinations, datasets and checkpoints that grow or get replaced, many machines sharing a base.
+
+**Use rsync** for small edits inside one large file at the same path (rsync sends only the changed
+bytes; xet-p2p re-chunks the file and resends whole ~64 KiB chunks), for databases with scattered
+edits, and for first copies of compressible text on slow links (rsync's zlib beats Xet's lz4 by
+about 1.5–2×).
+
+## How it works
 
 ```
-Xet (chunks + xorbs + shards + local CAS)  ↔  QUIC (pinned mutual TLS)  ↔  Xet (local CAS + reconstruction)
+ sender                                                  receiver
+ ┌──────────────────────┐      pinned mutual TLS      ┌──────────────────────┐
+ │ files → Xet chunks   │◄── QUIC, or TLS over TCP ──►│ Xet chunks → files   │
+ │ local store (CAS)    │                             │ local store (CAS)    │
+ └──────────────────────┘                             └──────────────────────┘
 ```
 
-- Content-defined chunking, hashing, xorbs, shards, and reconstruction come from Hugging Face's
-  [`xet-core`](https://github.com/huggingface/xet-core) (pinned `=1.8.0`). No custom formats.
-- Each peer keeps an **embedded, on-disk CAS**. There is no CAS server, no cloud storage, no Hugging
-  Face account. The receiver runs a QUIC listener that is part of this tool, not a CAS API.
-- Only content the receiver lacks is sent — at **chunk** granularity: chunks the receiver already
-  holds in any xorb (from any sender) are never re-sent, and received chunks are repacked into
-  native xorbs on the receiver ([benchmark](docs/BENCHMARK_M3.md)). `--mode xorb` sends whole
-  sender xorbs instead.
-- A repeat push of unchanged files sends zero payload bytes
-  and leaves the destination files untouched.
-- Interrupted pushes resume: re-run the same command and only what is still missing is sent, even if
-  the receiver process was killed.
-- Every received object is verified before it is stored; every file is verified (size + SHA-256)
-  before it is installed, and installation is atomic per file. A failed transfer installs nothing.
+Xet is the storage layer behind the Hugging Face Hub: files are cut into ~64 KiB chunks at
+content-defined boundaries (so an insertion only changes the chunks around it), packed into
+**xorbs**, and described by **shards** (how to rebuild each file). Upstream, clients talk to a CAS
+server. xet-p2p keeps that format unchanged (`xet-core` pinned at `=1.8.0`) and replaces the server
+with a local store on each peer plus a direct peer protocol. A push:
 
-Status: **M0–M5 complete for Modal** (sandbox providers, `pull`, TLS-over-TCP fallback,
-`doctor`; verified against a real Modal sandbox). E2B and Daytona are not implemented yet. See [PROGRESS.md](PROGRESS.md) for details and what is next, and
-[XET_P2P_CODEX_START.md](XET_P2P_CODEX_START.md) for the full design brief.
+1. **Ingest.** The sender chunks and hashes changed files into its store. Files whose size,
+   timestamps and inode are unchanged are not read at all (like git's index).
+2. **Handshake.** Each side checks the other's pinned certificate.
+3. **Manifest.** The sender lists every file (path, size, Xet hash, SHA-256), or, after the first
+   push to that receiver, only what changed since.
+4. **Receiver decides** per file: unchanged, skip; content already held elsewhere, copy or clone it
+   locally; otherwise ask for the file's chunk list, then only the chunks it lacks.
+5. **Transfer.** Missing chunks stream over parallel streams; the receiver packs them into its own
+   xorbs and records progress durably, so an interrupted push resumes where it stopped.
+6. **Verify and install.** Each file is rebuilt from the store, checked against its Xet hash and
+   SHA-256, and renamed into place atomically.
+
+Details of what is reused from `xet-core`, and where this tool diverges:
+[docs/UPSTREAM_AUDIT.md](docs/UPSTREAM_AUDIT.md).
 
 ## Build
 
@@ -37,20 +87,18 @@ cargo test            # all tests run offline over localhost
 
 ## Quick start
 
-Two machines that can reach each other over UDP (direct network, VPN, or port forward). QUIC does
-not traverse NAT by itself.
+Two machines that can reach each other. QUIC needs UDP; if only TCP gets through (most firewalls,
+tunnels, Modal), use the `tcp://` lines instead.
 
-**1. Each peer generates an identity** (once):
+**1. Each peer creates an identity** (once):
 
 ```bash
-# on the receiver
-xet-p2p keygen --out ./certs --name receiver
-# on the sender
-xet-p2p keygen --out ./certs --name sender
+xet-p2p keygen --out ./certs --name receiver   # on the receiver
+xet-p2p keygen --out ./certs --name sender     # on the sender
 ```
 
-Each command writes `<name>.crt` (public, share it) and `<name>.key` (private, mode `0600`, never
-share it), and prints the certificate's SHA-256 fingerprint.
+Each writes `<name>.crt` (public, share it) and `<name>.key` (private, mode `0600`, never share it)
+and prints the certificate's SHA-256 fingerprint.
 
 **2. Exchange certificates.** Copy `receiver.crt` to the sender and `sender.crt` to the receiver
 by any channel you trust. Compare fingerprints out of band if the channel is not trusted.
@@ -58,7 +106,7 @@ by any channel you trust. Compare fingerprints out of band if the channel is not
 **3. Start the receiver:**
 
 ```bash
-xet-p2p serve --listen 0.0.0.0:4433 \
+xet-p2p serve --listen 0.0.0.0:4433 --listen-tcp 0.0.0.0:4434 \
   --root /workspace --cas-dir /workspace/.xet-p2p/cas \
   --cert ./certs/receiver.crt --key ./certs/receiver.key \
   --allow-client ./certs/sender.crt
@@ -67,49 +115,40 @@ xet-p2p serve --listen 0.0.0.0:4433 \
 **4. Push from the sender:**
 
 ```bash
-xet-p2p push ./project --to receiver.example:4433 --dest project \
+xet-p2p push ./project quic://receiver.example:4433/project \
   --cas-dir ~/.cache/xet-p2p \
   --cert ./certs/sender.crt --key ./certs/sender.key \
   --peer-cert ./certs/receiver.crt
+# or, over TCP:
+xet-p2p push ./project tcp://receiver.example:4434/project ...same options...
 ```
 
-The files land in `/workspace/project`. Push again after editing; only new content is sent:
+The files land in `/workspace/project`. Push again after editing one file; only its changed chunk
+is sent, and the 25 other files are not even re-read:
 
 ```text
-pushed 26 files (124868 logical bytes) in 0.03s
-  local ingest: 26 chunks (0 new), 0 new bytes, 124868 deduped
-  xorbs: 1 referenced, 0 sent, 1 reused on receiver
-  payload sent: 0 bytes (0 xorb, 0 shard); UDP sent: 14439 bytes
-  receiver: installed 26 files, 124868 bytes reconstructed and verified
+pushed 26 files (4450271 logical bytes) in 0.07s
+  local ingest: 25 files unchanged since last read (4440180 bytes, not re-read); read 1 (0 incompressible, stored uncompressed): 1 chunks (1 new), 10091 new bytes, 0 deduped
+  chunk mode: 1 chunks in new files, 0 already on receiver (0 bytes), 1 sent in 1 runs; 1 xorbs packed
+  payload sent: 2787 bytes (0 xorb, 0 shard, 2715 chunk, 72 chunk-list); wire sent: 11752 bytes via QUIC (UDP)
+  effective throughput: 62.4 MiB/s logical, 0.0 MiB/s payload
+  receiver: 1 files installed, 25 unchanged; 10091 bytes reconstructed and verified
 ```
 
-## Security model
+Rename `src/` to `lib/` and push with `--delete`: the receiver already holds every file's content,
+so nothing but the file list is sent:
 
-- **Mutual authentication by pinning.** The sender accepts only the exact receiver certificate given
-  with `--peer-cert`; the receiver accepts only senders listed with `--allow-client`. Both directions
-  verify the TLS 1.3 handshake signature, so a copied certificate without its key is useless. TLS
-  verification is never disabled.
-- **Destination confinement.** `--dest` is a relative path resolved inside `--root`. Absolute paths,
-  `..`, empty components, backslashes, NUL bytes, and symlinks along the path are rejected. A
-  destination may not overlap the receiver's CAS directory. Manifest paths get the same checks.
-- **Untrusted content.** The receiver re-hashes every chunk of every xorb before storing it. It
-  registers a file's reconstruction entry only after recomputing the file's Xet hash from verified
-  xorbs, then checks each reconstructed file's size and SHA-256 against the manifest.
-- **Least disclosure.** The sender serves only objects referenced by the manifest it is pushing, so a
-  receiver cannot pull other content from the sender's CAS.
-- **Per-sender scopes.** `--allow-client sender.crt=projects/alice` confines that sender to
-  `<root>/projects/alice`. A bare `--allow-client sender.crt` grants the whole root. Once any scope is
-  configured, every sender needs an entry.
-- **Bounded resources.** Control frames, object headers, xorbs (80 MiB), and shards (256 MiB) have
-  hard size limits; concurrent streams are capped by `--parallel` and in-memory xorb bytes by
-  `--max-memory-mib` (default 256; at least one xorb always fits).
-- **Durability.** Received xorbs and shards are fsynced on commit, installed files before their
-  rename and directories after; session state is written temp-file + fsync + rename.
-- Keys and certificates are never logged. Errors returned to a peer contain paths and hashes only.
+```text
+pushed 26 files (4450271 logical bytes) in 0.05s
+  ...
+  payload sent: 0 bytes (0 xorb, 0 shard, 0 chunk, 0 chunk-list); wire sent: 6249 bytes via TLS over TCP (not QUIC)
+  receiver: 25 files installed, 1 unchanged; 255967 bytes reconstructed and verified
+  deleted on receiver: 25 files, 1 directories (--delete)
+```
 
-Not yet covered: certificate rotation/revocation (replace the pinned file and restart).
+`xet-p2p pull` works the same way in the other direction.
 
-## Sandboxes and targets
+## Sandboxes
 
 `push` and `pull` take a target URI:
 
@@ -124,22 +163,20 @@ Not yet covered: certificate rotation/revocation (replace the pinned file and re
 xet-p2p push ./project modal://sb-abc123/workspace/project
 xet-p2p pull modal://sb-abc123/workspace/results ./results
 xet-p2p doctor modal://sb-abc123        # what works, what doesn't, what auto would use
-xet-p2p push ./project modal://sb-abc123/workspace/project --transport quic   # fail, don't fall back
 ```
 
-For sandbox targets, `xet-p2p` attaches to the **existing** sandbox (it never creates or destroys
-one), uploads and starts a per-session agent, and generates a fresh key pair for each side: the
-agent accepts only this client, and the client pins only this agent. The session's keys, agent
-process and files are removed when the command ends; your files and the sandbox's CAS are kept.
+For a sandbox target, `xet-p2p` attaches to the **existing** sandbox (it never creates or destroys
+one), uploads and starts a small agent there, and generates a fresh key pair for each side: the
+agent accepts only this client, and the client pins only this agent. When the command ends, the
+session's keys, agent and files are removed; your files and the sandbox's store are kept.
+`--keep-agent MINUTES` keeps the agent running so later commands skip the ~3 s startup.
 
-**Transports.** `--transport auto` (default) uses QUIC when the sandbox can accept UDP, otherwise
-the TLS-over-TCP fallback, and prints which one it chose and whether a provider relay is in the
-path. `--transport quic` fails instead of falling back. Both use the same pinned mutual TLS and
-the same Xet objects; only the wire protocol differs.
+**Transports.** `--transport auto` (default) uses QUIC when the sandbox accepts UDP, otherwise TLS
+over TCP, and says which it chose. `--transport quic` fails instead of falling back.
 
 **Modal.** Modal exposes sandbox ports only through tunnels declared when the sandbox is created,
-and none carry UDP, so Modal transfers use TLS over TCP through a raw TCP tunnel (relayed by
-Modal). Create the sandbox with the port exposed (default 4434):
+and none carry UDP, so Modal transfers use TLS over TCP through a raw TCP tunnel. Create the sandbox
+with the port exposed (default 4434):
 
 ```python
 sb = modal.Sandbox.create("sleep", "infinity", app=app, image=modal.Image.debian_slim(),
@@ -159,165 +196,128 @@ The adapter uses your installed Modal SDK and credentials (`XET_P2P_MODAL_PYTHON
 Python it uses). URI options: `?port=N` (default 4434), `?root=/abs` (workspace, default
 `/workspace`), `?state=/abs` (agent binary and session files, default `/tmp/xet-p2p`). Modal raw
 TCP tunnels accept connections from any address; the pinned mutual TLS is what protects them.
-Sandbox storage is ephemeral unless you mount a Volume, so its CAS does not outlive the sandbox.
+Sandbox storage is ephemeral unless you mount a Volume, so its store does not outlive the sandbox.
 
-`e2b://` and `daytona://` are recognised but not implemented yet.
+E2B and Daytona (`e2b://`, `daytona://`) are recognised but not implemented yet.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
 | `xet-p2p keygen --out DIR --name NAME` | Create a self-signed identity |
-| `xet-p2p serve ... [--listen-tcp ADDR]` | Receive pushes / serve pulls under `--root` (QUIC, optionally also TLS over TCP) |
-| `xet-p2p push SRC TARGET` | Push a file or directory (`--to HOST:PORT --dest REL` = `quic://HOST:PORT/REL`) |
+| `xet-p2p serve ...` | Receive pushes and serve pulls under `--root` (QUIC, and TLS over TCP with `--listen-tcp`) |
+| `xet-p2p push SRC TARGET` | Push a file or directory |
 | `xet-p2p pull SOURCE DEST` | Pull a file or directory into a local directory |
 | `xet-p2p doctor TARGET` | Inspect a sandbox: capabilities, agent, which transports work |
-| `xet-p2p gc --cas-dir DIR [--max-size-mib N] [--dry-run]` | Reclaim CAS space (orphans; LRU eviction to a cap) |
-| `xet-p2p local ingest SRC --cas-dir DIR [-o manifest.json]` | Offline: store into a CAS, write manifest |
-| `xet-p2p local restore MANIFEST DEST --cas-dir DIR` | Offline: reconstruct from a CAS |
+| `xet-p2p gc --cas-dir DIR [--max-size-mib N] [--dry-run]` | Reclaim store space |
+| `xet-p2p local ingest SRC --cas-dir DIR [-o manifest.json]` | Offline: store into a local store, write a manifest |
+| `xet-p2p local restore MANIFEST DEST --cas-dir DIR` | Offline: rebuild files from a local store |
 
-Run any command with `--help` for all options. Set `RUST_LOG=debug` for verbose logs.
+Run any command with `--help` for all options. `RUST_LOG=debug` gives verbose logs; `--json`
+prints a push's numbers (bytes sent, files installed and unchanged, timings) as JSON.
 
-## Mirroring with `--delete`
+## Behaviour and options
 
-By default a push never removes anything on the receiver. With `push --delete`, everything under
-`--dest` that is not in the source is removed, rsync-style — including a file sitting where the
-source has a directory, and vice versa. Deletion happens only after every new file has been
-reconstructed and verified, so a failed push deletes nothing. Symlinks are removed, never followed,
-and nothing outside `--dest` (nor the CAS or session state) is ever touched.
+**Mirroring (`push --delete`).** By default a push never removes anything on the receiver. With
+`--delete`, everything under the destination that is not in the source is removed, rsync-style.
+Deletion happens only after every new file is rebuilt and verified, so a failed push deletes
+nothing. Symlinks are removed, never followed; nothing outside the destination is touched.
 
-## Resume and concurrency
+**Resume.** If a push is interrupted (network drop, either side killed), run it again: only what is
+still missing is sent. The receiver keeps a durable session per destination and manifest under
+`<cas-dir>/sessions`; sessions are removed on success and after 7 days idle. If the source changed
+in between, a new session starts but everything already received is reused.
 
-The receiver keeps a durable session per (destination, manifest) under `<cas-dir>/sessions`
-(`--session-dir` to move it). If a push is interrupted — network drop, sender killed, receiver
-killed — run the same push again. The receiver reuses the reconstruction metadata it already has and
-requests only xorbs it has not yet verified and stored. `push` reports `resumed interrupted session`
-with what was saved. If the source changed in between, a new session starts, but every xorb already
-stored is still reused, and so is the reconstruction metadata of every file that did not change. Sessions are removed on success and discarded after 7 days idle.
+**Concurrency.** Pushes into separate destinations run at the same time; pushes into overlapping
+destinations wait for each other.
 
-Pushes into disjoint destinations run concurrently; pushes into overlapping destinations (one inside
-the other) wait for each other.
+**Identical files on the receiver.** When the receiver already holds a file's content at another
+path, it makes the new file locally: a copy-on-write clone where the filesystem supports one, or,
+with `serve --link-identical`, a hard link (like rsync `--link-dest`; the two paths then share one
+file, so editing one in place edits both).
 
-## Operations
+**Transfer modes.** `--mode chunk` (default) sends only the chunks the receiver holds nowhere.
+`--mode xorb` sends whole xorbs as the sender stored them, slightly smaller for repeated edits from
+the same sender.
 
-- **Bandwidth**: `push --bwlimit-mib 20` caps payload throughput across all streams.
-- **TCP lanes**: over TLS-over-TCP a session uses 4 TCP connections (`XET_P2P_TCP_LANES=N`, 1–16)
-  so parallel streams get their own congestion windows; peers that only speak `xet-p2p-tcp/3` get one.
-- **Stalled senders**: `serve --stall-timeout-secs 120` (default) aborts a transfer whose sender
-  stops sending data, freeing its destination for others.
-- **Disk space**: the CAS is a cache. `xet-p2p gc --cas-dir DIR` deletes content no file references
-  (after a 7-day grace that protects resumable transfers); add `--max-size-mib N` to evict least
-  recently used content down to a cap (it is re-fetched from a peer when next needed). `gc` needs
-  the CAS to itself and refuses to run while a `serve` or `push` is using it.
+**Operations.**
+
+- `push --bwlimit-mib 20` caps throughput.
+- Over TLS on TCP a session opens 4 TCP connections (`XET_P2P_TCP_LANES=N`, 1–16) so parallel
+  streams don't share one congestion window.
+- `serve --stall-timeout-secs 120` (default) aborts a transfer whose sender stops sending.
+- The store is a cache. `xet-p2p gc --cas-dir DIR` deletes content no file references (after a
+  7-day grace that protects resumable transfers); `--max-size-mib N` also evicts the least recently
+  used content down to a cap. `gc` refuses to run while a `serve` or `push` is using the store.
+
+## Security model
+
+- **Mutual authentication by pinning.** The sender accepts only the exact receiver certificate given
+  with `--peer-cert`; the receiver accepts only senders listed with `--allow-client`. Both directions
+  verify the TLS 1.3 handshake signature, so a copied certificate without its key is useless. TLS
+  verification is never disabled.
+- **Destination confinement.** The destination is a relative path inside `--root`. Absolute paths,
+  `..`, empty components, backslashes, NUL bytes, and symlinks along the path are rejected, and a
+  destination may not overlap the receiver's store. Paths in the manifest get the same checks.
+- **Per-sender scopes.** `--allow-client sender.crt=projects/alice` confines that sender to
+  `<root>/projects/alice`. A bare `--allow-client sender.crt` grants the whole root. Once any scope
+  is configured, every sender needs one.
+- **Untrusted content.** The receiver re-hashes every chunk it receives, recomputes each file's Xet
+  hash from verified data, and checks each rebuilt file's size and SHA-256 before installing it.
+- **Least disclosure.** The sender serves only content referenced by the manifest it is pushing, so
+  a receiver cannot read anything else from the sender's store.
+- **Bounded resources.** Messages, xorbs (80 MiB) and shards (256 MiB) have hard size limits;
+  concurrent streams are capped by `--parallel`, in-memory data by `--max-memory-mib` (default 256).
+- **Durability.** Received data is fsynced when committed, installed files are flushed to disk
+  before they are renamed into place (one `syncfs` per install on Linux), and session state is
+  written atomically.
+- Keys and certificates are never logged. Errors sent to a peer contain paths and hashes only.
+
+Not covered yet: certificate rotation or revocation (replace the pinned file and restart).
 
 ## Profiling
 
 Both the client and the agent (also inside a sandbox) can profile themselves:
 
-- `XET_P2P_TRACE=PATH` records every pipeline stage (ours and upstream xet-core's) and at exit
-  writes `PATH.<pid>.json` (open in <https://ui.perfetto.dev>) and `PATH.<pid>.txt`, a summary of
-  each stage's count, total and busy time, share of the run and concurrency. `serve` writes it
-  when it exits (idle exit, SIGTERM, Ctrl-C).
+- `XET_P2P_TRACE=PATH` records every pipeline stage (this tool's and `xet-core`'s) and at exit
+  writes `PATH.<pid>.json` (open in <https://ui.perfetto.dev>) and `PATH.<pid>.txt`, a per-stage
+  summary of count, time and concurrency. `serve` writes it when it exits (idle, SIGTERM, Ctrl-C).
 - `XET_P2P_PROFILE=PATH` samples CPU stacks into a flame graph (`.svg`) and folded stacks
   (`.folded`). Build with `RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
   --features cpu-profile`.
-- `bench/devpair.py` keeps a pair of Modal sandboxes up for repeated measurements (`deploy BIN`,
-  `run --profile`, `agents`, `rollouts`).
 
-## Compared with rsync
+## Benchmarks
 
-Bytes sent by the source and wall-clock time, from [docs/BENCHMARK_M4.md](docs/BENCHMARK_M4.md)
-(Apple M4, localhost, no network shaping, so times reflect CPU and disk work):
+- [docs/BENCHMARK_S2S.md](docs/BENCHMARK_S2S.md): between two Modal sandboxes. Datasets, coding
+  agents, model weights, databases, archives, video and audio. The most recent results.
+- [docs/BENCHMARK_M5_MODAL.md](docs/BENCHMARK_M5_MODAL.md): a Mac to a Modal sandbox over the
+  internet (an older build).
+- [docs/BENCHMARK_M4.md](docs/BENCHMARK_M4.md) and [docs/BENCHMARK_M3.md](docs/BENCHMARK_M3.md):
+  on one machine over localhost, which isolates CPU and disk cost.
 
-| Scenario | Plain copy | rsync -a | rsync -az | **xet-p2p** | xet time | rsync -az time |
-|---|---:|---:|---:|---:|---:|---:|
-| Cold: 64 MiB random file | 64.0 MiB | 64.0 MiB | 64.0 MiB | **65.5 MiB** | 0.98 s | 1.38 s |
-| 4 KiB inserted mid 64 MiB file | 64.0 MiB | 36 KiB | 44 KiB | **162 KiB** | **0.35 s** | 1.55 s |
-| Checkpoint: 4 of 64 tensors rewritten (128 MiB) | 128.0 MiB | 8.1 MiB | 8.1 MiB | **8.7 MiB** | **0.95 s** | 3.21 s |
-| Cold: 64 MiB compressible log | 64.0 MiB | 64.0 MiB | 13.0 MiB | **25.1 MiB** | 1.00 s | 1.60 s |
-| 1 MiB appended to 64 MiB log | 65.0 MiB | 1056 KiB | 247 KiB | **458 KiB** | **0.72 s** | 2.06 s |
-| Cold: 2000 small files | 16.7 MiB | 16.9 MiB | 4.4 MiB | **7.5 MiB** | 1.12 s | 0.65 s |
-| 20 of 2000 small files edited | 16.7 MiB | 85 KiB | 80 KiB | **221 KiB** | 0.32 s | 0.16 s |
-| 2000 small files, unchanged | 16.7 MiB | 75 KiB | 75 KiB | **161 KiB** | 0.27 s | 0.10 s |
-| Edit pushed from a **different sender** (receiver already holds the content) | 64 MiB | n/a | n/a | **0.17 MiB** | 0.56 s | n/a |
+`bench/devpair.py` keeps a pair of Modal sandboxes up for repeated runs (`up`, `deploy`, `run`,
+`agents`, `rollouts`, `formats`, `down`).
 
-xet-p2p counts every UDP byte (QUIC + TLS included); rsync's counts exclude SSH framing and
-encryption. The last row is from [docs/BENCHMARK_M3.md](docs/BENCHMARK_M3.md): rsync only compares
-against the same path, so it has no equivalent.
-
-Over a **real network** (this Mac → a Modal sandbox, same tunnel for both tools,
-[docs/BENCHMARK_M5_MODAL.md](docs/BENCHMARK_M5_MODAL.md)), bytes follow the same pattern, xet-p2p's
-transfer is faster than rsync's whole command in 7 of 8 scenarios (TLS included), and end to end
-(5 repetitions, medians):
-
-| Scenario (Mac → Modal, ~145 ms RTT) | rsync -az | xet-p2p `--keep-agent` | xet-p2p (agent per command) |
-|---|---:|---:|---:|
-| warm, 2 of 32 checkpoint tensors rewritten (16 MiB) | 2.9 s | **2.5 s** | 5.7 s |
-| warm, 256 KiB appended to 8 MiB log | 2.1 s | **1.8 s** | 5.0 s |
-| warm, 4 KiB inserted mid 8 MiB file | 2.0 s | **1.8 s** | 4.9 s |
-| warm, 500 small files unchanged | 1.7 s | 1.8 s | 4.8 s |
-| warm, 10 of 500 small files edited | 1.9 s | 2.4 s | 5.7 s |
-| cold, 500 small files | 2.6 s | 3.1 s | 6.3 s |
-
-With `--keep-agent`, xet-p2p beats rsync on large-file edits and trails it by 0.5 s on small-file
-trees. A kept-agent command costs ~0.6 s of connection setup (one TCP and one TLS round trip);
-starting a fresh agent through Modal's API adds ~3.2 s. (This table predates the small-file and
-receiver work below; it has not been re-run.)
-
-**Between two Modal sandboxes** ([docs/BENCHMARK_S2S.md](docs/BENCHMARK_S2S.md), single runs):
-
-| Scenario | rsync | xet-p2p |
-|---|---:|---:|
-| FineWeb-Edu Parquet, cold 4.3 GB | 19.5 s | **13.8 s** |
-| Same dataset to a second destination | 21.4 s, 6.0 GiB sent | **3.5 s, ~0 sent** |
-| Agent rollouts from one Django base, per rollout (rsync `--link-dest`) | **1.3 s, 244 KiB** | 1.3 s, 611 KiB |
-| 7 agents joining a shared Django base (rsync `--link-dest`) | **8.7 s, 1.4 MiB** | 13.4 s, 3.7 MiB |
-| Same, plain `rsync -az` | 14.8 s, 66.2 MiB | **13.4 s, 3.7 MiB** |
-
-Where each tool wins:
-
-- **xet-p2p** on large binary data (checkpoints, datasets): large-file edits, growing datasets,
-  pushes to further destinations, and content the receiver already holds anywhere, in other files,
-  other destinations or from other senders, without naming a reference directory. Every file is
-  verified end to end, and copies are independent.
-- **rsync** on code and text trees: zlib compresses ~2× better than Xet's lz4, tiny edits cost
-  literal bytes rather than a ~64 KiB chunk, and its file list is smaller than xet-p2p's manifest
-  (~80 bytes per file, sent in full on every push, ~545 KB for a 6,800-file tree). With
-  `--link-dest` pointing at a previous copy it matches or beats xet-p2p on repeated code trees.
-
-## Transfer modes
-
-| Mode | What moves | Best for |
-|---|---|---|
-| `chunk` (default) | Only chunks the receiver holds nowhere, as native compressed chunk bytes; the receiver repacks them into its own native xorbs | Everything; decisively better when content sits in shared or foreign xorbs |
-| `xorb` | Whole native xorbs the receiver lacks, exactly as the sender stored them | Same-sender incremental edits (marginally smaller: no chunk lists) |
-
-On a warm receiver, a 4 KiB insert into a 64 MiB file moves ~0.05–0.17 MiB in chunk mode
-(0.08–0.27% of the file). See [docs/BENCHMARK_M3.md](docs/BENCHMARK_M3.md) for all scenarios and
-exact conditions.
-
-## Metrics
-
-`push` prints (or emits with `--json`) logical bytes, local chunk/dedup counts, xorbs referenced/sent/reused, payload bytes
-(native xorb + shard bytes), UDP bytes actually sent (all QUIC overhead included), elapsed time, and
-throughput, files installed vs unchanged, xorbs already present on the receiver, and resume
-savings. Whole-xorb reuse (what M1 does) and chunk-level wire dedup (M3) are different; the
-numbers here are whole-xorb.
-
-## Layout
+## Project layout
 
 ```text
 crates/
-  xet-local/        Offline Xet storage: wraps upstream LocalClient; ingest, manifest,
-                    verified object exchange, verified atomic reconstruction
-  transport/        Connection/stream traits, identities, certificate pinning, framing
-  transport-quic/   QUIC transport (Quinn), pinned mTLS
-  transport-tcp/    TLS-over-TCP fallback transport, yamux-multiplexed streams
-  transfer/         Control protocol; push, pull, Receiver; fetch and send cores
-  providers/        Target URIs, SandboxProvider adapters (local, modal), transport policy, doctor
-  cli/              xet-p2p binary
-docs/UPSTREAM_AUDIT.md   What is reused from xet-core, and every divergence
+  xet-local/        Local Xet store: wraps xet-core's LocalClient; ingest, manifests,
+                    verified exchange of chunks and xorbs, verified file rebuild
+  transport/        Connection and stream traits, identities, certificate pinning, framing
+  transport-quic/   QUIC transport (Quinn), pinned mutual TLS
+  transport-tcp/    TLS-over-TCP transport, multiplexed streams over parallel connections
+  transfer/         The peer protocol: push, pull, receiver, manifests
+  providers/        Target URIs and sandbox adapters (local, Modal), transport choice, doctor
+  cli/              The xet-p2p binary and profiler
+bench/              Benchmark scripts and raw results
+docs/               Benchmarks and the xet-core audit
 ```
+
+## Status
+
+Works between any two machines and with Modal sandboxes. E2B and Daytona adapters are not written
+yet. [PROGRESS.md](PROGRESS.md) is the development log, with known gaps and what is next.
 
 ## License
 
